@@ -2,21 +2,29 @@
 
 ## Executive Summary
 
-This specification defines the complete content extraction system for enterprise data classification. The system extracts content from various file types through datasource connectors, processes structured and unstructured data, and streams components for PII classification via the EngineInterface.
+This specification defines the complete content extraction system for enterprise data classification. The system handles two distinct types of datasources through separate, specialized interfaces:
+
+1. **File-Based Connectors** (SMB, S3, Azure Blob) - Extract rich content from files using ContentComponent interface
+2. **Database Connectors** (SQL Server, Oracle) - Sample structured data using existing dict interface
+
+The system extracts content from various data sources, processes structured and unstructured data, and streams components for PII classification via the EngineInterface while maintaining memory efficiency and error resilience.
 
 ## System Architecture Overview
 
 ### Core Objective
-Extract content from all file types across datasource connectors (SMB, S3, Azure Blob, SQL Server, etc.) and stream components to classification engine while maintaining memory efficiency and error resilience.
+Provide unified content extraction across all datasource types while respecting their fundamental differences:
+- **File-based sources**: Complex content extraction (text, tables, images, archives) with rich metadata
+- **Database sources**: Structured data sampling (rows, columns) with existing optimized patterns
 
 ### Key Design Principles
-1. **Memory-Safe Processing** - Serial component streaming with file size limits
-2. **Universal Interface** - All connectors implement identical interface contract
-3. **Configuration-Driven** - System and datasource-level extraction control
+1. **Interface Segregation** - Separate specialized interfaces for file vs database connectors
+2. **Memory-Safe Processing** - Serial component streaming with file size limits
+3. **Configuration-Driven** - System and datasource-level extraction control tailored to connector type
 4. **Error Isolation** - Component-level failure handling with fallback strategies
-5. **Classification Integration** - Direct integration with EngineInterface methods
+5. **Backward Compatibility** - Database connectors keep existing proven interfaces
+6. **Classification Integration** - Direct integration with EngineInterface methods for both data types
 
-## Updated Interface Architecture
+## Connector Interface Architecture
 
 ### File-Based Connectors Interface
 
@@ -89,15 +97,14 @@ class IDatabaseDataSourceConnector(ABC):
         pass
 ```
 
-
 ## ContentComponent Data Model
 
-### Core ContentComponent Structure
+### Core ContentComponent Structure (File-Based Connectors Only)
 
 ```python
 @dataclass
 class ContentComponent:
-    """Universal component model for all extracted content types"""
+    """Universal component model for all extracted content from files"""
     
     # Identity and location
     object_id: str              # Original file object ID from WorkPacket
@@ -137,7 +144,7 @@ class ContentComponent:
     is_archive_extraction: bool = False
 ```
 
-### Component Type Taxonomy
+### Component Type Taxonomy (File-Based Only)
 
 ```python
 COMPONENT_TYPES = {
@@ -162,15 +169,17 @@ COMPONENT_TYPES = {
 
 ## Configuration System
 
-### Two-Level Configuration Architecture
+### File-Based Connector Configuration
+
+File-based connectors use a two-level configuration architecture for rich content extraction control.
 
 #### 1. ConnectorConfiguration (Database Table)
-Stores connector-specific technical configurations:
+Stores connector-specific technical configurations for file-based connectors:
 
 ```python
 # Database schema: ConnectorConfigurations table
 {
-    "ConnectorType": "smb",
+    "ConnectorType": "smb",  # or "s3", "azure_blob"
     "ConfigName": "default", 
     "Configuration": {
         "supported_formats": ["pdf", "docx", "xlsx", "pptx", "html"],
@@ -185,10 +194,10 @@ Stores connector-specific technical configurations:
 ```
 
 #### 2. DataSource Configuration (JSON Field)  
-Stores business-level extraction policies per datasource:
+Stores business-level extraction policies per file-based datasource:
 
 ```python
-# datasource.configuration["content_extraction"]
+# datasource.configuration["content_extraction"] - FILE CONNECTORS ONLY
 {
     "limits": {
         "max_file_size_mb": 50,
@@ -210,10 +219,10 @@ Stores business-level extraction policies per datasource:
 }
 ```
 
-### Configuration Access Pattern
+#### 3. Configuration Access Pattern for File-Based Connectors
 
 ```python
-class SMBConnector(IDataSourceConnector):
+class SMBConnector(IFileDataSourceConnector):
     def __init__(self, datasource_id: str, logger: SystemLogger, 
                  error_handler: ErrorHandler, db_interface: DatabaseInterface):
         
@@ -228,7 +237,7 @@ class SMBConnector(IDataSourceConnector):
         self.extraction_config = ContentExtractionConfig.from_dict(extraction_dict)
 ```
 
-### System-Level Override Pattern
+#### 4. System-Level Override Pattern
 
 ```python
 # System OCR flag overrides datasource OCR setting
@@ -242,9 +251,26 @@ if not self.system_config.use_ocr and self.extraction_config.features.ocr_enable
                        system_ocr=False, datasource_ocr=True)
 ```
 
+### Database Connector Configuration
+
+Database connectors (SQL Server, Oracle, etc.) continue using their existing configuration patterns:
+
+```python
+# SQL Server datasource.configuration (UNCHANGED)
+{
+    "connection_config": {...},
+    "scan_config": {
+        "maxrows": 1000,  # Existing row sampling limit
+        "include_system_databases": false,
+        "exclude_tables": ["temp_*"]
+    },
+    "processing_mode": "row"  # or "column"
+}
+```
+
 ## File Type Processing Matrix
 
-### Supported File Types and Extraction Libraries
+### Supported File Types and Extraction Libraries (File-Based Connectors Only)
 
 | File Type | Primary Library | Table Extraction | Image Extraction | Notes |
 |-----------|----------------|------------------|-------------------|--------|
@@ -363,7 +389,7 @@ def _get_size_metadata(self, content: Union[str, bytes]) -> Dict[str, int]:
     }
 ```
 
-### File Processing Flow
+### File Processing Flow (File-Based Connectors Only)
 
 ```python
 def process_file_for_extraction(self, file_object_id: str, work_packet: WorkPacket):
@@ -418,7 +444,7 @@ def validate_extraction_resources(self, file_size_mb: int) -> bool:
     return True
 ```
 
-## Archive Processing
+## Archive Processing (File-Based Connectors Only)
 
 ### Archive as Directory Structure
 
@@ -487,7 +513,7 @@ def process_archive(self, archive_path: str, current_depth: int = 0) -> Iterator
         self.processed_archive_paths.remove(archive_path)
 ```
 
-## Content Extraction Implementation
+## Content Extraction Implementation (File-Based Connectors Only)
 
 ### PDF Processing
 
@@ -714,7 +740,7 @@ def extract_xlsx_components(self, file_path: str, object_id: str) -> Iterator[Co
 
 The document defines two distinct error handling patterns based on error scope:
 
-**Component-Level Errors (Continue Processing):**
+**Component-Level Errors (Continue Processing - File-Based Connectors):**
 ```python
 # Use when individual component extraction fails but other components can still be processed
 try:
@@ -730,7 +756,7 @@ except Exception as e:
     # Continue processing images, archives, etc.
 ```
 
-**System-Level Errors (May Stop Processing):**
+**System-Level Errors (May Stop Processing - Both Connector Types):**
 ```python
 # Use when fundamental system issues occur that may affect entire extraction
 try:
@@ -756,7 +782,7 @@ except Exception as e:
 ```python
 # Create new file: src/extraction/content_extractor.py
 class ContentExtractor:
-    """Reusable content extraction module for all connectors"""
+    """Reusable content extraction module for file-based connectors"""
     
     def __init__(self, extraction_config: ContentExtractionConfig, 
                  system_config: SystemConfig, logger: SystemLogger):
@@ -765,14 +791,14 @@ class ContentExtractor:
         self.logger = logger
         
     def extract_from_file(self, file_path: str, object_id: str) -> Iterator[ContentComponent]:
-        """Main extraction method used by all connectors"""
+        """Main extraction method used by all file-based connectors"""
         # Implementation details as shown in document examples
         pass
 ```
 
-**Connector Integration Pattern:**
+**File-Based Connector Integration Pattern:**
 ```python
-class SMBConnector(IDataSourceConnector):
+class SMBConnector(IFileDataSourceConnector):
     def __init__(self, datasource_id: str, ...):
         # Initialize connector-specific components
         self.content_extractor = ContentExtractor(
@@ -797,7 +823,7 @@ class SMBConnector(IDataSourceConnector):
 - **Maintenance**: Single place to update extraction algorithms
 - **Testing**: Centralized testing of extraction logic
 
-**Connector-Specific Responsibilities:**
+**File-Based Connector-Specific Responsibilities:**
 - File access and download (SMB vs S3 vs Azure Blob)
 - Path resolution and object ID mapping
 - Authentication and connection management
@@ -925,7 +951,7 @@ def cleanup_extraction_resources(self, temp_files: List[str], extraction_id: str
 
 ```python
 def validate_extraction_configuration(self) -> bool:
-    """Validate configuration and log issues"""
+    """Validate configuration and log issues (File-Based Connectors Only)"""
     
     validation_errors = []
     
@@ -1135,18 +1161,208 @@ classification_context = {
 }
 ```
 
-## Implementation Guidelines
+## Required File Updates
 
-### Connector Implementation Pattern
+### 1. Update worker_interfaces.py
+
+**Add both interfaces to support both connector types:**
 
 ```python
-class SMBConnector(IDataSourceConnector):
-    """Complete SMB connector implementation following specification"""
+# Add to src/core/interfaces/worker_interfaces.py
+
+from abc import ABC, abstractmethod
+from typing import List, Iterator, Union
+from core.models.models import WorkPacket, DiscoveredObject, ObjectMetadata, ContentComponent, PIIFinding
+
+# Keep existing interface for database connectors
+class IDatabaseDataSourceConnector(ABC):
+    """Interface for database-based datasource connectors (SQL Server, Oracle, etc.)"""
+    
+    @abstractmethod
+    def enumerate_objects(self, work_packet: WorkPacket) -> Iterator[List[DiscoveredObject]]:
+        pass
+    
+    @abstractmethod  
+    def get_object_details(self, work_packet: WorkPacket) -> List[ObjectMetadata]:
+        pass
+    
+    @abstractmethod
+    def get_object_content(self, work_packet: WorkPacket) -> Iterator[dict]:
+        """UNCHANGED: Returns Iterator[dict] for backward compatibility"""
+        pass
+
+# Add new interface for file-based connectors
+class IFileDataSourceConnector(ABC):
+    """Interface for file-based datasource connectors (SMB, S3, Azure Blob, etc.)"""
+    
+    @abstractmethod
+    def enumerate_objects(self, work_packet: WorkPacket) -> Iterator[List[DiscoveredObject]]:
+        pass
+    
+    @abstractmethod  
+    def get_object_details(self, work_packet: WorkPacket) -> List[ObjectMetadata]:
+        pass
+    
+    @abstractmethod
+    def get_object_content(self, work_packet: WorkPacket) -> Iterator[ContentComponent]:
+        """NEW: Returns Iterator[ContentComponent] for rich content extraction"""
+        pass
+
+# Keep existing IClassificationEngine unchanged
+class IClassificationEngine(ABC):
+    @abstractmethod
+    def classify_content(self, object_id: str, content: any, work_packet: WorkPacket) -> List[PIIFinding]:
+        pass
+```
+
+### 2. Update worker.py
+
+**Add routing logic to handle both interface types:**
+
+```python
+# Update imports in src/worker/worker.py
+from core.interfaces.worker_interfaces import (
+    IDatabaseDataSourceConnector, 
+    IFileDataSourceConnector, 
+    IClassificationEngine
+)
+from core.models.models import WorkPacket, TaskType, TaskOutputRecord, ProgressUpdate, ContentComponent
+
+# Update _process_classification method
+def _process_classification(self, work_packet: WorkPacket):
+    """Process CLASSIFICATION task with interface detection."""
+    payload = work_packet.payload
+    
+    # Get appropriate connector and classifier
+    connector = self.connector_factory.get_connector(payload.datasource_id)
+    classifier = self.classifier_factory.get_classification_engine(payload.classifier_template_id)
+    
+    # Detect connector type and route appropriately
+    if isinstance(connector, IFileDataSourceConnector):
+        self._process_file_based_classification(connector, classifier, work_packet)
+    elif isinstance(connector, IDatabaseDataSourceConnector):
+        self._process_database_classification(connector, classifier, work_packet)
+    else:
+        # Fallback to legacy behavior for existing connectors
+        self._process_database_classification(connector, classifier, work_packet)
+
+def _process_file_based_classification(self, connector: IFileDataSourceConnector, 
+                                     classifier: IClassificationEngine, work_packet: WorkPacket):
+    """Handle file-based connectors with ContentComponent interface."""
+    total_findings = 0
+    components_processed = 0
+    
+    # Process ContentComponent objects
+    for content_component in connector.get_object_content(work_packet):
+        # Route component to appropriate classification method
+        findings = self._classify_content_component(content_component, classifier, work_packet)
+        total_findings += len(findings)
+        components_processed += 1
+        
+        # Send heartbeat periodically
+        if components_processed % 10 == 0:
+            self._send_heartbeat(work_packet.header.task_id)
+
+    self.logger.info(f"File-based classification completed",
+                    task_id=work_packet.header.task_id,
+                    components_processed=components_processed,
+                    total_findings=total_findings)
+
+def _process_database_classification(self, connector: IDatabaseDataSourceConnector,
+                                   classifier: IClassificationEngine, work_packet: WorkPacket):
+    """Handle database connectors with existing dict interface (UNCHANGED)."""
+    total_findings = 0
+    objects_processed = 0
+    
+    # Process dict objects (existing logic)
+    for content_batch in connector.get_object_content(work_packet):
+        object_id = content_batch.get("object_id")
+        content = content_batch.get("content")
+        
+        if object_id and content:
+            # Classify content using existing method
+            findings = classifier.classify_content(object_id, content, work_packet)
+            total_findings += len(findings)
+            objects_processed += 1
+            
+            # Send heartbeat periodically
+            if objects_processed % 10 == 0:
+                self._send_heartbeat(work_packet.header.task_id)
+
+    self.logger.info(f"Database classification completed",
+                    task_id=work_packet.header.task_id,
+                    objects_processed=objects_processed,
+                    total_findings=total_findings)
+
+def _classify_content_component(self, component: ContentComponent, 
+                               classifier: IClassificationEngine, work_packet: WorkPacket) -> List[PIIFinding]:
+    """Route ContentComponent to appropriate classification method."""
+    try:
+        if component.component_type == "table":
+            # Route to structured data classification
+            return self._classify_table_component(component, classifier, work_packet)
+        elif component.component_type in ["text", "image_ocr", "table_fallback", "archive_member"]:
+            # Route to unstructured text classification
+            return classifier.classify_content(component.object_id, component.content, work_packet)
+        elif component.component_type in ["extraction_error", "unsupported_format", "file_too_large"]:
+            # No classification needed for error components
+            return []
+        else:
+            self.logger.warning("Unknown component type for classification",
+                               component_type=component.component_type,
+                               component_id=component.component_id)
+            return []
+    except Exception as e:
+        self.logger.error("Component classification failed",
+                         component_id=component.component_id,
+                         error=str(e))
+        return []
+
+def _classify_table_component(self, component: ContentComponent, 
+                             classifier: IClassificationEngine, work_packet: WorkPacket) -> List[PIIFinding]:
+    """Handle table component classification with structured data."""
+    # Convert table schema to rows and classify each row
+    # Implementation depends on classification engine capabilities
+    # For now, fallback to text content classification
+    return classifier.classify_content(component.object_id, component.content, work_packet)
+
+# Update ConnectorFactory
+class ConnectorFactory:
+    """Factory for creating connector instances with interface detection."""
+    
+    def __init__(self, logger: SystemLogger, error_handler: ErrorHandler):
+        self.logger = logger
+        self.error_handler = error_handler
+        self.connector_registry: Dict[str, Union[IFileDataSourceConnector, IDatabaseDataSourceConnector]] = {}
+        
+    def register_connector(self, datasource_id: str, 
+                          connector: Union[IFileDataSourceConnector, IDatabaseDataSourceConnector]):
+        """Register a connector instance for a specific datasource."""
+        self.connector_registry[datasource_id] = connector
+        
+        # Log interface type
+        interface_type = "File-based" if isinstance(connector, IFileDataSourceConnector) else "Database"
+        self.logger.info(f"Registered {interface_type} connector for datasource {datasource_id}")
+        
+    def get_connector(self, datasource_id: str) -> Union[IFileDataSourceConnector, IDatabaseDataSourceConnector]:
+        """Get connector instance for datasource."""
+        if datasource_id not in self.connector_registry:
+            raise ValueError(f"No connector registered for datasource: {datasource_id}")
+        return self.connector_registry[datasource_id]
+```
+
+## Implementation Guidelines
+
+### File-Based Connector Implementation Pattern
+
+```python
+class SMBConnector(IFileDataSourceConnector):
+    """SMB connector implementing file-based interface"""
     
     def __init__(self, datasource_id: str, logger: SystemLogger,
                  error_handler: ErrorHandler, db_interface: DatabaseInterface):
         
-        # Standard initialization pattern
+        # Standard initialization
         self.datasource_id = datasource_id
         self.logger = logger  
         self.error_handler = error_handler
@@ -1156,7 +1372,7 @@ class SMBConnector(IDataSourceConnector):
         self.datasource_config = self.db.get_datasource_configuration(datasource_id)
         self.connector_config = self.db.get_connector_configuration("smb", "default")
         
-        # Parse content extraction config
+        # Parse content extraction config with defaults
         extraction_dict = self.datasource_config.configuration.get('content_extraction', {})
         self.extraction_config = ContentExtractionConfig.from_dict(extraction_dict)
         
@@ -1168,7 +1384,7 @@ class SMBConnector(IDataSourceConnector):
         self.validate_extraction_configuration()
     
     def get_object_content(self, work_packet: WorkPacket) -> Iterator[ContentComponent]:
-        """Main content extraction implementation"""
+        """File-based content extraction with ContentComponent output"""
         
         trace_id = work_packet.header.trace_id
         task_id = work_packet.header.task_id
@@ -1226,6 +1442,57 @@ class SMBConnector(IDataSourceConnector):
             )
             self.logger.error("SMB content extraction failed", error_id=error.error_id)
             raise
+```
+
+### Database Connector Implementation Pattern (SQL Server - UNCHANGED)
+
+```python
+class SQLServerConnector(IDatabaseDataSourceConnector):
+    """SQL Server connector keeping existing interface (NO CHANGES NEEDED)"""
+    
+    def __init__(self, datasource_id: str, logger: SystemLogger,
+                 error_handler: ErrorHandler, db_interface: DatabaseInterface):
+        
+        # Keep existing initialization - NO ContentExtractionConfig needed
+        self.datasource_id = datasource_id
+        self.logger = logger
+        self.error_handler = error_handler
+        self.db = db_interface
+        
+        # Load datasource configuration
+        self.datasource_config = self.db.get_datasource_configuration(datasource_id)
+        self.connector_config = self.db.get_connector_configuration("sqlserver", "default")
+        
+        # Use existing maxrows configuration
+        self.max_rows = self.datasource_config.configuration.get('scan_config', {}).get('maxrows', 1000)
+    
+    def get_object_content(self, work_packet: WorkPacket) -> Iterator[dict]:
+        """Database content extraction with legacy dict output (UNCHANGED)"""
+        
+        for object_id in work_packet.payload.object_ids:
+            try:
+                # Existing SQL Server logic
+                discovered_objects = self.db.get_objects_for_classification([object_id])
+                if not discovered_objects:
+                    continue
+                
+                discovered_obj = discovered_objects[0]
+                object_path = discovered_obj.ObjectPath
+                
+                # Extract content based on object type (existing logic)
+                content = self._extract_content_for_classification(
+                    object_path, discovered_obj.ObjectType, trace_id, task_id
+                )
+                
+                if content:
+                    # Keep existing dict format
+                    yield {
+                        "object_id": object_id,
+                        "content": content
+                    }
+            except Exception as e:
+                # Keep existing error handling
+                continue
 ```
 
 ### Library Dependency Management
@@ -1381,6 +1648,34 @@ def test_error_handling():
         assert components[0].component_type == "no_content_extractable"
 ```
 
+### Interface Testing Pattern
+
+```python
+def test_interface_separation():
+    """Test that connectors implement appropriate interfaces"""
+    
+    # Test file-based connector
+    smb_connector = SMBConnector(datasource_id, logger, error_handler, db_interface)
+    assert isinstance(smb_connector, IFileDataSourceConnector)
+    
+    # Test database connector
+    sql_connector = SQLServerConnector(datasource_id, logger, error_handler, db_interface)
+    assert isinstance(sql_connector, IDatabaseDataSourceConnector)
+    
+    # Test worker routing
+    worker = Worker(settings, logger, error_handler)
+    
+    # File-based routing
+    file_work_packet = create_test_work_packet("file_datasource")
+    result = worker._process_classification(file_work_packet)
+    assert "file-based classification" in result
+    
+    # Database routing
+    db_work_packet = create_test_work_packet("sql_datasource")
+    result = worker._process_classification(db_work_packet)
+    assert "database classification" in result
+```
+
 ## Performance Considerations
 
 ### Memory Optimization
@@ -1427,16 +1722,59 @@ def test_error_handling():
 - **Secure storage:** Leverage existing credential management system
 - **Access logging:** Log all file access operations with context
 
+## Migration Strategy
+
+### Phase 1: Interface Updates
+1. Update `worker_interfaces.py` with both interfaces
+2. Update `worker.py` with routing logic
+3. Test with existing SQL Server connector (should work unchanged)
+
+### Phase 2: File-Based Connector Implementation
+1. Implement `ContentComponent` model
+2. Implement `ContentExtractionConfig` classes
+3. Build first file-based connector (SMB)
+4. Test end-to-end with new interface
+
+### Phase 3: Classification Engine Updates
+1. Add support for structured table classification
+2. Update classification routing logic
+3. Test with both interface types
+
+## Key Benefits
+
+### Clear Separation of Concerns
+- **File connectors**: Rich content extraction with components
+- **Database connectors**: Simple structured data sampling
+- **No forced architectural mismatch**
+
+### Backward Compatibility
+- Existing database connectors require zero changes
+- Worker routing handles both interface types transparently
+- Gradual migration path for new connector types
+
+### Optimal Performance
+- File connectors: Memory-safe streaming with resource limits
+- Database connectors: Existing optimized SQL sampling
+- Each connector type uses appropriate extraction strategy
+
 ## Conclusion
 
-This specification provides complete guidance for implementing content extraction across all datasource connectors. The architecture ensures memory safety, error resilience, configuration flexibility, and seamless integration with the classification engine while maintaining consistent interfaces across all connector types.
+This specification provides complete guidance for implementing content extraction across all datasource connectors. The architecture ensures:
+
+1. **Interface Segregation** - Separate specialized interfaces for fundamentally different connector types
+2. **Memory Safety** - Serial processing with resource limits and cleanup
+3. **Error Resilience** - Component-level isolation with system-level failure handling
+4. **Configuration Flexibility** - Tailored configuration systems for each connector type
+5. **Classification Integration** - Seamless routing to appropriate classification methods
+6. **Backward Compatibility** - Zero changes needed for existing database connectors
 
 ### Key Implementation Success Factors
 
-1. **Follow the exact interface contracts** - All connectors must implement identical method signatures
+1. **Follow the exact interface contracts** - File-based connectors use ContentComponent, database connectors use dict
 2. **Implement proper error isolation** - Component failures should not break entire extraction
 3. **Respect resource limits** - Honor all configuration limits and system constraints  
 4. **Maintain logging consistency** - Use established logging patterns with proper context
 5. **Test extensively** - Validate extraction, fallback, and error scenarios for all file types
+6. **Database connector preservation** - SQL Server and similar connectors work unchanged
 
-This specification serves as the definitive guide for building robust, scalable, and maintainable content extraction capabilities across the entire enterprise data classification platform.
+This specification serves as the definitive guide for building robust, scalable, and maintainable content extraction capabilities that respect the fundamental differences between file-based and database-based data sources while providing unified classification integration.

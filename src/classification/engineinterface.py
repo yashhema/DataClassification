@@ -132,89 +132,134 @@ class EngineInterface:
             return []
 
     def convert_findings_to_db_format(self, all_findings: List[PIIFinding], total_rows_scanned: int) -> List[Dict[str, Any]]:
-        """
-        Converts a list of PIIFinding objects from a data object (e.g., a table)
-        into the aggregated dictionary format required for database storage.
+            """
+            Converts a list of PIIFinding objects from a data object into the
+            aggregated dictionary format required for database storage.
 
-        Args:
-            all_findings: A list of all PIIFinding objects from a single data object.
-            total_rows_scanned: The total number of rows processed for this object.
+            It applies different aggregation logic for structured (database) and
+            unstructured (file) sources.
 
-        Returns:
-            A list of dictionaries, each ready for `insert_scan_findings`.
-        """
-        if not all_findings:
-            return []
+            Args:
+                all_findings: A list of all PIIFinding objects from a single data object.
+                total_rows_scanned: For structured data, the total rows processed. For
+                                    unstructured data, this should be the total number of
+                                    components processed within the file.
 
-        # Group findings by their unique context (classifier, field, etc.)
-        summary_map = defaultdict(lambda: {
-            "findings": [],
-            "high_confidence_rows": set()
-        })
-        
-        high_conf_score = self.config.confidence_scoring.high_confidence_min_score
+            Returns:
+                A list of dictionaries, each ready for `insert_scan_findings`.
+            """
+            if not all_findings:
+                return []
 
-        for finding in all_findings:
-            context = finding.context_data
-            key_components = [
-                self.job_context.get('datasource_id', ''),
-                finding.classifier_id,
-                context.get('table_name', context.get('file_path', '')),
-                context.get('field_name', '') # Will be empty for unstructured
-            ]
-            finding_key = tuple(key_components)
-            
-            summary_map[finding_key]["findings"].append(finding)
-            if finding.confidence_score >= high_conf_score:
-                 # Use a tuple representation of the dict for hashability
-                row_id_tuple = tuple(sorted(context.get("row_identifier", {}).items()))
-                if row_id_tuple:
-                    summary_map[finding_key]["high_confidence_rows"].add(row_id_tuple)
+            # --- Determine Source Type from the first finding's context ---
+            first_finding_context = all_findings[0].context_data or {}
+            is_file_source = 'file_path' in first_finding_context
 
+            # ======================================================================
+            # FILE AGGREGATION LOGIC (NEW)
+            # Goal: One summary record per classifier for the entire file.
+            # ======================================================================
+            if is_file_source:
+                # Group all findings from all components by classifier_id
+                summary_map = defaultdict(list)
+                for finding in all_findings:
+                    summary_map[finding.classifier_id].append(finding)
+                
+                db_records = []
+                for classifier_id, findings_list in summary_map.items():
+                    first_finding = findings_list[0]
+                    context = first_finding.context_data or {}
+                    scores = [f.confidence_score for f in findings_list]
+                    
+                    # --- Aggregated Confidence Score Logic for Files ---
+                    # A file is "HIGH" if it contains any high-confidence findings.
+                    high_conf_score = self.config.confidence_scoring.high_confidence_min_score
+                    has_high_confidence_finding = any(s >= high_conf_score for s in scores)
+                    avg_confidence = sum(scores) / len(scores) if scores else 0
+                    
+                    agg_conf = "LOW"
+                    if has_high_confidence_finding:
+                        agg_conf = "HIGH"
+                    elif avg_confidence > (self.config.confidence_scoring.low_threshold / 100):
+                         agg_conf = "MEDIUM"
 
-        # Create the final list of dictionaries for the database
-        db_records = []
-        for key, data in summary_map.items():
-            findings_list = data["findings"]
-            first_finding = findings_list[0]
-            context = first_finding.context_data
-            
-            scores = [f.confidence_score for f in findings_list]
-            
-            # --- Aggregated Confidence Score Logic ---
-            high_conf_rows = len(data["high_confidence_rows"])
-            confidence_percent = (high_conf_rows / total_rows_scanned * 100) if total_rows_scanned > 0 else 0
-            
-            agg_conf = "LOW"
-            if confidence_percent > self.config.confidence_scoring.medium_threshold:
-                agg_conf = "HIGH"
-            elif confidence_percent > self.config.confidence_scoring.low_threshold:
-                agg_conf = "MEDIUM"
+                    samples = [{"text": f.text, "confidence": f.confidence_score} for f in findings_list[:self.config.max_samples_per_finding]]
 
-            # Prepare samples for DB storage
-            samples = [{"text": f.text, "confidence": f.confidence_score, "row": f.context_data.get("row_identifier")} for f in findings_list[:self.config.max_samples_per_finding]]
+                    record = {
+                        "ScanJobID": self.job_context.get("job_id"),
+                        "DataSourceID": self.job_context.get("datasource_id"),
+                        "ClassifierID": classifier_id,
+                        "EntityType": first_finding.entity_type,
+                        "SchemaName": None,
+                        "TableName": None,
+                        "FieldName": None,  # Set to NULL for file-level summary
+                        "FilePath": context.get("file_path"),
+                        "FileName": context.get("file_name"),
+                        "FindingCount": len(findings_list),
+                        "AverageConfidence": avg_confidence,
+                        "MaxConfidence": max(scores) if scores else 0,
+                        "SampleFindings": json.dumps(samples),
+                        "TotalRowsInSource": total_rows_scanned, # Represents component count for files
+                        "AggregatedConfidence": agg_conf
+                    }
+                    db_records.append(record)
+                return db_records
 
-            record = {
-                "ScanJobID": self.job_context.get("job_id"),
-                "DataSourceID": self.job_context.get("datasource_id"),
-                "ClassifierID": first_finding.classifier_id,
-                "EntityType": first_finding.entity_type,
-                "SchemaName": context.get("table_metadata", {}).get("schema_name"),
-                "TableName": context.get("table_name"),
-                "FieldName": context.get("field_name"),
-                "FilePath": context.get("file_path"),
-                "FileName": context.get("file_name"),
-                "FindingCount": len(findings_list),
-                "AverageConfidence": sum(scores) / len(scores) if scores else 0,
-                "MaxConfidence": max(scores) if scores else 0,
-                "SampleFindings": json.dumps(samples),
-                "TotalRowsInSource": total_rows_scanned,
-                # Add the new aggregated score
-                "AggregatedConfidence": agg_conf 
-            }
-            db_records.append(record)
-            
-        return db_records
+            # ======================================================================
+            # STRUCTURED DATA AGGREGATION LOGIC (EXISTING)
+            # Goal: One summary record per classifier per field (column).
+            # ======================================================================
+            else:
+                summary_map = defaultdict(lambda: {"findings": [], "high_confidence_rows": set()})
+                high_conf_score = self.config.confidence_scoring.high_confidence_min_score
+
+                for finding in all_findings:
+                    context = finding.context_data or {}
+                    key = (finding.classifier_id, context.get('field_name', ''))
+                    
+                    summary_map[key]["findings"].append(finding)
+                    if finding.confidence_score >= high_conf_score:
+                        row_id_tuple = tuple(sorted(context.get("row_identifier", {}).items()))
+                        if row_id_tuple:
+                            summary_map[key]["high_confidence_rows"].add(row_id_tuple)
+
+                db_records = []
+                for (classifier_id, field_name), data in summary_map.items():
+                    findings_list = data["findings"]
+                    first_finding = findings_list[0]
+                    context = first_finding.context_data or {}
+                    scores = [f.confidence_score for f in findings_list]
+                    
+                    # --- Aggregated Confidence Score Logic for Structured Data ---
+                    high_conf_rows = len(data["high_confidence_rows"])
+                    confidence_percent = (high_conf_rows / total_rows_scanned * 100) if total_rows_scanned > 0 else 0
+                    
+                    agg_conf = "LOW"
+                    if confidence_percent > self.config.confidence_scoring.medium_threshold:
+                        agg_conf = "HIGH"
+                    elif confidence_percent > self.config.confidence_scoring.low_threshold:
+                        agg_conf = "MEDIUM"
+
+                    samples = [{"text": f.text, "confidence": f.confidence_score, "row": f.context_data.get("row_identifier")} for f in findings_list[:self.config.max_samples_per_finding]]
+                    
+                    record = {
+                        "ScanJobID": self.job_context.get("job_id"),
+                        "DataSourceID": self.job_context.get("datasource_id"),
+                        "ClassifierID": classifier_id,
+                        "EntityType": first_finding.entity_type,
+                        "SchemaName": context.get("table_metadata", {}).get("schema_name"),
+                        "TableName": context.get("table_name"),
+                        "FieldName": field_name,
+                        "FilePath": None, "FileName": None,
+                        "FindingCount": len(findings_list),
+                        "AverageConfidence": sum(scores) / len(scores) if scores else 0,
+                        "MaxConfidence": max(scores) if scores else 0,
+                        "SampleFindings": json.dumps(samples),
+                        "TotalRowsInSource": total_rows_scanned,
+                        "AggregatedConfidence": agg_conf 
+                    }
+                    db_records.append(record)
+            return db_records
 
 # =============================================================================
 # DEMONSTRATION OF USAGE

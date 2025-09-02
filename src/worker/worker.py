@@ -5,14 +5,16 @@ orchestrator communication, connector usage, and classification engine integrati
 
 This worker implements the contracts defined in:
 - WorkerOrchestratorInterface.txt  
-- worker_interfaces.py (IDataSourceConnector, IClassificationEngine)
+- worker_interfaces.py (IDatabaseDataSourceConnector, IFileDataSourceConnector)
+- EngineInterface integration for classification
 """
 
+import asyncio
 import time
 import threading
 import requests
 import json
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from datetime import datetime, timezone
 import traceback
 from enum import Enum
@@ -20,15 +22,15 @@ from enum import Enum
 from core.logging.system_logger import SystemLogger
 from core.config.configuration_manager import SystemConfig
 from core.errors import ErrorHandler, ClassificationError, NetworkError, ProcessingError
-from core.models.models import WorkPacket, TaskType, TaskOutputRecord, ProgressUpdate
-
-# Add these imports at the top:
+from core.models.models import WorkPacket, TaskType, TaskOutputRecord, ProgressUpdate, ContentComponent, PIIFinding
 from core.interfaces.worker_interfaces import (
     IDatabaseDataSourceConnector, 
-    IFileDataSourceConnector, 
-    IClassificationEngine
+    IFileDataSourceConnector
 )
-from core.models.models import ContentComponent
+from classification.engineinterface import EngineInterface
+from core.db.database_interface import DatabaseInterface
+from core.config.configuration_manager import ConfigurationManager
+
 class WorkerStatus(str, Enum):
     """Worker operational states."""
     STARTING = "STARTING"
@@ -49,6 +51,8 @@ class Worker:
                  settings: SystemConfig, 
                  logger: SystemLogger, 
                  error_handler: ErrorHandler,
+                 db_interface: DatabaseInterface,
+                 config_manager: ConfigurationManager,
                  worker_id: Optional[str] = None,
                  orchestrator_url: Optional[str] = None,
                  orchestrator_instance: Optional[Any] = None):
@@ -59,6 +63,7 @@ class Worker:
             settings: System configuration
             logger: System logger instance
             error_handler: Error handler instance
+            db_interface: Database interface for storing results
             worker_id: Unique worker identifier
             orchestrator_url: URL for orchestrator API (EKS mode)
             orchestrator_instance: Direct orchestrator reference (single-process mode)
@@ -66,6 +71,8 @@ class Worker:
         self.settings = settings
         self.logger = logger
         self.error_handler = error_handler
+        self.db_interface = db_interface
+        self.config_manager = config_manager
         self.worker_id = worker_id or f"worker-{int(time.time())}"
         
         # Deployment mode detection
@@ -91,7 +98,6 @@ class Worker:
         
         # Component factories (will be populated by dependency injection)
         self.connector_factory: Optional[ConnectorFactory] = None
-        self.classifier_factory: Optional[ClassifierFactory] = None
         
         # Performance metrics
         self.tasks_completed = 0
@@ -100,15 +106,14 @@ class Worker:
 
         self.logger.log_component_lifecycle("Worker", "INITIALIZED", worker_id=self.worker_id)
 
-    def set_factories(self, connector_factory: 'ConnectorFactory', classifier_factory: 'ClassifierFactory'):
+    def set_factories(self, connector_factory: 'ConnectorFactory'):
         """Inject the factory dependencies after construction."""
         self.connector_factory = connector_factory
-        self.classifier_factory = classifier_factory
 
     def start(self):
         """Start the worker main loop."""
-        if not self.connector_factory or not self.classifier_factory:
-            raise RuntimeError("Factories must be set before starting worker")
+        if not self.connector_factory:
+            raise RuntimeError("ConnectorFactory must be set before starting worker")
             
         self.logger.log_component_lifecycle("Worker", "STARTING", worker_id=self.worker_id)
         self.status = WorkerStatus.IDLE
@@ -233,7 +238,17 @@ class Worker:
             elif work_packet.payload.task_type == TaskType.DISCOVERY_GET_DETAILS:
                 self._process_discovery_get_details(work_packet)
             elif work_packet.payload.task_type == TaskType.CLASSIFICATION:
-                self._process_classification(work_packet)
+                # Run classification in proper async context
+                try:
+                    asyncio.run(self._process_classification(work_packet))
+                except RuntimeError as e:
+                    if "cannot be called from a running event loop" in str(e):
+                        # Handle nested event loop case  
+                        loop = asyncio.get_running_loop()
+                        task = loop.create_task(self._process_classification(work_packet))
+                        loop.run_until_complete(task)
+                    else:
+                        raise
             elif work_packet.payload.task_type == TaskType.DELTA_CALCULATE:
                 self._process_delta_calculate(work_packet)
             else:
@@ -321,104 +336,401 @@ class Worker:
         )
         self._report_task_progress(work_packet.header.task_id, progress)
 
-    def _process_classification_ToBeRemoved(self, work_packet: WorkPacket):
-        """Process CLASSIFICATION task."""
-        payload = work_packet.payload
-        
-        # Get appropriate connector and classifier
-        connector = self.connector_factory.get_connector(payload.datasource_id)
-        classifier = self.classifier_factory.get_classification_engine(payload.classifier_template_id)
-        
-        # Process content classification
-        total_findings = 0
-        objects_processed = 0
-        
-        for content_batch in connector.get_object_content(work_packet):
-            object_id = content_batch.get("object_id")
-            content = content_batch.get("content")
-            
-            if object_id and content:
-                # Classify content
-                findings = classifier.classify_content(object_id, content, work_packet)
-                total_findings += len(findings)
-                objects_processed += 1
-                
-                # Send heartbeat periodically
-                if objects_processed % 10 == 0:
-                    self._send_heartbeat(work_packet.header.task_id)
-
-        self.logger.info(f"Classification completed: {objects_processed} objects, {total_findings} findings",
-                        task_id=work_packet.header.task_id,
-                        objects_processed=objects_processed,
-                        total_findings=total_findings)
-
-
-    def _process_classification(self, work_packet: WorkPacket):
+    async def _process_classification(self, work_packet: WorkPacket):
         """Process CLASSIFICATION task with interface detection."""
         payload = work_packet.payload
         
-        # Get appropriate connector and classifier
+        # Get appropriate connector
         connector = self.connector_factory.get_connector(payload.datasource_id)
-        classifier = self.classifier_factory.get_classification_engine(payload.classifier_template_id)
+        
+        # Create EngineInterface for this specific work packet
+        job_context = {
+            "job_id": work_packet.header.trace_id,
+            "task_id": work_packet.header.task_id,
+            "datasource_id": work_packet.payload.datasource_id,
+            "trace_id": work_packet.header.trace_id,
+            "worker_id": self.worker_id
+        }
+        
+        # Create fresh EngineInterface for this task
+        engine_interface = EngineInterface(
+            db_interface=self.db_interface,
+            config_manager=self.config_manager,
+            system_logger=self.logger,
+            error_handler=self.error_handler,
+            job_context=job_context
+        )
+        
+        # Initialize engine interface for this template
+        try:
+            engine_interface.initialize_for_template(payload.classifier_template_id)
+        except Exception as e:
+            error = self.error_handler.handle_error(
+                e, "initialize_engine_interface",
+                operation="engine_initialization",
+                template_id=payload.classifier_template_id,
+                trace_id=work_packet.header.trace_id
+            )
+            self.logger.error("Failed to initialize EngineInterface", error_id=error.error_id)
+            raise
         
         # Detect connector type and route appropriately
         if isinstance(connector, IFileDataSourceConnector):
-            self._process_file_based_classification(connector, classifier, work_packet)
+            await self._process_file_based_classification(connector, engine_interface, work_packet)
         elif isinstance(connector, IDatabaseDataSourceConnector):
-            self._process_database_classification(connector, classifier, work_packet)
+            await self._process_database_classification(connector, engine_interface, work_packet)
         else:
-            # Fallback to legacy behavior for existing connectors
-            self._process_database_classification(connector, classifier, work_packet)
+            # Fallback to database classification for existing connectors
+            await self._process_database_classification(connector, engine_interface, work_packet)
 
-    def _process_file_based_classification(self, connector: IFileDataSourceConnector, 
-                                         classifier: IClassificationEngine, work_packet: WorkPacket):
+    async def _process_file_based_classification(self, connector: IFileDataSourceConnector, 
+                                               engine_interface: EngineInterface, work_packet: WorkPacket):
         """Handle file-based connectors with ContentComponent interface."""
-        total_findings = 0
+        all_findings = []  # Accumulate ALL findings from all components
         components_processed = 0
+        total_components = 0
         
-        # Process ContentComponent objects
+        self.logger.info("Starting file-based classification",
+                        task_id=work_packet.header.task_id)
+        
+        # Process ContentComponent objects and accumulate findings
         for content_component in connector.get_object_content(work_packet):
-            # Route component to appropriate classification method
-            findings = self._classify_content_component(content_component, classifier, work_packet)
-            total_findings += len(findings)
-            components_processed += 1
+            total_components += 1
+            
+            try:
+                # Get findings for this component
+                component_findings = await self._classify_content_component(content_component, engine_interface, work_packet)
+                all_findings.extend(component_findings)  # Accumulate findings
+                components_processed += 1
+                
+                self.logger.debug("Component classified",
+                                component_id=content_component.component_id,
+                                component_type=content_component.component_type,
+                                findings_count=len(component_findings))
+                
+            except Exception as e:
+                error = self.error_handler.handle_error(
+                    e, f"classify_component_{content_component.component_id}",
+                    operation="component_classification",
+                    component_type=content_component.component_type,
+                    trace_id=work_packet.header.trace_id
+                )
+                self.logger.warning("Component classification failed", error_id=error.error_id)
+                # Continue processing other components
             
             # Send heartbeat periodically
             if components_processed % 10 == 0:
                 self._send_heartbeat(work_packet.header.task_id)
 
-        self.logger.info(f"File-based classification completed",
+        # Convert ALL accumulated findings to database format
+        self.logger.info("Converting findings to database format",
+                        task_id=work_packet.header.task_id,
+                        total_findings=len(all_findings),
+                        total_components=total_components)
+        
+        db_records = engine_interface.convert_findings_to_db_format(
+            all_findings=all_findings,
+            total_rows_scanned=total_components  # For files, this represents component count
+        )
+        
+        # Store results in database
+        await self._store_classification_results(db_records, work_packet)
+
+        self.logger.info("File-based classification completed",
                         task_id=work_packet.header.task_id,
                         components_processed=components_processed,
-                        total_findings=total_findings)
+                        total_components=total_components,
+                        total_findings=len(all_findings),
+                        db_records_created=len(db_records))
 
-    def _process_database_classification(self, connector: IDatabaseDataSourceConnector,
-                                       classifier: IClassificationEngine, work_packet: WorkPacket):
-        """Handle database connectors with existing dict interface (UNCHANGED)."""
-        total_findings = 0
+    async def _process_database_classification(self, connector: IDatabaseDataSourceConnector,
+                                             engine_interface: EngineInterface, work_packet: WorkPacket):
+        """Handle database connectors with existing dict interface."""
+        all_findings = []  # Accumulate ALL findings from all objects
         objects_processed = 0
+        total_objects = 0
         
-        # Process dict objects (existing logic)
+        self.logger.info("Starting database classification",
+                        task_id=work_packet.header.task_id)
+        
+        # Process dict objects and accumulate findings
         for content_batch in connector.get_object_content(work_packet):
+            total_objects += 1
             object_id = content_batch.get("object_id")
             content = content_batch.get("content")
             
             if object_id and content:
-                # Classify content using existing method
-                findings = classifier.classify_content(object_id, content, work_packet)
-                total_findings += len(findings)
-                objects_processed += 1
+                try:
+                    # For database content, treat as document content
+                    file_metadata = {
+                        "file_path": f"database_object_{object_id}",
+                        "file_name": object_id,
+                        "field_name": object_id,
+                        "extraction_source": "database"
+                    }
+                    
+                    # Get findings for this database object
+                    object_findings = await engine_interface.classify_document_content(
+                        content=content,
+                        file_metadata=file_metadata
+                    )
+                    
+                    all_findings.extend(object_findings)  # Accumulate findings
+                    objects_processed += 1
+                    
+                    self.logger.debug("Database object classified",
+                                    object_id=object_id,
+                                    findings_count=len(object_findings))
+                    
+                except Exception as e:
+                    error = self.error_handler.handle_error(
+                        e, f"classify_database_object_{object_id}",
+                        operation="database_object_classification",
+                        object_id=object_id,
+                        trace_id=work_packet.header.trace_id
+                    )
+                    self.logger.warning("Database object classification failed", error_id=error.error_id)
+                    # Continue processing other objects
                 
                 # Send heartbeat periodically
                 if objects_processed % 10 == 0:
                     self._send_heartbeat(work_packet.header.task_id)
 
-        self.logger.info(f"Database classification completed",
+        # Convert ALL accumulated findings to database format
+        self.logger.info("Converting findings to database format",
+                        task_id=work_packet.header.task_id,
+                        total_findings=len(all_findings),
+                        total_objects=total_objects)
+        
+        db_records = engine_interface.convert_findings_to_db_format(
+            all_findings=all_findings,
+            total_rows_scanned=total_objects  # For database, this represents object count
+        )
+        
+        # Store results in database
+        await self._store_classification_results(db_records, work_packet)
+
+        self.logger.info("Database classification completed",
                         task_id=work_packet.header.task_id,
                         objects_processed=objects_processed,
-                        total_findings=total_findings)
+                        total_objects=total_objects,
+                        total_findings=len(all_findings),
+                        db_records_created=len(db_records))
 
+    async def _classify_content_component(self, component: ContentComponent, 
+                                        engine_interface: EngineInterface, work_packet: WorkPacket) -> List[PIIFinding]:
+        """Route ContentComponent to appropriate classification method and return accumulated findings."""
+        try:
+            if component.component_type == "table":
+                # Route to row-by-row classification
+                return await self._classify_table_component(component, engine_interface, work_packet)
+                
+            elif component.component_type in ["text", "image_ocr", "table_fallback", "archive_member"]:
+                # Route to document content classification
+                file_metadata = {
+                    "file_path": component.parent_path,
+                    "file_name": component.parent_path.split('/')[-1] if component.parent_path else component.component_id,
+                    "field_name": component.component_id,
+                    "component_type": component.component_type,
+                    "extraction_method": component.extraction_method,
+                    "extraction_source": "archive_member" if component.is_archive_extraction else "file"
+                }
+                
+                if component.is_archive_extraction:
+                    archive_parent = component.parent_path.split('/')[0] if component.parent_path else ""
+                    file_metadata["archive_parent"] = archive_parent
+                
+                return await engine_interface.classify_document_content(
+                    content=component.content,
+                    file_metadata=file_metadata
+                )
+                
+            elif component.component_type in ["extraction_error", "unsupported_format", "file_too_large", "no_content_extractable"]:
+                # No classification needed for error components
+                self.logger.debug("Skipping classification for error component",
+                                component_id=component.component_id,
+                                component_type=component.component_type)
+                return []
+            else:
+                self.logger.warning("Unknown component type for classification",
+                                   component_type=component.component_type,
+                                   component_id=component.component_id)
+                return []
+        except Exception as e:
+            self.logger.error("Component classification failed",
+                             component_id=component.component_id,
+                             error=str(e))
+            return []
 
+    async def _classify_table_component(self, component: ContentComponent, 
+                                      engine_interface: EngineInterface, work_packet: WorkPacket) -> List[PIIFinding]:
+        """Handle table component: row-by-row classification with accumulation."""
+        
+        all_row_findings = []  # Accumulate findings from all rows in this table
+        
+        try:
+            # Validate component has required table data
+            if not hasattr(component, 'schema') or not component.schema:
+                self.logger.warning("Table component missing schema",
+                                   component_id=component.component_id)
+                return []
+            
+            table_schema = component.schema
+            
+            # Handle both possible table data formats
+            table_rows = []
+            if "rows" in table_schema and isinstance(table_schema["rows"], list):
+                # Structured format: data in schema
+                table_rows = table_schema["rows"]
+            elif component.content:
+                # Serialized format: parse from content
+                table_rows = self._parse_serialized_table_content(component.content, table_schema)
+            
+            if not table_rows:
+                self.logger.warning("Table component has no rows to process",
+                                   component_id=component.component_id)
+                return []
+            
+            headers = table_schema.get("headers", [])
+            
+            # Build table metadata for classification
+            table_metadata = {
+                "table_name": component.component_id,
+                "columns": {header: {} for header in headers},
+                "source_file": component.parent_path,
+                "component_type": component.component_type,
+                "schema_name": None  # Files don't have schema names
+            }
+            
+            # Classify each row individually and accumulate findings
+            for row_index, row_data in enumerate(table_rows):
+                try:
+                    # Ensure row_data is dict format
+                    if not isinstance(row_data, dict):
+                        self.logger.warning("Invalid row data format",
+                                           component_id=component.component_id,
+                                           row_index=row_index,
+                                           row_type=type(row_data))
+                        continue
+                    
+                    row_pk = {
+                        "row_index": row_index, 
+                        "component_id": component.component_id
+                    }
+                    
+                    # Single row classification call
+                    row_findings = await engine_interface.classify_database_row(
+                        row_data=row_data,
+                        row_pk=row_pk,
+                        table_metadata=table_metadata
+                    )
+                    
+                    # Add component context to each finding
+                    for finding in row_findings:
+                        if not hasattr(finding, 'context_data') or finding.context_data is None:
+                            finding.context_data = {}
+                        finding.context_data.update({
+                            "component_id": component.component_id,
+                            "component_type": component.component_type,
+                            "extraction_method": component.extraction_method,
+                            "row_index": row_index,
+                            "file_path": component.parent_path,
+                            "file_name": component.parent_path.split('/')[-1] if component.parent_path else component.component_id,
+                            "field_name": component.component_id  # Use component_id as field_name
+                        })
+                    
+                    # Accumulate row findings
+                    all_row_findings.extend(row_findings)
+                    
+                except Exception as row_error:
+                    self.logger.warning("Row classification failed",
+                                       component_id=component.component_id,
+                                       row_index=row_index,
+                                       error=str(row_error))
+                    # Continue processing other rows
+                    continue
+            
+            self.logger.info("Table component classification completed",
+                            component_id=component.component_id,
+                            rows_processed=len(table_rows),
+                            findings_found=len(all_row_findings))
+            
+            return all_row_findings  # Return accumulated findings from all rows
+            
+        except Exception as e:
+            self.logger.error("Table component classification failed",
+                             component_id=component.component_id, 
+                             error=str(e))
+            return []
+
+    def _parse_serialized_table_content(self, content: str, schema: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Parse serialized table content into row dictionaries."""
+        try:
+            if not content or not content.strip():
+                return []
+            
+            headers = schema.get("headers", [])
+            if not headers:
+                return []
+            
+            # Split content into rows (assuming newline separated)
+            content_lines = content.strip().split('\n')
+            rows = []
+            
+            for line in content_lines:
+                if not line.strip():
+                    continue
+                
+                # Split by pipe separator (based on specification examples)
+                values = [v.strip() for v in line.split('|')]
+                
+                # Create row dict matching headers
+                row_dict = {}
+                for i, header in enumerate(headers):
+                    row_dict[header] = values[i] if i < len(values) else ""
+                
+                rows.append(row_dict)
+            
+            return rows
+            
+        except Exception as e:
+            self.logger.error("Failed to parse serialized table content",
+                             error=str(e))
+            return []
+
+    async def _store_classification_results(self, db_records: List[Dict[str, Any]], work_packet: WorkPacket):
+        """Store classification results in database."""
+        if not db_records:
+            self.logger.info("No classification results to store",
+                            task_id=work_packet.header.task_id)
+            return
+            
+        try:
+            # Build job context for database call
+            job_context = {
+                "job_id": work_packet.header.trace_id,  # Use trace_id as job_id
+                "task_id": work_packet.header.task_id,
+                "datasource_id": work_packet.payload.datasource_id,
+                "trace_id": work_packet.header.trace_id,
+                "worker_id": self.worker_id
+            }
+            
+            # Store results using database interface
+            self.db_interface.insert_scan_findings(db_records, context=job_context)
+            
+            self.logger.info("Classification results stored successfully",
+                            task_id=work_packet.header.task_id,
+                            records_stored=len(db_records))
+            
+        except Exception as e:
+            error = self.error_handler.handle_error(
+                e, "store_classification_results",
+                operation="database_insert",
+                task_id=work_packet.header.task_id,
+                records_count=len(db_records)
+            )
+            self.logger.error("Failed to store classification results", error_id=error.error_id)
+            raise
 
     def _process_delta_calculate(self, work_packet: WorkPacket):
         """Process DELTA_CALCULATE task."""
@@ -525,63 +837,9 @@ class Worker:
             self.logger.warning("Failed to send heartbeat", error_id=error.error_id)
 
 
-    def _classify_content_component(self, component: ContentComponent, 
-                                   classifier: IClassificationEngine, work_packet: WorkPacket) -> List[PIIFinding]:
-        """Route ContentComponent to appropriate classification method."""
-        try:
-            if component.component_type == "table":
-                # Route to structured data classification
-                return self._classify_table_component(component, classifier, work_packet)
-            elif component.component_type in ["text", "image_ocr", "table_fallback", "archive_member"]:
-                # Route to unstructured text classification
-                return classifier.classify_content(component.object_id, component.content, work_packet)
-            elif component.component_type in ["extraction_error", "unsupported_format", "file_too_large"]:
-                # No classification needed for error components
-                return []
-            else:
-                self.logger.warning("Unknown component type for classification",
-                                   component_type=component.component_type,
-                                   component_id=component.component_id)
-                return []
-        except Exception as e:
-            self.logger.error("Component classification failed",
-                             component_id=component.component_id,
-                             error=str(e))
-            return []
-
-    def _classify_table_component(self, component: ContentComponent, 
-                                 classifier: IClassificationEngine, work_packet: WorkPacket) -> List[PIIFinding]:
-        """Handle table component classification with structured data."""
-        # Convert table schema to rows and classify each row
-        # Implementation depends on classification engine capabilities
-        # For now, fallback to text content classification
-        return classifier.classify_content(component.object_id, component.content, work_packet)
-
-
 # =============================================================================
 # Factory Classes for Dependency Injection
 # =============================================================================
-
-class ConnectorFactory_ToBeRemoved:
-    """Factory for creating connector instances based on datasource configuration."""
-    
-    def __init__(self, logger: SystemLogger, error_handler: ErrorHandler):
-        self.logger = logger
-        self.error_handler = error_handler
-        self.connector_registry: Dict[str, IDataSourceConnector] = {}
-        
-    def register_connector(self, datasource_id: str, connector: IDataSourceConnector):
-        """Register a connector instance for a specific datasource."""
-        self.connector_registry[datasource_id] = connector
-        self.logger.info(f"Registered connector for datasource {datasource_id}")
-        
-    def get_connector(self, datasource_id: str) -> IDataSourceConnector:
-        """Get connector instance for datasource."""
-        if datasource_id not in self.connector_registry:
-            raise ValueError(f"No connector registered for datasource: {datasource_id}")
-        return self.connector_registry[datasource_id]
-
-
 
 class ConnectorFactory:
     """Factory for creating connector instances with interface detection."""
@@ -607,24 +865,25 @@ class ConnectorFactory:
         return self.connector_registry[datasource_id]
 
 
-class ClassifierFactory:
-    """Factory for creating classification engine instances based on template configuration."""
+class EngineFactory:
+    """Factory for creating EngineInterface instances."""
     
-    def __init__(self, logger: SystemLogger, error_handler: ErrorHandler):
+    def __init__(self, db_interface: DatabaseInterface, config_manager: ConfigurationManager, 
+                 logger: SystemLogger, error_handler: ErrorHandler):
+        self.db_interface = db_interface
+        self.config_manager = config_manager
         self.logger = logger
         self.error_handler = error_handler
-        self.engine_registry: Dict[str, IClassificationEngine] = {}
         
-    def register_classification_engine(self, template_id: str, engine: IClassificationEngine):
-        """Register a classification engine for a specific template."""
-        self.engine_registry[template_id] = engine
-        self.logger.info(f"Registered classification engine for template {template_id}")
-        
-    def get_classification_engine(self, template_id: str) -> IClassificationEngine:
-        """Get classification engine instance for template."""
-        if template_id not in self.engine_registry:
-            raise ValueError(f"No classification engine registered for template: {template_id}")
-        return self.engine_registry[template_id]
+    def create_engine_interface(self, job_context: Dict[str, Any]) -> EngineInterface:
+        """Create a fresh EngineInterface instance for a specific job context."""
+        return EngineInterface(
+            db_interface=self.db_interface,
+            config_manager=self.config_manager,
+            system_logger=self.logger,
+            error_handler=self.error_handler,
+            job_context=job_context
+        )
 
 
 # =============================================================================
@@ -634,13 +893,14 @@ class ClassifierFactory:
 def create_worker(settings: SystemConfig, 
                  logger: SystemLogger, 
                  error_handler: ErrorHandler,
+                 db_interface: DatabaseInterface,
+                 config_manager: ConfigurationManager,
                  connector_factory: ConnectorFactory,
-                 classifier_factory: ClassifierFactory,
                  **kwargs) -> Worker:
     """Factory function to create a properly configured worker instance."""
     
-    worker = Worker(settings, logger, error_handler, **kwargs)
-    worker.set_factories(connector_factory, classifier_factory)
+    worker = Worker(settings, logger, error_handler, db_interface, config_manager, **kwargs)
+    worker.set_factories(connector_factory)
     
     return worker
 
@@ -649,8 +909,9 @@ def create_worker_pool(count: int,
                       settings: SystemConfig,
                       logger: SystemLogger, 
                       error_handler: ErrorHandler,
+                      db_interface: DatabaseInterface,
+                      config_manager: ConfigurationManager,
                       connector_factory: ConnectorFactory,
-                      classifier_factory: ClassifierFactory,
                       **worker_kwargs) -> List[Worker]:
     """Create a pool of worker instances."""
     
@@ -658,8 +919,8 @@ def create_worker_pool(count: int,
     for i in range(count):
         worker_id = f"worker-pool-{i+1}"
         worker = create_worker(
-            settings, logger, error_handler,
-            connector_factory, classifier_factory,
+            settings, logger, error_handler, db_interface, config_manager,
+            connector_factory,
             worker_id=worker_id,
             **worker_kwargs
         )
