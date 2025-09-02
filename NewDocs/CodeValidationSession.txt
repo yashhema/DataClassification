@@ -1,0 +1,106 @@
+# Code Validation Session - Continuation Prompt
+
+## Role and Methodology
+
+I am acting as a **code validator** for a distributed classification system with three deployment models (Single-Process, EKS, Federated). My validation approach prioritizes:
+
+1. **Logging and Error Handling as Primary Concerns** - Every component must integrate properly with centralized logging and structured error handling
+2. **Specification Compliance** - Code must match original architecture documents exactly
+3. **Production Readiness** - Focus on distributed system debugging, traceability, and operational requirements
+
+## Critical Validation Rules
+
+### **Incomplete Code Detection**
+I immediately flag any code containing:
+- `# ... (rest of code remains the same)`
+- `# ... existing implementation ...`
+- Any ellipsis or truncation markers
+
+I refuse validation until complete implementation is provided to prevent source code corruption.
+
+### **Architecture Requirements**
+Every component must demonstrate:
+- **SystemLogger Integration**: Proper ambient_context with source identification (component_name, machine_name, node_group, deployment_model)
+- **ErrorHandler Integration**: All exceptions converted to ClassificationError, no console print() statements
+- **Trace Context Propagation**: trace_id maintained across operations
+- **Database-as-Source-of-Truth**: Critical state persisted for crash recovery
+
+## Components Validated and Status
+
+### **✅ COMPLETED**
+**SystemLogger** (`src/core/logging/system_logger.py`)
+- Source context validation implemented
+- Performance sampling with circuit breaker
+- JSON formatting for distributed logs
+- All specification-required logging methods present
+
+**ErrorHandler** (`src/core/errors.py`)
+- Circuit breaker for database persistence failures  
+- Integration with SystemLogger (no console output)
+- Context-aware severity determination
+- Error registry with LRU eviction
+
+**Main.py** (`src/main.py`)
+- Multi-modal startup (orchestrator/worker/single-process)
+- Proper error handling with SystemLogger integration
+- Configuration loading with graceful failure
+
+### **🔍 CURRENTLY VALIDATING**
+**ConfigurationManager** (`src/core/config/configuration_manager.py`)
+
+**Critical Issues Found:**
+- Uses `print()` instead of SystemLogger integration
+- No ErrorHandler integration for file/parsing failures
+- Missing auto-population of system identity fields
+- Missing specification parameters (global_cpu_threshold_percent, etc.)
+
+## Key Architecture Decisions Made
+
+### **Logging Architecture**
+- Dual output eliminated: SystemLogger handles all output via standard logging handlers
+- Ambient context pattern: Source identification automatically included in all logs
+- Performance sampling: High-frequency events (progress batches) use configurable sampling rates
+
+### **Error Handling Architecture**  
+- Centralized through ErrorHandler: All exceptions converted to structured ClassificationError
+- Circuit breaker pattern: Database persistence failures don't cascade
+- No console output in production code: All output routed through SystemLogger
+
+### **Integration Patterns**
+Components must be initialized with:
+```python
+ambient_context = {
+    "deployment_model": "EKS",
+    "component_name": "Orchestrator", 
+    "machine_name": socket.gethostname(),
+    "node_group": "production-east"
+}
+system_logger = SystemLogger(base_logger, "JSON", ambient_context)
+error_handler = ErrorHandler()
+```
+
+## Specifications Referenced
+
+1. **System Deployment Models & Operational Flow** - Three deployment patterns
+2. **Orchestrator Lifecycle & Resource Management** - Database-as-truth, in-memory caching
+3. **Worker-Orchestrator Interface Specification** - API contracts, tracing requirements
+4. **Configuration Specification** - System parameters, startup modes
+
+## Validation Approach
+
+For each component, I check:
+1. **Runtime Safety**: Will it crash? Missing imports? Type errors?
+2. **Logging Compliance**: Proper SystemLogger usage with required context?
+3. **Error Integration**: ErrorHandler used instead of raw exceptions?
+4. **Specification Match**: All required methods/parameters present?
+5. **Production Readiness**: Distributed debugging capabilities?
+
+## Next Steps
+
+Continue validating remaining components in this order:
+1. Complete ConfigurationManager fixes
+2. DatabaseInterface (database operations, transaction safety)
+3. Core business logic components (Orchestrator, Worker)
+4. Integration testing between validated components
+
+The validation emphasizes operational excellence - these components must work reliably in production distributed environments with proper observability.

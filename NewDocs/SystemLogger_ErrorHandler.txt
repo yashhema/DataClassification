@@ -1,0 +1,232 @@
+# SystemLogger and ErrorHandler Implementation Specification
+
+**Document Purpose**: Defines the actual implementation and usage patterns for SystemLogger and ErrorHandler based on the current codebase.
+
+---
+
+## SystemLogger Implementation
+
+### Initialization
+```python
+SystemLogger(logger: logging.Logger, log_format: str = "TEXT", ambient_context: Optional[Dict[str, Any]] = None)
+```
+
+**Capabilities:**
+- JSON or TEXT log formatting
+- Ambient context propagation to all log entries
+- Performance sampling for high-frequency events
+- Automatic trace_id validation and fallback generation
+
+### Available Methods
+
+#### Configuration and Startup
+```python
+log_config_load(status: str, **context)
+log_component_lifecycle(component: str, event: str, **context)
+log_health_check(component: str, is_healthy: bool, **context)
+```
+
+#### Task Lifecycle
+```python
+log_task_assignment(task_id: int, worker_id: str, trace_id: Optional[str], **context)
+log_progress_batch(task_output_payload: Dict[str, Any], task_id: int, sampling_rate: float = 0.1, force_log: bool = False, **context)
+log_task_completion(task_id: int, status: str, **context)
+```
+
+#### Worker Health
+```python
+log_heartbeat(task_id: int, worker_id: str, **context)
+log_lease_expiry(task_id: int, worker_id: str, **context)
+log_worker_health(worker_id: str, is_healthy: bool, **context)
+```
+
+#### Resource and Database Operations
+```python
+log_resource_decision(job_id: int, decision: str, is_approved: bool, **context)
+log_database_operation(operation: str, table: str, status: str, **context)
+```
+
+#### Error Integration
+```python
+log_classification_error(error: "ClassificationError", trace_id: Optional[str], **context)
+```
+
+#### General Purpose
+```python
+info(message: str, **context)
+warning(message: str, **context)
+error(message: str, **context)
+```
+
+### Key Features
+
+#### Trace ID Validation
+- Automatically generates missing trace_ids as `missing_trace_{uuid}`
+- Adds `trace_warning` to context when trace_id is missing
+
+#### Performance Sampling
+- `log_progress_batch()` implements sampling to reduce high-frequency log volume
+- Tracks sampling statistics and periodically reports suppressed message counts
+- Supports `force_log=True` to bypass sampling for critical events
+
+#### Context Management
+- Merges ambient_context with method-specific context
+- Validates deployment_model presence in ambient_context
+
+---
+
+## ErrorHandler Implementation
+
+### Initialization
+```python
+ErrorHandler(max_registry_size: int = 1000, circuit_breaker_threshold: int = 5, circuit_breaker_timeout_seconds: int = 300)
+```
+
+### Primary Method
+```python
+handle_error(error: Exception, system_logger: "SystemLogger", db_interface: Optional["DatabaseInterface"] = None, persist_critical: bool = False, **context) -> ClassificationError
+```
+
+### Error Classification
+
+#### Supported Exception Types
+- `ValidationError` (Pydantic) → `PYDANTIC_VALIDATION_ERROR`
+- `SQLAlchemyError` → `DATABASE_OPERATION_FAILED` (retryable)
+- Generic exceptions → `SYSTEM_INTERNAL_ERROR`
+
+#### Context-Aware Severity
+- Startup phase errors: `ErrorSeverity.CRITICAL`
+- Runtime errors: `ErrorSeverity.HIGH`
+- Determined by `operation_phase="startup"` in context
+
+### Features
+
+#### Error Registry
+- OrderedDict-based LRU cache with configurable size limit
+- Automatic eviction of oldest errors when limit reached
+
+#### Circuit Breaker
+- Prevents repeated database persistence failures
+- Configurable failure threshold and timeout
+- Automatic recovery with half-open state testing
+
+#### Database Persistence
+- Critical/High severity errors persisted to database
+- Requires `SystemErrorLog` ORM model in `error_log_schema.py`
+- Circuit breaker prevents cascade failures
+
+---
+
+## Integration Patterns
+
+### Component Initialization
+```python
+def initialize_logging_and_errors():
+    # Setup base logger
+    base_logger = logging.getLogger(__name__)
+    
+    # Configure ambient context
+    ambient_context = {
+        "deployment_model": "EKS",
+        "component_id": "orchestrator-pod-1"
+    }
+    
+    # Initialize SystemLogger
+    system_logger = SystemLogger(base_logger, "JSON", ambient_context)
+    
+    # Initialize ErrorHandler
+    error_handler = ErrorHandler()
+    
+    return system_logger, error_handler
+```
+
+### Standard Error Handling Pattern
+```python
+def operation_with_error_handling():
+    try:
+        # ... operation logic ...
+        system_logger.log_config_load("SUCCESS")
+    except Exception as e:
+        classification_error = error_handler.handle_error(
+            error=e,
+            system_logger=system_logger,
+            db_interface=db_interface,
+            persist_critical=True,
+            operation_phase="startup",
+            trace_id="startup_123"
+        )
+        
+        if classification_error.severity == ErrorSeverity.CRITICAL:
+            sys.exit(1)
+```
+
+### Task Processing Pattern
+```python
+def process_task(work_packet):
+    try:
+        system_logger.log_task_assignment(
+            work_packet.header.task_id, 
+            "worker-1", 
+            work_packet.header.trace_id
+        )
+        # ... processing ...
+        system_logger.log_task_completion(work_packet.header.task_id, "COMPLETED")
+    except Exception as e:
+        error_handler.handle_error(
+            e, system_logger,
+            task_id=work_packet.header.task_id,
+            job_id=work_packet.header.job_id,
+            trace_id=work_packet.header.trace_id
+        )
+```
+
+---
+
+## Current Limitations and Dependencies
+
+### Required External Components
+- `SystemErrorLog` ORM model must exist in `core/db_models/error_log_schema.py`
+- `DatabaseInterface` with `get_session()` method
+- `ClassificationError` base exception class
+
+### Error Types Currently Defined
+```python
+NETWORK_CONNECTION_FAILED, RIGHTS_ACCESS_DENIED, CONFIGURATION_INVALID,
+PROCESSING_DATA_CORRUPTION, RESOURCE_MEMORY_EXHAUSTED, VALIDATION_SCHEMA_ERROR,
+SYSTEM_INTERNAL_ERROR, TASK_LEASE_EXPIRED, HEALTH_CHECK_FAILED,
+DATABASE_OPERATION_FAILED, PYDANTIC_VALIDATION_ERROR, RESOURCE_ALLOCATION_FAILED,
+FAIR_SHARE_VIOLATION
+```
+
+### Circuit Breaker Behavior
+- Opens after 5 consecutive database failures (configurable)
+- Timeout: 300 seconds (configurable)
+- Half-open state attempts single write to test recovery
+
+---
+
+## Missing Functionality (Future Enhancements)
+
+### SystemLogger Gaps
+- No method for batch operation logging (multiple database operations)
+- No performance timing integration (operation duration tracking)
+- No log level filtering by component
+- No correlation of related log entries across operations
+
+### ErrorHandler Gaps
+- No integration with system retry parameters (`worker.max_retries`)
+- No error pattern analysis or reporting
+- No alerting mechanism for critical error thresholds
+- No error correlation across related operations
+- No cleanup mechanism for circuit breaker state persistence
+
+### Integration Gaps
+- No automatic error-to-metric conversion for monitoring
+- No log shipping configuration for distributed deployments
+- No cross-component error correlation
+- No centralized error dashboard or reporting
+
+### Deployment-Specific Features
+- Single-Process: No thread-specific error tracking
+- EKS: No pod restart correlation with error history
+- Federated: No cross-datacenter error aggregation

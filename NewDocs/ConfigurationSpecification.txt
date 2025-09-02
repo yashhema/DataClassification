@@ -1,0 +1,75 @@
+# Startup, Deployment, and Configuration Specification
+
+This document provides a definitive guide to the application's startup sequence, its deployment in various models, and the system parameters that control its behavior.
+
+---
+
+### 1. The `main.py` Flexible Launcher
+
+The `src/main.py` script is the single entry point for the entire application. Its behavior is controlled by command-line arguments, allowing the same codebase to launch the full application for development or individual components for distributed production deployments.
+
+* **Core Logic**: The script uses a command-line argument parser (e.g., `argparse`) to detect a `--mode` flag. The value of this flag determines which components are initialized.
+
+* **Modes of Operation**:
+    * **Default (Single-Process Mode)**:
+        * **Command**: `python src/main.py`
+        * **Action**: If no `--mode` flag is provided, the script launches the application in single-process mode. It initializes the Orchestrator, the Resource Coordinator, the Webservice API, and a pool of Worker threads all within the same process.
+
+    * **Orchestrator Mode**:
+        * **Command**: `python src/main.py --mode orchestrator`
+        * **Action**: The script initializes **only** the Orchestrator, Resource Coordinator, and the Webservice API. It does **not** create any Worker threads. This mode is used for the Orchestrator pods in a distributed deployment.
+
+    * **Worker Mode**:
+        * **Command**: `python src/main.py --mode worker`
+        * **Action**: The script initializes **only** the Worker logic. It does **not** start an Orchestrator or an API. Its sole purpose is to begin its main loop of polling the Orchestrator for tasks. This mode is used for the Worker pods in a distributed deployment.
+
+---
+
+### 2. Deployment & Containerization Strategy
+
+The system is designed to be containerized for deployment in environments like Kubernetes (EKS). Two primary container images are built from the same codebase.
+
+* **Dockerfile Strategy**: A single, multi-stage `Dockerfile` is used to build the application. The final stage of the build process creates a base image containing the application code and all its dependencies.
+
+* **Image Creation**:
+    * **Orchestrator Image**: A Docker image is built from the base image. Its `CMD` or `ENTRYPOINT` is set to `python src/main.py --mode orchestrator`.
+    * **Worker Image**: A second Docker image is built from the same base image. Its `CMD` or `ENTRYPOINT` is set to `python src/main.py --mode worker`.
+
+This approach ensures that both core components are running the exact same version of the code, which simplifies version management and reduces the risk of deployment errors.
+
+---
+
+### 3. Configuration Loading Flow
+
+The system uses a layered approach to configuration to ensure consistency and flexibility, especially in distributed environments.
+
+1.  **Kubernetes ConfigMap**: All default configuration files (e.g., `system_default.yaml`) are stored in a Kubernetes **ConfigMap**.
+2.  **Volume Mounting**: When an Orchestrator or Worker pod starts, the ConfigMap is mounted as a volume into the container, making the configuration files accessible (e.g., at `/etc/config/system_default.yaml`).
+3.  **Initial Load**: The `ConfigurationManager` is initialized with the path to this mounted file. It loads the base settings, including the database connection string.
+4.  **Database Overrides**: Using the connection string, the `ConfigurationManager` connects to the central database and fetches any global or node-specific parameters from the `SystemParameters` table. These values override the defaults loaded from the file.
+5.  **Validation and Finalization**: The `ConfigurationManager` calls its `finalize()` method. This parses the complete, merged configuration dictionary into the strongly-typed `SystemConfig` Pydantic model. If any required parameters are missing or have invalid types, the application will **fail immediately on startup** with a clear error message.
+
+---
+
+### 4. System Startup Parameters
+
+The following parameters are defined in the `SystemConfig` Pydantic model and control the application's behavior.
+
+| Parameter Name                           | Component    | Default | Description                                                                                              |
+|------------------------------------------|--------------|---------|----------------------------------------------------------------------------------------------------------|
+| `orchestrator.deployment_model`          | Orchestrator | `EKS`   | The deployment model (`EKS` or `SINGLE_PROCESS`). This is a critical flag that changes resource logic.   |
+| `orchestrator.long_poll_timeout_seconds` | Orchestrator | `30`    | How long the Orchestrator holds a worker's `get_task` request if no work is available.                   |
+| `orchestrator.reaper_interval_seconds`   | Orchestrator | `120`   | How often the "Reaper" process checks for hung or timed-out tasks.                                       |
+| `orchestrator.task_cache_size`           | Orchestrator | `100`   | The number of pending tasks to pre-fetch from the database for each active job's in-memory queue.        |
+| `orchestrator.fair_sharing_policy`       | Orchestrator | `ROUND` | The algorithm used by the Resource Coordinator for fair sharing of workers between jobs.                 |
+| `worker.in_process_thread_count`         | Worker       | `8`     | The number of worker threads to create when running in `SINGLE_PROCESS` mode.                            |
+| `worker.task_timeout_seconds`            | Worker       | `600`   | The lease duration. If a worker doesn't heartbeat within this time, it's considered hung.                |
+| `worker.heartbeat_interval_seconds`      | Worker       | `60`    | How often a worker must report a heartbeat to the Orchestrator for long-running tasks.                   |
+| `worker.max_retries`                     | Worker       | `3`     | The maximum number of times a failed, retryable task will be attempted.                                  |
+| `worker.process_memory_limit_mb`         | Worker       | `4096`  | The hard memory limit for a worker process (used for the "Pre-Task Check" in EKS mode).                  |
+| `worker.global_cpu_threshold_percent`    | Worker       | `90`    | The system-wide CPU usage threshold that can trigger system back-pressure.                               |
+| `job.failure_threshold_percent`          | Job          | `10`    | If this percentage of tasks in a job fail, the entire job is marked as `FAILED`.                         |
+| `connector.discovery_batch_write_size`   | Connector    | `1000`  | The number of discovered objects a connector should batch before writing to the database.                |
+| `connector.easyocr_support_enabled`      | Connector    | `True`  | A feature flag to enable/disable OCR processing for images.                                              |
+| `connector.get_table_or_images_enabled`  | Connector    | `True`  | A feature flag for another specific connector capability.                                                |
+

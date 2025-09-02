@@ -1,0 +1,22 @@
+You're correct - this functionality is not clearly stated in the specifications I reviewed.
+
+Looking back at the documents:
+
+**What IS specified:**
+- Job creation and execution workflows
+- Task lifecycle management (PENDING → ASSIGNED → COMPLETED/FAILED)
+- Worker-Orchestrator communication patterns
+- Deployment models and resource management
+
+**What is NOT specified:**
+- Job pause/resume capabilities
+- Real-time job control mechanisms
+- Statistics collection interfaces
+- Command-line job management
+- REST API endpoints for job control
+
+The specifications focus on the core job execution flow but don't address operational control requirements for testing and monitoring. They define how jobs run to completion but not how to interrupt, pause, or gather metrics during execution.
+
+Your requirement for dual interfaces (CLI + API) for job control is a testing/operational need that extends beyond the current specifications. The closest the specs come to this is mentioning that jobs can be triggered "manually" but they don't define the mechanisms for ongoing job management.
+
+This represents a gap between the specified job execution architecture and the practical testing/operational requirements you need to implement.
