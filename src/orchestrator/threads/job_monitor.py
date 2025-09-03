@@ -1,6 +1,6 @@
 # src/orchestrator/threads/job_monitor.py
 """
-The JobCompletionMonitor is a background thread that monitors the status of
+The JobCompletionMonitor is a background coroutine that monitors the status of
 active jobs. It is responsible for transitioning jobs to their final state
 (e.g., COMPLETED, FAILED) once all their tasks are finished or a failure
 threshold is met. It also handles the graceful transition for paused jobs.
@@ -9,11 +9,13 @@ FIXES APPLIED:
 - Added JobState enum import for finalize_job_state calls
 - Updated finalize_job_state method calls to use JobState enums instead of strings
 - Maintained correct JobStatus enum usage for database queries
+ASYNC CONVERSION:
+- Converted from threading.Thread to async coroutine
+- All database calls now use await
+- Uses asyncio.sleep instead of threading.Event.wait
 """
 
-import threading
-import time
-
+import asyncio
 from core.db_models.job_schema import JobStatus
 
 # Import for type hinting and JobState enum access
@@ -24,34 +26,34 @@ else:
     # Import JobState for runtime use
     from orchestrator.orchestrator import JobState
 
-class JobCompletionMonitor(threading.Thread):
+class JobCompletionMonitor:
     """
     Monitors running jobs for completion, failure thresholds, and handles
     the final state transition for PAUSING jobs.
     """
     
     def __init__(self, orchestrator: "Orchestrator"):
-        super().__init__(name="JobMonitorThread", daemon=True)
         self.orchestrator = orchestrator
         self.logger = orchestrator.logger
         self.db = orchestrator.db
         self.interval = orchestrator.settings.orchestrator.job_monitor_interval_sec
+        self.name = "JobMonitorCoroutine"
 
-    def run(self):
-        """The main loop for the Job Monitor thread."""
+    async def run_async(self):
+        """The main async loop for the Job Monitor coroutine."""
         self.logger.log_component_lifecycle("JobMonitor", "STARTED")
         
-        while not self.orchestrator._shutdown_event.wait(self.interval):
+        while not self.orchestrator._shutdown_event.is_set():
             try:
                 # Fetch all jobs that are in a non-terminal state
                 # Using JobStatus enums (correct - matches database interface expectation)
-                jobs_to_check = self.db.get_active_jobs(
+                jobs_to_check = await self.db.get_active_jobs(
                     statuses=[JobStatus.RUNNING, JobStatus.PAUSING]
                 )
                 
                 for job in jobs_to_check:
                     try:
-                        self._process_job(job)
+                        await self._process_job(job)
                     except Exception as job_error:
                         self.logger.error(
                             f"Error processing job {job.id} in JobMonitor",
@@ -64,16 +66,19 @@ class JobCompletionMonitor(threading.Thread):
                 # Update liveness timestamp after a successful loop
                 self.orchestrator.update_thread_liveness("job_monitor")
                 
+                # Async sleep instead of threading.Event.wait
+                await asyncio.sleep(self.interval)
+                
             except Exception as e:
                 self.logger.error("An unexpected error occurred in the JobMonitor loop.", exc_info=True)
                 # Avoid tight loop on repeated database failures
-                time.sleep(self.interval)
+                await asyncio.sleep(self.interval)
         
         self.logger.log_component_lifecycle("JobMonitor", "STOPPED")
 
-    def _process_job(self, job):
+    async def _process_job(self, job):
         """Process a single job for state transitions."""
-        stats = self.db.get_job_progress_summary(job.id)
+        stats = await self.db.get_job_progress_summary(job.id)
         total_tasks = sum(stats.values())
         assigned_tasks = stats.get("ASSIGNED", 0)
         
@@ -83,7 +88,7 @@ class JobCompletionMonitor(threading.Thread):
         if job.status == JobStatus.PAUSING:
             if assigned_tasks == 0:
                 # Atomically transition the state in the DB
-                if self.db.transition_job_from_pausing_to_paused(job.id):
+                if await self.db.transition_job_from_pausing_to_paused(job.id):
                     # FIXED: Use JobState enum instead of string
                     self.orchestrator.finalize_job_state(job.id, JobState.PAUSED)
             return  # Don't check other transitions for pausing jobs

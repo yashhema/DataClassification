@@ -13,13 +13,15 @@ FIXES APPLIED: All critical bugs addressed
 - Integrated error_handler and memory validation
 - Fixed temp path generation with context IDs
 - Implemented all missing file type processors
+ASYNC CONVERSION: Converted all file I/O to async operations
 """
 
 import os
 import uuid
 import hashlib
 import tempfile
-from typing import Iterator, Dict, Any, List, Union, Optional
+import aiofiles
+from typing import AsyncIterator, Dict, Any, List, Union, Optional
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -28,7 +30,7 @@ from core.models import ContentComponent, ContentExtractionConfig
 from core.logging.system_logger import SystemLogger
 from core.db.configuration_manager import SystemConfig
 from core.errors import ErrorHandler
-
+import aiofiles.os
 class ContentExtractor:
     """Universal content extraction module for file-based connectors"""
     
@@ -58,8 +60,8 @@ class ContentExtractor:
     # Main Extraction Interface
     # =============================================================================
 
-    def extract_from_file(self, file_path: str, object_id: str, 
-                         job_id: int = 0, task_id: int = 0, datasource_id: str = "unknown") -> Iterator[ContentComponent]:
+    async def extract_from_file(self, file_path: str, object_id: str, 
+                               job_id: int = 0, task_id: int = 0, datasource_id: str = "unknown") -> AsyncIterator[ContentComponent]:
         """
         Main extraction method - routes file to appropriate extractor
         """
@@ -67,14 +69,15 @@ class ContentExtractor:
         
         try:
             # Memory validation before processing
-            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            stats = await aiofiles.os.stat(file_path)
+            file_size_mb = stats / (1024 * 1024)
             if not self._validate_extraction_resources(file_size_mb):
                 yield self._create_error_component(object_id, 
                     f"Insufficient memory for file processing (size: {file_size_mb:.2f}MB)")
                 return
             
             # Pre-validation - check file size limits
-            if not os.path.exists(file_path):
+            if not await aiofiles.os.path.exists(file_path):
                 yield self._create_error_component(object_id, f"File not found: {file_path}")
                 return
             
@@ -82,7 +85,7 @@ class ContentExtractor:
                 yield self._create_oversized_component(object_id, {
                     "path": file_path,
                     "size_mb": file_size_mb,
-                    "size_bytes": os.path.getsize(file_path)
+                    "size_bytes": (await aiofiles.os.stat(file_path)).st_size
                 })
                 return
             
@@ -98,11 +101,13 @@ class ContentExtractor:
             
             # Route to appropriate extractor
             if file_type in ['zip', 'tar']:
-                yield from self._process_archive(file_path, object_id, file_type, 
-                                               job_id, task_id, datasource_id)
+                async for component in self._process_archive(file_path, object_id, file_type, 
+                                                           job_id, task_id, datasource_id):
+                    yield component
             elif file_type in self.extractor_registry:
                 extractor = self.extractor_registry[file_type]
-                yield from extractor(file_path, object_id, job_id, task_id, datasource_id)
+                async for component in extractor(file_path, object_id, job_id, task_id, datasource_id):
+                    yield component
             else:
                 yield self._create_unsupported_component(object_id, file_path, file_type)
             
@@ -121,15 +126,15 @@ class ContentExtractor:
             yield self._create_error_component(object_id, f"System extraction error: {str(e)}")
         
         finally:
-            self._cleanup_temp_files(extraction_id)
+            await self._cleanup_temp_files_async(extraction_id)
 
     # =============================================================================
     # Archive Processing - Fixed Recursion and Depth Control
     # =============================================================================
 
-    def _process_archive(self, archive_path: str, object_id: str, file_type: str,
-                        job_id: int, task_id: int, datasource_id: str, 
-                        current_depth: int = 0) -> Iterator[ContentComponent]:
+    async def _process_archive(self, archive_path: str, object_id: str, file_type: str,
+                              job_id: int, task_id: int, datasource_id: str, 
+                              current_depth: int = 0) -> AsyncIterator[ContentComponent]:
         """
         Process archive with depth control and circular reference detection
         """
@@ -151,17 +156,19 @@ class ContentExtractor:
         
         try:
             if file_type == 'zip':
-                yield from self._process_zip_archive(archive_path, object_id, 
-                                                   job_id, task_id, datasource_id, current_depth)
+                async for component in self._process_zip_archive(archive_path, object_id, 
+                                                               job_id, task_id, datasource_id, current_depth):
+                    yield component
             elif file_type == 'tar':
-                yield from self._process_tar_archive(archive_path, object_id,
-                                                   job_id, task_id, datasource_id, current_depth)
+                async for component in self._process_tar_archive(archive_path, object_id,
+                                                               job_id, task_id, datasource_id, current_depth):
+                    yield component
         finally:
             self.processed_archive_paths.discard(archive_path)
 
-    def _process_zip_archive(self, archive_path: str, object_id: str,
-                           job_id: int, task_id: int, datasource_id: str,
-                           current_depth: int) -> Iterator[ContentComponent]:
+    async def _process_zip_archive(self, archive_path: str, object_id: str,
+                                 job_id: int, task_id: int, datasource_id: str,
+                                 current_depth: int) -> AsyncIterator[ContentComponent]:
         """Process ZIP archive without recursion"""
         
         try:
@@ -192,8 +199,8 @@ class ContentExtractor:
                         temp_member_path = self._create_temp_path(job_id, task_id, datasource_id, 
                                                                 f"zip_member_{processed_members}")
                         
-                        with open(temp_member_path, 'wb') as temp_file:
-                            temp_file.write(member_data)
+                        async with aiofiles.open(temp_member_path, 'wb') as temp_file:
+                            await temp_file.write(member_data)
                         self.temp_files_created.append(temp_member_path)
                         
                         # Process member
@@ -202,13 +209,15 @@ class ContentExtractor:
                         
                         # Check if member is also an archive (nested archives)
                         if member_file_type in ['zip', 'tar']:
-                            yield from self._process_archive(temp_member_path, member_object_id, 
-                                                           member_file_type, job_id, task_id, 
-                                                           datasource_id, current_depth + 1)
+                            async for component in self._process_archive(temp_member_path, member_object_id, 
+                                                                       member_file_type, job_id, task_id, 
+                                                                       datasource_id, current_depth + 1):
+                                yield component
                         else:
-                            yield from self._process_archive_member(temp_member_path, member_object_id,
-                                                                  member_file_type, archive_path, member_name,
-                                                                  job_id, task_id, datasource_id)
+                            async for component in self._process_archive_member(temp_member_path, member_object_id,
+                                                                              member_file_type, archive_path, member_name,
+                                                                              job_id, task_id, datasource_id):
+                                yield component
                         
                         processed_members += 1
                         
@@ -227,9 +236,9 @@ class ContentExtractor:
             self.logger.error("ZIP processing failed", error_id=error.error_id)
             yield self._create_error_component(object_id, f"ZIP processing failed: {str(e)}")
 
-    def _process_tar_archive(self, archive_path: str, object_id: str,
-                           job_id: int, task_id: int, datasource_id: str,
-                           current_depth: int) -> Iterator[ContentComponent]:
+    async def _process_tar_archive(self, archive_path: str, object_id: str,
+                                 job_id: int, task_id: int, datasource_id: str,
+                                 current_depth: int) -> AsyncIterator[ContentComponent]:
         """Process TAR archive without recursion"""
         
         try:
@@ -264,8 +273,8 @@ class ContentExtractor:
                         temp_member_path = self._create_temp_path(job_id, task_id, datasource_id,
                                                                 f"tar_member_{processed_members}")
                         
-                        with open(temp_member_path, 'wb') as temp_file:
-                            temp_file.write(member_data)
+                        async with aiofiles.open(temp_member_path, 'wb') as temp_file:
+                            await temp_file.write(member_data)
                         self.temp_files_created.append(temp_member_path)
                         
                         # Process member
@@ -274,13 +283,15 @@ class ContentExtractor:
                         
                         # Check if member is also an archive (nested archives)
                         if member_file_type in ['zip', 'tar']:
-                            yield from self._process_archive(temp_member_path, member_object_id,
-                                                           member_file_type, job_id, task_id,
-                                                           datasource_id, current_depth + 1)
+                            async for component in self._process_archive(temp_member_path, member_object_id,
+                                                                       member_file_type, job_id, task_id,
+                                                                       datasource_id, current_depth + 1):
+                                yield component
                         else:
-                            yield from self._process_archive_member(temp_member_path, member_object_id,
-                                                                  member_file_type, archive_path, member.name,
-                                                                  job_id, task_id, datasource_id)
+                            async for component in self._process_archive_member(temp_member_path, member_object_id,
+                                                                              member_file_type, archive_path, member.name,
+                                                                              job_id, task_id, datasource_id):
+                                yield component
                         
                         processed_members += 1
                         
@@ -299,9 +310,9 @@ class ContentExtractor:
             self.logger.error("TAR processing failed", error_id=error.error_id)
             yield self._create_error_component(object_id, f"TAR processing failed: {str(e)}")
 
-    def _process_archive_member(self, member_path: str, member_object_id: str, 
-                              member_file_type: str, archive_path: str, member_name: str,
-                              job_id: int, task_id: int, datasource_id: str) -> Iterator[ContentComponent]:
+    async def _process_archive_member(self, member_path: str, member_object_id: str, 
+                                    member_file_type: str, archive_path: str, member_name: str,
+                                    job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
         """
         Process archive member directly without recursion
         """
@@ -310,7 +321,7 @@ class ContentExtractor:
         if member_file_type in self.extractor_registry:
             extractor = self.extractor_registry[member_file_type]
             
-            for component in extractor(member_path, member_object_id, job_id, task_id, datasource_id):
+            async for component in extractor(member_path, member_object_id, job_id, task_id, datasource_id):
                 # Set component_type to 'archive_member' for all archive content
                 original_type = component.component_type
                 component.component_type = "archive_member"
@@ -331,7 +342,7 @@ class ContentExtractor:
                 component_id=f"{self._get_base_name(member_path)}_unsupported_1",
                 parent_path=f"{archive_path}/{member_name}",
                 content=f"Archive member type '{member_file_type}' not supported",
-                original_size=os.path.getsize(member_path),
+                original_size=(await aiofiles.os.stat(member_path)).st_size,
                 extracted_size=0,
                 is_truncated=False,
                 schema={},
@@ -374,8 +385,8 @@ class ContentExtractor:
     # PDF Processing - Added Missing Table Extraction
     # =============================================================================
 
-    def extract_pdf_components(self, file_path: str, object_id: str,
-                             job_id: int, task_id: int, datasource_id: str) -> Iterator[ContentComponent]:
+    async def extract_pdf_components(self, file_path: str, object_id: str,
+                                   job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
         """Complete PDF content extraction with PyMuPDF table support"""
         
         try:
@@ -399,12 +410,14 @@ class ContentExtractor:
                 
                 # 2. Extract tables (if enabled)
                 if self.extraction_config.features.extract_tables:
-                    yield from self._extract_pdf_tables_pymupdf_primary(file_path, object_id, doc)
+                    async for component in self._extract_pdf_tables_pymupdf_primary(file_path, object_id, doc):
+                        yield component
                 
                 # 3. Extract images (if enabled and OCR available)
                 if (self.extraction_config.features.extract_pictures and 
                     self._is_ocr_enabled()):
-                    yield from self._extract_pdf_images(file_path, object_id, doc, job_id, task_id, datasource_id)
+                    async for component in self._extract_pdf_images(file_path, object_id, doc, job_id, task_id, datasource_id):
+                        yield component
                 
             finally:
                 doc.close()
@@ -416,7 +429,7 @@ class ContentExtractor:
             self.logger.warning("PDF processing failed", file_path=file_path, error=str(e))
             yield self._create_error_component(object_id, f"PDF extraction failed: {str(e)}")
 
-    def _extract_pdf_tables_pymupdf_primary(self, file_path: str, object_id: str, doc) -> Iterator[ContentComponent]:
+    async def _extract_pdf_tables_pymupdf_primary(self, file_path: str, object_id: str, doc) -> AsyncIterator[ContentComponent]:
         """PyMuPDF table extraction as PRIMARY method before Camelot fallback"""
         
         table_index = 1
@@ -463,9 +476,10 @@ class ContentExtractor:
         
         # FALLBACK: Camelot if PyMuPDF failed
         if not tables_found:
-            yield from self._extract_pdf_tables_camelot_fallback(file_path, object_id, table_index)
+            async for component in self._extract_pdf_tables_camelot_fallback(file_path, object_id, table_index):
+                yield component
 
-    def _extract_pdf_tables_camelot_fallback(self, file_path: str, object_id: str, table_index: int) -> Iterator[ContentComponent]:
+    async def _extract_pdf_tables_camelot_fallback(self, file_path: str, object_id: str, table_index: int) -> AsyncIterator[ContentComponent]:
         """Camelot fallback for PDF table extraction"""
         
         base_name = self._get_base_name(file_path)
@@ -524,8 +538,8 @@ class ContentExtractor:
                                  camelot_error=str(camelot_error),
                                  tabula_error=str(tabula_error))
 
-    def _extract_pdf_images(self, file_path: str, object_id: str, doc, 
-                           job_id: int, task_id: int, datasource_id: str) -> Iterator[ContentComponent]:
+    async def _extract_pdf_images(self, file_path: str, object_id: str, doc, 
+                                 job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
         """Extract and OCR images from PDF"""
         import pymupdf as fitz
         
@@ -550,7 +564,7 @@ class ContentExtractor:
                         pix.save(temp_img_path)
                         self.temp_files_created.append(temp_img_path)
                         
-                        ocr_text = self._extract_text_from_image(temp_img_path)
+                        ocr_text = await self._extract_text_from_image_async(temp_img_path)
                         if ocr_text.strip():
                             yield ContentComponent(
                                 object_id=object_id,
@@ -558,7 +572,7 @@ class ContentExtractor:
                                 component_id=f"{base_name}_pdf_image_ocr_{image_index}",
                                 parent_path=file_path,
                                 content=ocr_text,
-                                original_size=os.path.getsize(temp_img_path),
+                                original_size=(await aiofiles.os.stat(temp_img_path)).st_size,
                                 extracted_size=len(ocr_text),
                                 is_truncated=False,
                                 schema={},
@@ -579,8 +593,8 @@ class ContentExtractor:
     # Word Document Processing - Added Missing Image Extraction
     # =============================================================================
 
-    def extract_docx_components(self, file_path: str, object_id: str,
-                              job_id: int, task_id: int, datasource_id: str) -> Iterator[ContentComponent]:
+    async def extract_docx_components(self, file_path: str, object_id: str,
+                                    job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
         """Complete Word document extraction"""
         
         try:
@@ -621,15 +635,16 @@ class ContentExtractor:
             
             # 3. Extract images (if enabled)
             if (self.extraction_config.features.extract_pictures and self._is_ocr_enabled()):
-                yield from self._extract_docx_images(file_path, object_id, doc, job_id, task_id, datasource_id)
+                async for component in self._extract_docx_images(file_path, object_id, doc, job_id, task_id, datasource_id):
+                    yield component
             
         except ImportError:
             yield self._create_error_component(object_id, "python-docx library not available")
         except Exception as e:
             yield self._create_error_component(object_id, f"Word document extraction failed: {str(e)}")
 
-    def _extract_docx_images(self, file_path: str, object_id: str, doc, 
-                           job_id: int, task_id: int, datasource_id: str) -> Iterator[ContentComponent]:
+    async def _extract_docx_images(self, file_path: str, object_id: str, doc, 
+                                 job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
         """Extract images from Word document"""
         
         if not self.ocr_available:
@@ -650,11 +665,11 @@ class ContentExtractor:
                         temp_img_path = self._create_temp_path(job_id, task_id, datasource_id, 
                                                              f"docx_img_{image_index}")
                         
-                        with open(temp_img_path, 'wb') as f:
-                            f.write(img_data)
+                        async with aiofiles.open(temp_img_path, 'wb') as f:
+                            await f.write(img_data)
                         self.temp_files_created.append(temp_img_path)
                         
-                        ocr_text = self._extract_text_from_image(temp_img_path)
+                        ocr_text = await self._extract_text_from_image_async(temp_img_path)
                         if ocr_text.strip():
                             yield ContentComponent(
                                 object_id=object_id,
@@ -684,8 +699,8 @@ class ContentExtractor:
     # Excel Processing - Added Text Extraction
     # =============================================================================
 
-    def extract_xlsx_components(self, file_path: str, object_id: str,
-                              job_id: int, task_id: int, datasource_id: str) -> Iterator[ContentComponent]:
+    async def extract_xlsx_components(self, file_path: str, object_id: str,
+                                    job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
         """Complete Excel workbook extraction with text and tables"""
         
         try:
@@ -747,7 +762,8 @@ class ContentExtractor:
             
             # Extract embedded images (if enabled)
             if (self.extraction_config.features.extract_pictures and self._is_ocr_enabled()):
-                yield from self._extract_xlsx_images(file_path, object_id, job_id, task_id, datasource_id)
+                async for component in self._extract_xlsx_images(file_path, object_id, job_id, task_id, datasource_id):
+                    yield component
             
         except ImportError:
             self.logger.warning("pandas/openpyxl not available", file_path=file_path)
@@ -756,8 +772,8 @@ class ContentExtractor:
             self.logger.warning("Excel processing failed", file_path=file_path, error=str(e))
             yield self._create_error_component(object_id, f"Excel extraction failed: {str(e)}")
 
-    def _extract_xlsx_images(self, file_path: str, object_id: str, 
-                           job_id: int, task_id: int, datasource_id: str) -> Iterator[ContentComponent]:
+    async def _extract_xlsx_images(self, file_path: str, object_id: str, 
+                                 job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
         """Extract images from Excel file"""
         
         if not self.ocr_available:
@@ -778,11 +794,11 @@ class ContentExtractor:
                         temp_img_path = self._create_temp_path(job_id, task_id, datasource_id, 
                                                              f"xlsx_img_{image_index}")
                         
-                        with open(temp_img_path, 'wb') as f:
-                            f.write(img_data)
+                        async with aiofiles.open(temp_img_path, 'wb') as f:
+                            await f.write(img_data)
                         self.temp_files_created.append(temp_img_path)
                         
-                        ocr_text = self._extract_text_from_image(temp_img_path)
+                        ocr_text = await self._extract_text_from_image_async(temp_img_path)
                         if ocr_text.strip():
                             yield ContentComponent(
                                 object_id=object_id,
@@ -812,8 +828,8 @@ class ContentExtractor:
     # PowerPoint Processing - Added Missing Implementation
     # =============================================================================
 
-    def extract_pptx_components(self, file_path: str, object_id: str,
-                              job_id: int, task_id: int, datasource_id: str) -> Iterator[ContentComponent]:
+    async def extract_pptx_components(self, file_path: str, object_id: str,
+                                    job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
         """Complete PowerPoint presentation extraction"""
         
         try:
@@ -870,15 +886,16 @@ class ContentExtractor:
             
             # Extract images (if enabled)
             if (self.extraction_config.features.extract_pictures and self._is_ocr_enabled()):
-                yield from self._extract_pptx_images(file_path, object_id, prs, job_id, task_id, datasource_id)
+                async for component in self._extract_pptx_images(file_path, object_id, prs, job_id, task_id, datasource_id):
+                    yield component
             
         except ImportError:
             yield self._create_error_component(object_id, "python-pptx library not available")
         except Exception as e:
             yield self._create_error_component(object_id, f"PowerPoint extraction failed: {str(e)}")
 
-    def _extract_pptx_images(self, file_path: str, object_id: str, prs, 
-                           job_id: int, task_id: int, datasource_id: str) -> Iterator[ContentComponent]:
+    async def _extract_pptx_images(self, file_path: str, object_id: str, prs, 
+                                 job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
         """Extract images from PowerPoint presentation"""
         from pptx.enum.shapes import MSO_SHAPE_TYPE
         
@@ -898,11 +915,11 @@ class ContentExtractor:
                         temp_img_path = self._create_temp_path(job_id, task_id, datasource_id, 
                                                              f"pptx_img_{image_index}")
                         
-                        with open(temp_img_path, 'wb') as f:
-                            f.write(image_bytes)
+                        async with aiofiles.open(temp_img_path, 'wb') as f:
+                            await f.write(image_bytes)
                         self.temp_files_created.append(temp_img_path)
                         
-                        ocr_text = self._extract_text_from_image(temp_img_path)
+                        ocr_text = await self._extract_text_from_image_async(temp_img_path)
                         if ocr_text.strip():
                             yield ContentComponent(
                                 object_id=object_id,
@@ -929,15 +946,15 @@ class ContentExtractor:
     # XML Processing - Complete Implementation
     # =============================================================================
 
-    def extract_xml_components(self, file_path: str, object_id: str,
-                             job_id: int, task_id: int, datasource_id: str) -> Iterator[ContentComponent]:
+    async def extract_xml_components(self, file_path: str, object_id: str,
+                                   job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
         """Complete XML file extraction"""
         
         try:
             import xml.etree.ElementTree as ET
             
-            with open(file_path, 'r', encoding='utf-8') as f:
-                xml_content = f.read()
+            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                xml_content = await f.read()
             
             # Parse XML structure
             root = ET.fromstring(xml_content)
@@ -1023,16 +1040,17 @@ class ContentExtractor:
     # Email Processing - Complete Implementation  
     # =============================================================================
 
-    def extract_eml_components(self, file_path: str, object_id: str,
-                             job_id: int, task_id: int, datasource_id: str) -> Iterator[ContentComponent]:
+    async def extract_eml_components(self, file_path: str, object_id: str,
+                                   job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
         """Complete email file extraction"""
         
         try:
             import email
             from email.policy import default
             
-            with open(file_path, 'rb') as f:
-                msg = email.message_from_binary_file(f, policy=default)
+            async with aiofiles.open(file_path, 'rb') as f:
+                msg_data = await f.read()
+                msg = email.message_from_bytes(msg_data, policy=default)
             
             base_name = self._get_base_name(file_path)
             
@@ -1051,9 +1069,10 @@ class ContentExtractor:
                     elif part.get_content_type() == "text/html":
                         # Parse HTML body for tables if enabled
                         if self.extraction_config.features.extract_tables:
-                            yield from self._extract_html_tables_from_content(
+                            async for component in self._extract_html_tables_from_content(
                                 part.get_content(), object_id, f"{base_name}_email_html"
-                            )
+                            ):
+                                yield component
             else:
                 email_text.append(msg.get_content())
             
@@ -1069,7 +1088,7 @@ class ContentExtractor:
         except Exception as e:
             yield self._create_error_component(object_id, f"Email extraction failed: {str(e)}")
 
-    def _extract_html_tables_from_content(self, html_content: str, object_id: str, base_id: str) -> Iterator[ContentComponent]:
+    async def _extract_html_tables_from_content(self, html_content: str, object_id: str, base_id: str) -> AsyncIterator[ContentComponent]:
         """Extract tables from HTML content string"""
         
         try:
@@ -1103,15 +1122,15 @@ class ContentExtractor:
     # HTML Processing - Added Image Processing
     # =============================================================================
 
-    def extract_html_components(self, file_path: str, object_id: str,
-                              job_id: int, task_id: int, datasource_id: str) -> Iterator[ContentComponent]:
+    async def extract_html_components(self, file_path: str, object_id: str,
+                                    job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
         """Complete HTML document extraction with image processing"""
         
         try:
             from bs4 import BeautifulSoup
             
-            with open(file_path, 'r', encoding='utf-8') as f:
-                html_content = f.read()
+            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                html_content = await f.read()
             
             soup = BeautifulSoup(html_content, 'html.parser')
             base_name = self._get_base_name(file_path)
@@ -1150,15 +1169,16 @@ class ContentExtractor:
             
             # 3. Extract image references (if enabled)
             if (self.extraction_config.features.extract_pictures and self._is_ocr_enabled()):
-                yield from self._extract_html_images(file_path, object_id, soup, job_id, task_id, datasource_id)
+                async for component in self._extract_html_images(file_path, object_id, soup, job_id, task_id, datasource_id):
+                    yield component
             
         except ImportError:
             yield self._create_error_component(object_id, "BeautifulSoup library not available")
         except Exception as e:
             yield self._create_error_component(object_id, f"HTML extraction failed: {str(e)}")
 
-    def _extract_html_images(self, file_path: str, object_id: str, soup, 
-                           job_id: int, task_id: int, datasource_id: str) -> Iterator[ContentComponent]:
+    async def _extract_html_images(self, file_path: str, object_id: str, soup, 
+                                 job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
         """Extract and OCR images referenced in HTML"""
         
         if not self.ocr_available:
@@ -1178,8 +1198,8 @@ class ContentExtractor:
                 html_dir = os.path.dirname(file_path)
                 image_path = os.path.join(html_dir, src)
                 
-                if os.path.exists(image_path):
-                    ocr_text = self._extract_text_from_image(image_path)
+                if await aiofiles.os.path.exists(image_path):
+                    ocr_text = await self._extract_text_from_image_async(image_path)
                     
                     if ocr_text.strip():
                         yield ContentComponent(
@@ -1188,7 +1208,7 @@ class ContentExtractor:
                             component_id=f"{base_name}_html_image_ocr_{image_index}",
                             parent_path=file_path,
                             content=ocr_text,
-                            original_size=os.path.getsize(image_path),
+                            original_size=(await aiofiles.os.stat(image_path)).st_size,
                             extracted_size=len(ocr_text),
                             is_truncated=False,
                             schema={},
@@ -1202,6 +1222,103 @@ class ContentExtractor:
                 self.logger.warning("Failed to process HTML image",
                                    src=src, error=str(img_error))
                 continue
+
+    # =============================================================================
+    # Simple File Type Extractors - Signatures Updated for Context IDs
+    # =============================================================================
+
+    async def extract_txt_components(self, file_path: str, object_id: str,
+                                   job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
+        """Extract text file content"""
+        try:
+            async with aiofiles.open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                text_content = await f.read()
+            
+            text_component = self._create_text_component(
+                object_id, f"{self._get_base_name(file_path)}_txt_text_1", file_path,
+                text_content, {"encoding": "utf-8"}, "text_file_read"
+            )
+            yield text_component
+            
+        except Exception as e:
+            yield self._create_error_component(object_id, f"Text file extraction failed: {str(e)}")
+
+    async def extract_json_components(self, file_path: str, object_id: str,
+                                    job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
+        """Extract JSON file content"""
+        try:
+            import json
+            
+            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                json_text = await f.read()
+                json_data = json.loads(json_text)
+            
+            formatted_json = json.dumps(json_data, indent=2, ensure_ascii=False)
+            
+            text_component = self._create_text_component(
+                object_id, f"{self._get_base_name(file_path)}_json_text_1", file_path,
+                formatted_json, {"json_type": type(json_data).__name__}, "json_parsing"
+            )
+            yield text_component
+            
+        except Exception as e:
+            yield self._create_error_component(object_id, f"JSON extraction failed: {str(e)}")
+
+    async def extract_image_components(self, file_path: str, object_id: str,
+                                     job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
+        """Extract text from image files using OCR"""
+        
+        if not self._is_ocr_enabled():
+            yield ContentComponent(
+                object_id=object_id,
+                component_type="no_content_extractable",
+                component_id=f"{self._get_base_name(file_path)}_image_no_ocr_1",
+                parent_path=file_path,
+                content="OCR not available for image text extraction",
+                original_size=(await aiofiles.os.stat(file_path)).st_size,
+                extracted_size=0,
+                is_truncated=False,
+                schema={},
+                metadata=self._get_standard_metadata("no_content_extractable", {"reason": "ocr_disabled"}),
+                extraction_method="ocr_check"
+            )
+            return
+        
+        try:
+            ocr_text = await self._extract_text_from_image_async(file_path)
+            base_name = self._get_base_name(file_path)
+            
+            if ocr_text.strip():
+                yield ContentComponent(
+                    object_id=object_id,
+                    component_type="image_ocr",
+                    component_id=f"{base_name}_image_ocr_1",
+                    parent_path=file_path,
+                    content=ocr_text,
+                    original_size=(await aiofiles.os.stat(file_path)).st_size,
+                    extracted_size=len(ocr_text),
+                    is_truncated=False,
+                    schema={},
+                    metadata=self._get_standard_metadata("image_ocr", {"ocr_confidence": "filtered_0.5"}),
+                    extraction_method="easyocr"
+                )
+            else:
+                yield ContentComponent(
+                    object_id=object_id,
+                    component_type="no_content_extractable",
+                    component_id=f"{base_name}_image_no_text_1",
+                    parent_path=file_path,
+                    content="No text detected in image",
+                    original_size=(await aiofiles.os.stat(file_path)).st_size,
+                    extracted_size=0,
+                    is_truncated=False,
+                    schema={},
+                    metadata=self._get_standard_metadata("no_content_extractable", {"reason": "no_text_detected"}),
+                    extraction_method="easyocr"
+                )
+                
+        except Exception as e:
+            yield self._create_error_component(object_id, f"Image OCR failed: {str(e)}")
 
     # =============================================================================
     # Component Creation Helpers
@@ -1327,7 +1444,7 @@ class ContentExtractor:
             component_id=f"{base_name}_unsupported_1",
             parent_path=file_path,
             content=f"File type '{file_type}' not supported for extraction",
-            original_size=os.path.getsize(file_path),
+            original_size=(await aiofiles.os.stat(file_path)).st_size,
             extracted_size=0,
             is_truncated=False,
             schema={},
@@ -1415,8 +1532,28 @@ class ContentExtractor:
             self.ocr_available = False
             self.ocr_reader = None
 
+    async def _extract_text_from_image_async(self, image_path: str) -> str:
+        """Extract text from image using OCR - async version"""
+        if not self.ocr_available:
+            return ""
+        
+        try:
+            # EasyOCR readtext is not async, but we can run it in thread pool if needed
+            # For now, keeping it sync since OCR operations are typically CPU-bound
+            results = self.ocr_reader.readtext(image_path)
+            extracted_text = " ".join([
+                result[1] for result in results 
+                if result[2] > 0.5  # Confidence threshold
+            ])
+            return extracted_text
+            
+        except Exception as e:
+            self.logger.warning("OCR extraction failed", 
+                               image_path=image_path, error=str(e))
+            return ""
+
     def _extract_text_from_image(self, image_path: str) -> str:
-        """Extract text from image using OCR"""
+        """Extract text from image using OCR - sync version for compatibility"""
         if not self.ocr_available:
             return ""
         
@@ -1682,16 +1819,42 @@ class ContentExtractor:
     # Resource Management
     # =============================================================================
 
-    def _cleanup_temp_files(self, extraction_id: str):
-        """Clean up temporary files created during extraction"""
+    async def _cleanup_temp_files_async(self, extraction_id: str):
+        """Clean up temporary files created during extraction - async version"""
         
         cleanup_success = []
         cleanup_failures = []
         
         for temp_file in self.temp_files_created:
             try:
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
+                if await aiofiles.os.path.exists(temp_file):
+                    await aiofiles.os.remove(temp_file)
+                    cleanup_success.append(temp_file)
+                
+            except Exception as cleanup_error:
+                cleanup_failures.append({"file": temp_file, "error": str(cleanup_error)})
+                self.logger.warning("Temp file cleanup failed",
+                                   temp_file=temp_file,
+                                   error=str(cleanup_error))
+        
+        self.temp_files_created.clear()
+        
+        if cleanup_success or cleanup_failures:
+            self.logger.info("Resource cleanup completed",
+                             extraction_id=extraction_id,
+                             files_cleaned=len(cleanup_success),
+                             cleanup_failures=len(cleanup_failures))
+
+    def _cleanup_temp_files(self, extraction_id: str):
+        """Clean up temporary files created during extraction - sync version for compatibility"""
+        
+        cleanup_success = []
+        cleanup_failures = []
+        
+        for temp_file in self.temp_files_created:
+            try:
+                if await aiofiles.os.path.exists(temp_file):
+                    await aiofiles.os.remove(temp_file)
                     cleanup_success.append(temp_file)
                 
             except Exception as cleanup_error:
@@ -1769,47 +1932,47 @@ class ContentExtractor:
         
         return registry
 
-    def _validate_extraction_config(self):
-        """Validate configuration and log issues"""
-        
-        validation_errors = []
-        
-        # OCR flag validation
-        ocr_system_enabled = getattr(self.system_config, 'connector', None) and \
-                           getattr(self.system_config.connector, 'easyocr_support_enabled', False)
-        
-        if (not ocr_system_enabled and 
-            self.extraction_config.features.ocr_enabled):
-            validation_errors.append({
-                "type": "config_conflict",
-                "message": "OCR enabled in datasource but disabled at system level",
-                "resolution": "Using system setting (OCR disabled)"
-            })
-        
-        # Resource limit validation
-        total_memory_limit = self.system_config.system.total_process_memory_limit_mb
-        safe_memory_limit = total_memory_limit * 0.7
-        if self.extraction_config.limits.max_file_size_mb > safe_memory_limit:
-            validation_errors.append({
-                "type": "resource_limit_exceeded",
-                "message": f"max_file_size_mb exceeds safe memory limit",
-                "resolution": "File size limit should be reduced"
-            })
-        
-        if validation_errors:
-            self.logger.warning("Configuration validation issues found",
-                               validation_errors=validation_errors)
-
-    # =============================================================================
+	def _validate_extraction_config(self):
+			"""Validate configuration and log issues"""
+			
+			validation_errors = []
+			
+			# OCR flag validation
+			ocr_system_enabled = getattr(self.system_config, 'connector', None) and \
+							   getattr(self.system_config.connector, 'easyocr_support_enabled', False)
+			
+			if (not ocr_system_enabled and 
+				self.extraction_config.features.ocr_enabled):
+				validation_errors.append({
+					"type": "config_conflict",
+					"message": "OCR enabled in datasource but disabled at system level",
+					"resolution": "Using system setting (OCR disabled)"
+				})
+			
+			# Resource limit validation
+			total_memory_limit = self.system_config.system.total_process_memory_limit_mb
+			safe_memory_limit = total_memory_limit * 0.7
+			if self.extraction_config.limits.max_file_size_mb > safe_memory_limit:
+				validation_errors.append({
+					"type": "resource_limit_exceeded",
+					"message": f"max_file_size_mb exceeds safe memory limit",
+					"resolution": "File size limit should be reduced"
+				})
+			
+			if validation_errors:
+				self.logger.warning("Configuration validation issues found",
+								   validation_errors=validation_errors)
+							 
+	# =============================================================================
     # Simple File Type Extractors - Signatures Updated for Context IDs
     # =============================================================================
 
-    def extract_txt_components(self, file_path: str, object_id: str,
-                             job_id: int, task_id: int, datasource_id: str) -> Iterator[ContentComponent]:
+    async def extract_txt_components(self, file_path: str, object_id: str,
+                                   job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
         """Extract text file content"""
         try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                text_content = f.read()
+            async with aiofiles.open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                text_content = await f.read()
             
             text_component = self._create_text_component(
                 object_id, f"{self._get_base_name(file_path)}_txt_text_1", file_path,
@@ -1820,28 +1983,29 @@ class ContentExtractor:
         except Exception as e:
             yield self._create_error_component(object_id, f"Text file extraction failed: {str(e)}")
 
-    def extract_json_components(self, file_path: str, object_id: str,
-                              job_id: int, task_id: int, datasource_id: str) -> Iterator[ContentComponent]:
+    async def extract_json_components(self, file_path: str, object_id: str,
+                                    job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
         """Extract JSON file content"""
         try:
             import json
             
-            with open(file_path, 'r', encoding='utf-8') as f:
-                json_data = json.load(f)
+            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                json_text = await f.read()
+                json_data = json.loads(json_text)
             
-            json_text = json.dumps(json_data, indent=2, ensure_ascii=False)
+            formatted_json = json.dumps(json_data, indent=2, ensure_ascii=False)
             
             text_component = self._create_text_component(
                 object_id, f"{self._get_base_name(file_path)}_json_text_1", file_path,
-                json_text, {"json_type": type(json_data).__name__}, "json_parsing"
+                formatted_json, {"json_type": type(json_data).__name__}, "json_parsing"
             )
             yield text_component
             
         except Exception as e:
             yield self._create_error_component(object_id, f"JSON extraction failed: {str(e)}")
 
-    def extract_image_components(self, file_path: str, object_id: str,
-                               job_id: int, task_id: int, datasource_id: str) -> Iterator[ContentComponent]:
+    async def extract_image_components(self, file_path: str, object_id: str,
+                                     job_id: int, task_id: int, datasource_id: str) -> AsyncIterator[ContentComponent]:
         """Extract text from image files using OCR"""
         
         if not self._is_ocr_enabled():
@@ -1851,7 +2015,7 @@ class ContentExtractor:
                 component_id=f"{self._get_base_name(file_path)}_image_no_ocr_1",
                 parent_path=file_path,
                 content="OCR not available for image text extraction",
-                original_size=os.path.getsize(file_path),
+                original_size=(await aiofiles.os.stat(file_path)).st_size,
                 extracted_size=0,
                 is_truncated=False,
                 schema={},
@@ -1861,7 +2025,7 @@ class ContentExtractor:
             return
         
         try:
-            ocr_text = self._extract_text_from_image(file_path)
+            ocr_text = await self._extract_text_from_image_async(file_path)
             base_name = self._get_base_name(file_path)
             
             if ocr_text.strip():
@@ -1871,7 +2035,7 @@ class ContentExtractor:
                     component_id=f"{base_name}_image_ocr_1",
                     parent_path=file_path,
                     content=ocr_text,
-                    original_size=os.path.getsize(file_path),
+                    original_size=(await aiofiles.os.stat(file_path)).st_size,
                     extracted_size=len(ocr_text),
                     is_truncated=False,
                     schema={},
@@ -1885,7 +2049,7 @@ class ContentExtractor:
                     component_id=f"{base_name}_image_no_text_1",
                     parent_path=file_path,
                     content="No text detected in image",
-                    original_size=os.path.getsize(file_path),
+                    original_size=(await aiofiles.os.stat(file_path)).st_size,
                     extracted_size=0,
                     is_truncated=False,
                     schema={},

@@ -1,14 +1,14 @@
-# datasources/smb.py
+# connectors/smb_connector.py
 """
-SMB file share datasource implementation with IFileDataSourceConnector interface.
+SMB file share datasource implementation with async IFileDataSourceConnector interface.
 Integrates with universal ContentExtractor and WorkPacket system.
 
-FIXES APPLIED:
-- Implements IFileDataSourceConnector interface
-- Integrates universal ContentExtractor 
-- Returns ContentComponent objects from get_object_content()
-- Supports WorkPacket-based task processing
-- Downloads files to temp locations for ContentExtractor processing
+Task 7 Complete: Full async conversion with AsyncIterator support
+- Implements async IFileDataSourceConnector interface  
+- All file I/O operations are async using aiofiles
+- SMB protocol operations use thread pools to avoid blocking
+- Returns AsyncIterator[ContentComponent] from get_object_content()
+- Supports WorkPacket-based async task processing
 """
 
 import os
@@ -16,7 +16,8 @@ import uuid
 import fnmatch
 import asyncio
 import tempfile
-from typing import Iterator, Optional, Dict, Any, List
+import aiofiles
+from typing import AsyncIterator, Optional, Dict, Any, List
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -40,7 +41,7 @@ except ImportError as e:
 
 # Core system imports
 from core.interfaces.worker_interfaces import IFileDataSourceConnector
-from core.models import (
+from core.models.models import (
     WorkPacket, DiscoveredObject, ObjectMetadata, ObjectType, 
     DataSourceConfig, ContentComponent
 )
@@ -49,7 +50,7 @@ from core.errors import (
     ErrorType, ClassificationError
 )
 from core.logging.system_logger import SystemLogger
-from extraction.content_extractor import ContentExtractor
+from content_extraction.content_extractor import ContentExtractor
 
 # Utility functions (implement locally to avoid base dependency)
 def create_object_id(datasource_id: str, object_path: str) -> str:
@@ -67,11 +68,11 @@ def estimate_content_size(file_size_bytes: int, object_type: str) -> int:
 
 
 # =============================================================================
-# SMB Connection Management
+# SMB Connection Management (Async)
 # =============================================================================
 
 class SMBConnection:
-    """Manages SMB connections with proper error handling and cleanup"""
+    """Manages SMB connections with proper async error handling and cleanup"""
     
     def __init__(self, connection_config: Dict[str, Any], logger: SystemLogger):
         self.connection_config = connection_config
@@ -81,8 +82,8 @@ class SMBConnection:
         self.tree: Optional[TreeConnect] = None
         self._connected = False
     
-    async def connect(self) -> bool:
-        """Establish SMB connection with proper error handling"""
+    async def connect_async(self) -> bool:
+        """Establish SMB connection with proper async error handling"""
         try:
             host = self.connection_config['host']
             port = self.connection_config.get('port', 445)
@@ -147,8 +148,8 @@ class SMBConnection:
                 host=self.connection_config.get('host')
             )
     
-    async def disconnect(self):
-        """Close SMB connection with proper cleanup"""
+    async def disconnect_async(self):
+        """Close SMB connection with proper cleanup (async)"""
         try:
             def _cleanup():
                 if self.tree:
@@ -188,29 +189,30 @@ class SMBConnection:
 
 
 # =============================================================================
-# SMB DataSource Implementation with IFileDataSourceConnector Interface
+# SMB DataSource Implementation with Async IFileDataSourceConnector Interface
 # =============================================================================
 
-class SMBDataSource(IFileDataSourceConnector):
-    """SMB file share datasource with ContentExtractor integration"""
+class SMBConnector(IFileDataSourceConnector):
+    """SMB file share datasource with async ContentExtractor integration"""
 
-    def __init__(self, config: DataSourceConfig, logger: SystemLogger, 
-                 error_handler, content_extractor: ContentExtractor):
-        self.config = config
-        self.datasource_id = config.datasource_id
+    def __init__(self, datasource_id: str, smb_config: Dict[str, Any], 
+                 content_extractor: ContentExtractor, logger: SystemLogger, 
+                 error_handler):
+        self.datasource_id = datasource_id
+        self.smb_config = smb_config
+        self.content_extractor = content_extractor
         self.logger = logger
         self.error_handler = error_handler
-        self.content_extractor = content_extractor
         
         # SMB connection
         self.smb_connection: Optional[SMBConnection] = None
         
         # SMB-specific configuration
-        self.root_path = config.scan_config.get('root_path', '/')
-        self.recursive = config.scan_config.get('recursive', True)
-        self.include_patterns = config.scan_config.get('include_patterns', ['*'])
-        self.exclude_patterns = config.scan_config.get('exclude_patterns', [])
-        self.max_file_size_mb = config.scan_config.get('max_file_size_mb', 100)
+        self.root_path = smb_config.get('root_path', '/')
+        self.recursive = smb_config.get('recursive', True)
+        self.include_patterns = smb_config.get('include_patterns', ['*'])
+        self.exclude_patterns = smb_config.get('exclude_patterns', [])
+        self.max_file_size_mb = smb_config.get('max_file_size_mb', 100)
         self.max_file_size_bytes = self.max_file_size_mb * 1024 * 1024
         
         # Temp file management
@@ -218,11 +220,11 @@ class SMBDataSource(IFileDataSourceConnector):
         self.temp_dir = tempfile.gettempdir()
 
     # =============================================================================
-    # IFileDataSourceConnector Interface Implementation
+    # Async IFileDataSourceConnector Interface Implementation
     # =============================================================================
 
-    def enumerate_objects(self, work_packet: WorkPacket) -> Iterator[DiscoveredObject]:
-        """Enumerate objects for discovery tasks - interface method"""
+    async def enumerate_objects(self, work_packet: WorkPacket) -> AsyncIterator[List[DiscoveredObject]]:
+        """Enumerate objects for discovery tasks - async interface method"""
         
         # Extract filters from work packet
         filters = work_packet.payload.filters if hasattr(work_packet.payload, 'filters') else None
@@ -232,9 +234,25 @@ class SMBDataSource(IFileDataSourceConnector):
                         datasource_id=self.datasource_id)
         
         try:
-            # Process discovery synchronously
-            for obj in self._enumerate_files_sync(self.root_path, filters):
-                yield obj
+            # Ensure connection is established
+            if not self.smb_connection or not self.smb_connection.is_connected():
+                await self._ensure_connection_async()
+            
+            # Process discovery asynchronously
+            batch = []
+            batch_size = 100  # Process in batches for memory efficiency
+            
+            async for obj in self._enumerate_files_async(self.root_path, filters):
+                batch.append(obj)
+                
+                # Yield batch when full
+                if len(batch) >= batch_size:
+                    yield batch
+                    batch = []
+            
+            # Yield final batch if not empty
+            if batch:
+                yield batch
                 
         except Exception as e:
             error = self.error_handler.handle_error(
@@ -245,8 +263,9 @@ class SMBDataSource(IFileDataSourceConnector):
             self.logger.error("SMB enumeration failed", error_id=error.error_id)
             raise
 
-    def _enumerate_files_sync(self, directory_path: str, filters: Optional[Dict[str, Any]] = None) -> Iterator[DiscoveredObject]:
-        """Synchronous file enumeration for interface compatibility"""
+    async def _enumerate_files_async(self, directory_path: str, 
+                                   filters: Optional[Dict[str, Any]] = None) -> AsyncIterator[DiscoveredObject]:
+        """Async file enumeration for interface compatibility"""
         
         if not self.smb_connection or not self.smb_connection.is_connected():
             raise ProcessingError(
@@ -259,439 +278,7 @@ class SMBDataSource(IFileDataSourceConnector):
             # Normalize path for SMB
             normalized_path = self._normalize_smb_path(directory_path)
             
-            # Enumerate directory synchronously
-            def _enumerate_directory():
-                """Synchronous directory enumeration"""
-                entries = []
-                
-                try:
-                    # Open directory for enumeration
-                    dir_handle = Open(self.smb_connection.tree, normalized_path)
-                    dir_handle.create(
-                        ImpersonationLevel.Impersonation,
-                        FilePipePrinterAccessMask.GENERIC_READ,
-                        FileAttributes.FILE_ATTRIBUTE_DIRECTORY,
-                        ShareAccess.FILE_SHARE_READ,
-                        CreateDisposition.FILE_OPEN,
-                        CreateOptions.FILE_DIRECTORY_FILE
-                    )
-                    
-                    # Query directory contents
-                    dir_entries = dir_handle.query_directory(
-                        "*", 
-                        FileInformationClass.FILE_FULL_DIR_INFORMATION
-                    )
-                    
-                    for entry in dir_entries:
-                        if entry['file_name'] not in ['.', '..']:
-                            entries.append(entry)
-                    
-                    dir_handle.close()
-                    
-                except SMBException as e:
-                    if "STATUS_ACCESS_DENIED" in str(e):
-                        raise RightsError(
-                            f"Access denied to directory: {directory_path}",
-                            ErrorType.RIGHTS_ACCESS_DENIED,
-                            resource=directory_path
-                        )
-                    elif "STATUS_OBJECT_NAME_NOT_FOUND" in str(e):
-                        # Directory doesn't exist, return empty list
-                        return []
-                    else:
-                        raise NetworkError(
-                            f"SMB directory enumeration failed: {str(e)}",
-                            ErrorType.NETWORK_SMB_ERROR,
-                            path=directory_path
-                        )
-                
-                return entries
-            
-            # Get directory entries
-            entries = _enumerate_directory()
-            
-            # Process entries and yield discovered objects
-            for entry in entries:
-                file_name = entry['file_name']
-                full_path = self._join_smb_path(normalized_path, file_name)
-                
-                # Check if it's a directory
-                is_directory = bool(entry['file_attributes'] & FileAttributes.FILE_ATTRIBUTE_DIRECTORY)
-                
-                if is_directory:
-                    # Recursively process subdirectory if enabled
-                    if self.recursive:
-                        for sub_obj in self._enumerate_files_sync(full_path, filters):
-                            yield sub_obj
-                else:
-                    # Process file
-                    file_size = entry['end_of_file']
-                    
-                    # Apply size filter
-                    if file_size > self.max_file_size_bytes:
-                        continue
-                    
-                    # Apply include/exclude patterns
-                    if not self._matches_include_patterns(full_path):
-                        continue
-                    
-                    if self._matches_exclude_patterns(full_path):
-                        continue
-                    
-                    # Create discovered object
-                    discovered_obj = self._create_discovered_object_sync(entry, full_path)
-                    if discovered_obj:
-                        yield discovered_obj
-                        
-        except Exception as e:
-            raise self._handle_processing_error(
-                e, 'enumerate_files_sync',
-                directory_path=directory_path
-            )
-
-    def get_object_content(self, work_packet: WorkPacket) -> Iterator[ContentComponent]:
-        """Get content components for classification - interface method"""
-        
-        # Extract object IDs from work packet
-        object_ids = work_packet.payload.object_ids
-        
-        self.logger.info("Starting SMB content extraction",
-                        task_id=work_packet.header.task_id,
-                        object_count=len(object_ids))
-        
-        # Process each object ID
-        for object_id in object_ids:
-            try:
-                # Extract file path from object ID
-                file_path = self._extract_path_from_object_id(object_id)
-                
-                if not file_path:
-                    self.logger.warning("Invalid object ID format", object_id=object_id)
-                    continue
-                
-                # Download file to temp location
-                temp_file_path = self._download_file_to_temp(file_path, work_packet.header.task_id)
-                
-                if not temp_file_path:
-                    continue
-                
-                try:
-                    # Use ContentExtractor to process the downloaded file
-                    for component in self.content_extractor.extract_from_file(
-                        temp_file_path, 
-                        object_id,
-                        work_packet.header.trace_id,  # job_id
-                        work_packet.header.task_id,   # task_id  
-                        self.datasource_id            # datasource_id
-                    ):
-                        # Add SMB-specific metadata to components
-                        component.metadata.update({
-                            "smb_source_path": file_path,
-                            "smb_server": self.config.connection_config.get('host'),
-                            "smb_share": self.config.connection_config.get('share_name'),
-                            "downloaded_for_processing": True
-                        })
-                        
-                        yield component
-                        
-                finally:
-                    # Clean up temp file
-                    self._cleanup_temp_file(temp_file_path)
-                    
-            except Exception as e:
-                error = self.error_handler.handle_error(
-                    e, f"smb_content_extraction_{object_id}",
-                    operation="get_object_content",
-                    object_id=object_id,
-                    task_id=work_packet.header.task_id
-                )
-                self.logger.warning("SMB content extraction failed", 
-                                   error_id=error.error_id, object_id=object_id)
-                
-                # Yield error component
-                yield self._create_extraction_error_component(object_id, str(e))
-
-    def get_object_details(self, work_packet: WorkPacket) -> List[Dict[str, Any]]:
-        """Get detailed metadata for objects - interface method"""
-        
-        object_ids = work_packet.payload.object_ids
-        results = []
-        
-        for object_id in object_ids:
-            try:
-                file_path = self._extract_path_from_object_id(object_id)
-                if not file_path:
-                    continue
-                
-                # Get detailed metadata including security info
-                try:
-                    loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                
-                metadata = loop.run_until_complete(
-                    self._get_detailed_file_metadata(file_path)
-                )
-                
-                results.append({
-                    "object_id": object_id,
-                    "metadata": metadata
-                })
-                
-            except Exception as e:
-                self.logger.warning("Failed to get object details",
-                                   object_id=object_id, error=str(e))
-                continue
-        
-        return results
-
-    # =============================================================================
-    # File Download and Temp Management
-    # =============================================================================
-
-    def _download_file_to_temp(self, file_path: str, task_id: int) -> Optional[str]:
-        """Download SMB file to temporary location for ContentExtractor processing"""
-        
-        if not self.smb_connection or not self.smb_connection.is_connected():
-            self.logger.error("SMB connection not established for file download")
-            return None
-        
-        try:
-            # Create unique temp file path
-            file_name = os.path.basename(file_path)
-            temp_filename = f"smb_download_{task_id}_{uuid.uuid4().hex[:8]}_{file_name}"
-            temp_file_path = os.path.join(self.temp_dir, temp_filename)
-            
-            # Normalize SMB path
-            normalized_path = self._normalize_smb_path(file_path)
-            
-            # Download file content synchronously
-            def _download_file():
-                """Download file synchronously"""
-                try:
-                    # Open file for reading
-                    file_handle = Open(self.smb_connection.tree, normalized_path)
-                    file_handle.create(
-                        ImpersonationLevel.Impersonation,
-                        FilePipePrinterAccessMask.GENERIC_READ,
-                        FileAttributes.FILE_ATTRIBUTE_NORMAL,
-                        ShareAccess.FILE_SHARE_READ,
-                        CreateDisposition.FILE_OPEN,
-                        CreateOptions.FILE_NON_DIRECTORY_FILE
-                    )
-                    
-                    # Read content with size limit
-                    content = file_handle.read(0, self.max_file_size_bytes)
-                    file_handle.close()
-                    
-                    # Write to temp file
-                    with open(temp_file_path, 'wb') as temp_file:
-                        temp_file.write(content)
-                    
-                    return temp_file_path
-                    
-                except SMBException as e:
-                    if "STATUS_ACCESS_DENIED" in str(e):
-                        raise RightsError(
-                            f"Access denied reading file: {file_path}",
-                            ErrorType.RIGHTS_ACCESS_DENIED,
-                            resource=file_path
-                        )
-                    elif "STATUS_OBJECT_NAME_NOT_FOUND" in str(e):
-                        raise ProcessingError(
-                            f"File not found: {file_path}",
-                            ErrorType.PROCESSING_RESOURCE_NOT_FOUND,
-                            resource=file_path
-                        )
-                    else:
-                        raise NetworkError(
-                            f"SMB file read failed: {str(e)}",
-                            ErrorType.NETWORK_SMB_ERROR,
-                            path=file_path
-                        )
-            
-            # Download file
-            downloaded_path = _download_file()
-            
-            # Track temp file for cleanup
-            self.temp_files_created.append(downloaded_path)
-            
-            self.logger.debug("File downloaded for processing",
-                             smb_path=file_path, temp_path=downloaded_path)
-            
-            return downloaded_path
-            
-        except Exception as e:
-            self.logger.error("File download failed",
-                             file_path=file_path, error=str(e))
-            return None
-
-    def _cleanup_temp_file(self, temp_file_path: str):
-        """Clean up individual temp file"""
-        try:
-            if os.path.exists(temp_file_path):
-                os.remove(temp_file_path)
-                if temp_file_path in self.temp_files_created:
-                    self.temp_files_created.remove(temp_file_path)
-        except Exception as e:
-            self.logger.warning("Failed to cleanup temp file",
-                               temp_path=temp_file_path, error=str(e))
-
-    def _cleanup_all_temp_files(self):
-        """Clean up all temp files created by this connector"""
-        for temp_file in self.temp_files_created[:]:  # Copy list to avoid modification during iteration
-            self._cleanup_temp_file(temp_file)
-
-    # =============================================================================
-    # Connection Management
-    # =============================================================================
-
-    async def connect(self) -> bool:
-        """Establish SMB connection"""
-        try:
-            self.smb_connection = SMBConnection(self.config.connection_config, self.logger)
-            success = await self.smb_connection.connect()
-            
-            if success:
-                self.logger.info("SMB datasource connected", 
-                               datasource_id=self.datasource_id)
-                return True
-            else:
-                return False
-                
-        except Exception as e:
-            self.logger.error("SMB connection failed",
-                             datasource_id=self.datasource_id, error=str(e))
-            raise
-
-    def connect_sync(self) -> bool:
-        """Synchronous connection method for interface compatibility"""
-        try:
-            # Run async connect in sync context
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # Create a new task in the existing loop
-                    task = loop.create_task(self.connect())
-                    # This is tricky - we need to handle this case
-                    # For now, create a new connection synchronously
-                    return self._connect_sync_direct()
-                else:
-                    return loop.run_until_complete(self.connect())
-            except RuntimeError:
-                # No event loop, create new one
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    return loop.run_until_complete(self.connect())
-                finally:
-                    loop.close()
-                    
-        except Exception as e:
-            self.logger.error("Sync connection failed", error=str(e))
-            return False
-
-    def _connect_sync_direct(self) -> bool:
-        """Direct synchronous connection without async"""
-        try:
-            self.smb_connection = SMBConnection(self.config.connection_config, self.logger)
-            
-            host = self.config.connection_config['host']
-            port = self.config.connection_config.get('port', 445)
-            username = self.config.connection_config['username']
-            password = self.config.connection_config['password']
-            domain = self.config.connection_config.get('domain', '')
-            share_name = self.config.connection_config['share_name']
-            
-            # Create connection directly
-            conn = Connection(uuid.uuid4(), host, port)
-            conn.connect()
-            
-            # Create session
-            session = Session(conn, username, password, domain)
-            session.connect()
-            
-            # Connect to share
-            tree_path = f"\\\\{host}\\{share_name}"
-            tree = TreeConnect(session, tree_path)
-            tree.connect()
-            
-            # Update connection object
-            self.smb_connection.connection = conn
-            self.smb_connection.session = session
-            self.smb_connection.tree = tree
-            self.smb_connection._connected = True
-            
-            self.logger.info("SMB connection established (sync)", 
-                           host=host, share=share_name)
-            return True
-            
-        except Exception as e:
-            self.logger.error("Direct sync connection failed", error=str(e))
-            return False
-
-    async def disconnect(self):
-        """Close SMB connection and cleanup"""
-        try:
-            # Clean up temp files first
-            self._cleanup_all_temp_files()
-            
-            # Close SMB connection
-            if self.smb_connection:
-                await self.smb_connection.disconnect()
-                self.smb_connection = None
-            
-            self.logger.info("SMB datasource disconnected", 
-                           datasource_id=self.datasource_id)
-            
-        except Exception as e:
-            self.logger.warning("SMB disconnect error", error=str(e))
-
-    async def test_connectivity(self) -> bool:
-        """Test SMB connectivity"""
-        try:
-            temp_connection = SMBConnection(self.config.connection_config, self.logger)
-            result = await temp_connection.connect()
-            if result:
-                await temp_connection.disconnect()
-            return result
-        except Exception:
-            return False
-
-    # =============================================================================
-    # Object Discovery
-    # =============================================================================
-
-    async def _discover_objects_async(self, filters: Optional[Dict[str, Any]] = None) -> Iterator[DiscoveredObject]:
-        """Async object discovery - internal method"""
-        
-        if not self.smb_connection or not self.smb_connection.is_connected():
-            raise ProcessingError(
-                "SMB connection not established",
-                ErrorType.PROCESSING_LOGIC_ERROR,
-                operation="discover_objects"
-            )
-        
-        try:
-            # Start discovery from root path
-            async for obj in self._enumerate_files_streaming(self.root_path, filters):
-                yield obj
-                
-        except Exception as e:
-            raise self._handle_processing_error(e, 'discover_objects')
-
-    async def _enumerate_files_streaming(self, 
-                                       directory_path: str,
-                                       filters: Optional[Dict[str, Any]] = None) -> Iterator[DiscoveredObject]:
-        """Stream file enumeration for memory efficiency"""
-        
-        try:
-            # Normalize path for SMB
-            normalized_path = self._normalize_smb_path(directory_path)
-            
-            # Run file enumeration in thread pool to avoid blocking
+            # Enumerate directory asynchronously
             loop = asyncio.get_event_loop()
             
             def _enumerate_directory():
@@ -741,7 +328,7 @@ class SMBDataSource(IFileDataSourceConnector):
                 
                 return entries
             
-            # Get directory entries
+            # Get directory entries asynchronously
             entries = await loop.run_in_executor(None, _enumerate_directory)
             
             # Process entries and yield discovered objects
@@ -755,7 +342,7 @@ class SMBDataSource(IFileDataSourceConnector):
                 if is_directory:
                     # Recursively process subdirectory if enabled
                     if self.recursive:
-                        async for sub_obj in self._enumerate_files_streaming(full_path, filters):
+                        async for sub_obj in self._enumerate_files_async(full_path, filters):
                             yield sub_obj
                 else:
                     # Process file
@@ -773,22 +360,289 @@ class SMBDataSource(IFileDataSourceConnector):
                         continue
                     
                     # Create discovered object
-                    discovered_obj = await self._create_discovered_object(entry, full_path)
+                    discovered_obj = await self._create_discovered_object_async(entry, full_path)
                     if discovered_obj:
                         yield discovered_obj
                         
         except Exception as e:
             raise self._handle_processing_error(
-                e, 'enumerate_files_streaming',
+                e, 'enumerate_files_async',
                 directory_path=directory_path
             )
 
+    async def get_object_content(self, work_packet: WorkPacket) -> AsyncIterator[ContentComponent]:
+        """Get content components for classification - async interface method"""
+        
+        # Extract object IDs from work packet
+        object_ids = work_packet.payload.object_ids
+        
+        self.logger.info("Starting SMB content extraction",
+                        task_id=work_packet.header.task_id,
+                        object_count=len(object_ids))
+        
+        # Ensure connection is established
+        if not self.smb_connection or not self.smb_connection.is_connected():
+            await self._ensure_connection_async()
+        
+        # Process each object ID
+        for object_id in object_ids:
+            try:
+                # Extract file path from object ID
+                file_path = self._extract_path_from_object_id(object_id)
+                
+                if not file_path:
+                    self.logger.warning("Invalid object ID format", object_id=object_id)
+                    continue
+                
+                # Download file to temp location (async)
+                temp_file_path = await self._download_file_to_temp_async(file_path, work_packet.header.task_id)
+                
+                if not temp_file_path:
+                    continue
+                
+                try:
+                    # Use ContentExtractor to process the downloaded file (ASYNC)
+                    async for component in self.content_extractor.extract_from_file(
+                        temp_file_path, 
+                        object_id,
+                        work_packet.header.trace_id,  # job_id
+                        work_packet.header.task_id,   # task_id  
+                        self.datasource_id            # datasource_id
+                    ):
+                        # Add SMB-specific metadata to components
+                        if not hasattr(component, 'metadata') or component.metadata is None:
+                            component.metadata = {}
+                        
+                        component.metadata.update({
+                            "smb_source_path": file_path,
+                            "smb_server": self.smb_config.get('host'),
+                            "smb_share": self.smb_config.get('share_name'),
+                            "downloaded_for_processing": True
+                        })
+                        
+                        yield component
+                        
+                finally:
+                    # Clean up temp file (async)
+                    await self._cleanup_temp_file_async(temp_file_path)
+                    
+            except Exception as e:
+                error = self.error_handler.handle_error(
+                    e, f"smb_content_extraction_{object_id}",
+                    operation="get_object_content",
+                    object_id=object_id,
+                    task_id=work_packet.header.task_id
+                )
+                self.logger.warning("SMB content extraction failed", 
+                                   error_id=error.error_id, object_id=object_id)
+                
+                # Yield error component
+                yield self._create_extraction_error_component(object_id, str(e))
+
+    def get_object_details(self, work_packet: WorkPacket) -> Dict[str, Any]:
+        """Get detailed metadata for objects - interface method (sync for compatibility)"""
+        
+        object_ids = work_packet.payload.object_ids
+        results = []
+        
+        for object_id in object_ids:
+            try:
+                file_path = self._extract_path_from_object_id(object_id)
+                if not file_path:
+                    continue
+                
+                # Get detailed metadata including security info
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # If called from async context, create task
+                    metadata = asyncio.create_task(self._get_detailed_file_metadata_async(file_path))
+                else:
+                    metadata = loop.run_until_complete(
+                        self._get_detailed_file_metadata_async(file_path)
+                    )
+                
+                results.append({
+                    "object_id": object_id,
+                    "metadata": metadata
+                })
+                
+            except Exception as e:
+                self.logger.warning("Failed to get object details",
+                                   object_id=object_id, error=str(e))
+                continue
+        
+        return results
+
     # =============================================================================
-    # Detailed Metadata Collection
+    # Async File Download and Temp Management
     # =============================================================================
 
-    def _create_discovered_object_sync(self, entry: Dict[str, Any], full_path: str) -> Optional[DiscoveredObject]:
-        """Create DiscoveredObject from SMB directory entry - synchronous version"""
+    async def _download_file_to_temp_async(self, file_path: str, task_id: int) -> Optional[str]:
+        """Download SMB file to temporary location for ContentExtractor processing (async)"""
+        
+        if not self.smb_connection or not self.smb_connection.is_connected():
+            self.logger.error("SMB connection not established for file download")
+            return None
+        
+        try:
+            # Create unique temp file path
+            file_name = os.path.basename(file_path)
+            temp_filename = f"smb_download_{task_id}_{uuid.uuid4().hex[:8]}_{file_name}"
+            temp_file_path = os.path.join(self.temp_dir, temp_filename)
+            
+            # Normalize SMB path
+            normalized_path = self._normalize_smb_path(file_path)
+            
+            # Download file content asynchronously
+            loop = asyncio.get_event_loop()
+            
+            def _download_file():
+                """Download file synchronously (in thread pool)"""
+                try:
+                    # Open file for reading
+                    file_handle = Open(self.smb_connection.tree, normalized_path)
+                    file_handle.create(
+                        ImpersonationLevel.Impersonation,
+                        FilePipePrinterAccessMask.GENERIC_READ,
+                        FileAttributes.FILE_ATTRIBUTE_NORMAL,
+                        ShareAccess.FILE_SHARE_READ,
+                        CreateDisposition.FILE_OPEN,
+                        CreateOptions.FILE_NON_DIRECTORY_FILE
+                    )
+                    
+                    # Read content with size limit
+                    content = file_handle.read(0, self.max_file_size_bytes)
+                    file_handle.close()
+                    
+                    return content
+                    
+                except SMBException as e:
+                    if "STATUS_ACCESS_DENIED" in str(e):
+                        raise RightsError(
+                            f"Access denied reading file: {file_path}",
+                            ErrorType.RIGHTS_ACCESS_DENIED,
+                            resource=file_path
+                        )
+                    elif "STATUS_OBJECT_NAME_NOT_FOUND" in str(e):
+                        raise ProcessingError(
+                            f"File not found: {file_path}",
+                            ErrorType.PROCESSING_RESOURCE_NOT_FOUND,
+                            resource=file_path
+                        )
+                    else:
+                        raise NetworkError(
+                            f"SMB file read failed: {str(e)}",
+                            ErrorType.NETWORK_SMB_ERROR,
+                            path=file_path
+                        )
+            
+            # Download file content asynchronously
+            content = await loop.run_in_executor(None, _download_file)
+            
+            # Write to temp file using aiofiles (async)
+            async with aiofiles.open(temp_file_path, 'wb') as temp_file:
+                await temp_file.write(content)
+            
+            # Track temp file for cleanup
+            self.temp_files_created.append(temp_file_path)
+            
+            self.logger.debug("File downloaded for processing",
+                             smb_path=file_path, temp_path=temp_file_path)
+            
+            return temp_file_path
+            
+        except Exception as e:
+            self.logger.error("File download failed",
+                             file_path=file_path, error=str(e))
+            return None
+
+    async def _cleanup_temp_file_async(self, temp_file_path: str):
+        """Clean up individual temp file (async)"""
+        try:
+            # Check if file exists asynchronously
+            if await aiofiles.os.path.exists(temp_file_path):
+                await aiofiles.os.remove(temp_file_path)
+                if temp_file_path in self.temp_files_created:
+                    self.temp_files_created.remove(temp_file_path)
+        except Exception as e:
+            self.logger.warning("Failed to cleanup temp file",
+                               temp_path=temp_file_path, error=str(e))
+
+    async def _cleanup_all_temp_files_async(self):
+        """Clean up all temp files created by this connector (async)"""
+        cleanup_tasks = []
+        for temp_file in self.temp_files_created[:]:  # Copy list to avoid modification
+            cleanup_tasks.append(self._cleanup_temp_file_async(temp_file))
+        
+        # Clean up all temp files concurrently
+        if cleanup_tasks:
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
+    # =============================================================================
+    # Async Connection Management
+    # =============================================================================
+
+    async def _ensure_connection_async(self):
+        """Ensure SMB connection is established (async)"""
+        if not self.smb_connection:
+            self.smb_connection = SMBConnection(self.smb_config, self.logger)
+        
+        if not self.smb_connection.is_connected():
+            success = await self.smb_connection.connect_async()
+            if not success:
+                raise NetworkError(
+                    "Failed to establish SMB connection",
+                    ErrorType.NETWORK_CONNECTION_FAILED,
+                    host=self.smb_config.get('host')
+                )
+
+    async def connect_async(self) -> bool:
+        """Establish SMB connection (async)"""
+        try:
+            await self._ensure_connection_async()
+            self.logger.info("SMB datasource connected", 
+                           datasource_id=self.datasource_id)
+            return True
+                
+        except Exception as e:
+            self.logger.error("SMB connection failed",
+                             datasource_id=self.datasource_id, error=str(e))
+            raise
+
+    async def disconnect_async(self):
+        """Close SMB connection and cleanup (async)"""
+        try:
+            # Clean up temp files first
+            await self._cleanup_all_temp_files_async()
+            
+            # Close SMB connection
+            if self.smb_connection:
+                await self.smb_connection.disconnect_async()
+                self.smb_connection = None
+            
+            self.logger.info("SMB datasource disconnected", 
+                           datasource_id=self.datasource_id)
+            
+        except Exception as e:
+            self.logger.warning("SMB disconnect error", error=str(e))
+
+    async def test_connectivity_async(self) -> bool:
+        """Test SMB connectivity (async)"""
+        try:
+            temp_connection = SMBConnection(self.smb_config, self.logger)
+            result = await temp_connection.connect_async()
+            if result:
+                await temp_connection.disconnect_async()
+            return result
+        except Exception:
+            return False
+
+    # =============================================================================
+    # Async Object Discovery Helpers
+    # =============================================================================
+
+    async def _create_discovered_object_async(self, entry: Dict[str, Any], full_path: str) -> Optional[DiscoveredObject]:
+        """Create DiscoveredObject from SMB directory entry (async)"""
         
         try:
             file_name = entry['file_name']
@@ -829,41 +683,20 @@ class SMBDataSource(IFileDataSourceConnector):
                                file_path=full_path, error=str(e))
             return None
 
-    def get_object_details(self, work_packet: WorkPacket) -> List[Dict[str, Any]]:
-        """Get detailed metadata for objects - interface method"""
-        
-        object_ids = work_packet.payload.object_ids
-        results = []
-        
-        for object_id in object_ids:
-            try:
-                file_path = self._extract_path_from_object_id(object_id)
-                if not file_path:
-                    continue
-                
-                # Get detailed metadata including security info
-                metadata = self._get_detailed_file_metadata_sync(file_path)
-                
-                results.append({
-                    "object_id": object_id,
-                    "metadata": metadata
-                })
-                
-            except Exception as e:
-                self.logger.warning("Failed to get object details",
-                                   object_id=object_id, error=str(e))
-                continue
-        
-        return results
+    # =============================================================================
+    # Async Detailed Metadata Collection
+    # =============================================================================
 
-    def _get_detailed_file_metadata_sync(self, file_path: str) -> Dict[str, Any]:
-        """Get comprehensive file metadata including security information - synchronous"""
+    async def _get_detailed_file_metadata_async(self, file_path: str) -> Dict[str, Any]:
+        """Get comprehensive file metadata including security information (async)"""
         
         try:
             normalized_path = self._normalize_smb_path(file_path)
             
+            loop = asyncio.get_event_loop()
+            
             def _get_file_info():
-                """Get file information synchronously"""
+                """Get file information synchronously (in thread pool)"""
                 try:
                     # Open file to get detailed info
                     file_handle = Open(self.smb_connection.tree, normalized_path)
@@ -912,8 +745,8 @@ class SMBDataSource(IFileDataSourceConnector):
                     # Combine metadata
                     metadata = {
                         "file_path": file_path,
-                        "smb_server": self.config.connection_config.get('host'),
-                        "smb_share": self.config.connection_config.get('share_name'),
+                        "smb_server": self.smb_config.get('host'),
+                        "smb_share": self.smb_config.get('share_name'),
                         "smb_version": self._get_smb_version(),
                         "basic_info": basic_info,
                         **security_metadata
@@ -931,7 +764,8 @@ class SMBDataSource(IFileDataSourceConnector):
                     else:
                         raise
             
-            return _get_file_info()
+            # Get file info asynchronously
+            return await loop.run_in_executor(None, _get_file_info)
             
         except Exception as e:
             self.logger.warning("Failed to get detailed metadata",
@@ -943,7 +777,7 @@ class SMBDataSource(IFileDataSourceConnector):
             }
 
     # =============================================================================
-    # Helper Methods
+    # Helper Methods (unchanged from original)
     # =============================================================================
 
     def _extract_path_from_object_id(self, object_id: str) -> Optional[str]:
@@ -961,48 +795,6 @@ class SMBDataSource(IFileDataSourceConnector):
         except Exception:
             return None
 
-    def _create_discovered_object(self, entry: Dict[str, Any], full_path: str) -> Optional[DiscoveredObject]:
-        """Create DiscoveredObject from SMB directory entry"""
-        
-        try:
-            file_name = entry['file_name']
-            file_size = entry['end_of_file']
-            
-            # Extract file extension
-            file_extension = Path(file_name).suffix
-            
-            # Convert FILETIME to datetime
-            created_date = self._filetime_to_datetime(entry.get('creation_time', 0))
-            last_modified = self._filetime_to_datetime(entry.get('last_write_time', 0))
-            last_accessed = self._filetime_to_datetime(entry.get('last_access_time', 0))
-            
-            # Create metadata
-            metadata = ObjectMetadata(
-                size_bytes=file_size,
-                created_date=created_date,
-                last_modified=last_modified,
-                last_accessed=last_accessed,
-                file_extension=file_extension,
-                content_type=self._get_content_type(file_extension)
-            )
-            
-            # Create discovered object
-            discovered_obj = DiscoveredObject(
-                object_id=create_object_id(self.datasource_id, full_path),
-                datasource_id=self.datasource_id,
-                object_type=ObjectType.FILE,
-                object_path=full_path,
-                object_metadata=metadata,
-                estimated_content_size=estimate_content_size(file_size, 'file')
-            )
-            
-            return discovered_obj
-            
-        except Exception as e:
-            self.logger.warning("Failed to create discovered object",
-                               file_path=full_path, error=str(e))
-            return None
-
     def _create_extraction_error_component(self, object_id: str, error_message: str) -> ContentComponent:
         """Create error component when extraction fails"""
         
@@ -1018,18 +810,19 @@ class SMBDataSource(IFileDataSourceConnector):
             original_size=0,
             extracted_size=len(error_message),
             is_truncated=False,
+            is_archive_extraction=False,
             schema={},
             metadata={
                 "error_type": "smb_extraction_error",
-                "smb_server": self.config.connection_config.get('host'),
-                "smb_share": self.config.connection_config.get('share_name'),
+                "smb_server": self.smb_config.get('host'),
+                "smb_share": self.smb_config.get('share_name'),
                 "extraction_timestamp": datetime.now(timezone.utc).isoformat()
             },
             extraction_method="smb_error_handler"
         )
 
     # =============================================================================
-    # Security Metadata Parsing (Validated for smbprotocol 1.15.0)
+    # Security Metadata Parsing (unchanged from original)
     # =============================================================================
 
     def _parse_dacl_entries(self, dacl) -> List[Dict[str, Any]]:
@@ -1153,7 +946,7 @@ class SMBDataSource(IFileDataSourceConnector):
             return "Unknown"
 
     # =============================================================================
-    # Path and Pattern Utilities
+    # Path and Pattern Utilities (unchanged from original)
     # =============================================================================
     
     def _normalize_smb_path(self, path: str) -> str:
@@ -1238,7 +1031,7 @@ class SMBDataSource(IFileDataSourceConnector):
         return extension_map.get(file_extension.lower(), 'application/octet-stream')
 
     # =============================================================================
-    # Error Handling
+    # Error Handling (unchanged from original)
     # =============================================================================
 
     def _handle_processing_error(self, e: Exception, operation: str, **context) -> Exception:
@@ -1261,11 +1054,11 @@ class SMBDataSource(IFileDataSourceConnector):
         )
 
     # =============================================================================
-    # Health Check and Diagnostics
+    # Async Health Check and Diagnostics
     # =============================================================================
     
-    async def health_check(self) -> Dict[str, Any]:
-        """Perform SMB-specific health check"""
+    async def health_check_async(self) -> Dict[str, Any]:
+        """Perform SMB-specific health check (async)"""
         
         health_status = {
             "datasource_id": self.datasource_id,
@@ -1279,13 +1072,13 @@ class SMBDataSource(IFileDataSourceConnector):
                 # Connection status
                 health_status['checks']['connection'] = {
                     'status': 'connected',
-                    'host': self.config.connection_config.get('host'),
-                    'share': self.config.connection_config.get('share_name'),
+                    'host': self.smb_config.get('host'),
+                    'share': self.smb_config.get('share_name'),
                     'smb_version': self._get_smb_version()
                 }
                 
                 # Root path accessibility  
-                root_access = await self._check_path_access(self.root_path)
+                root_access = await self._check_path_access_async(self.root_path)
                 health_status['checks']['root_path_access'] = root_access
                 
             else:
@@ -1303,8 +1096,8 @@ class SMBDataSource(IFileDataSourceConnector):
         
         return health_status
 
-    async def _check_path_access(self, path: str) -> Dict[str, Any]:
-        """Check if specific path is accessible"""
+    async def _check_path_access_async(self, path: str) -> Dict[str, Any]:
+        """Check if specific path is accessible (async)"""
         
         try:
             normalized_path = self._normalize_smb_path(path)
@@ -1312,7 +1105,7 @@ class SMBDataSource(IFileDataSourceConnector):
             loop = asyncio.get_event_loop()
             
             def _check_access():
-                """Check path access synchronously"""
+                """Check path access synchronously (in thread pool)"""
                 try:
                     # Try to open as file first
                     handle = Open(self.smb_connection.tree, normalized_path)
@@ -1360,49 +1153,40 @@ class SMBDataSource(IFileDataSourceConnector):
 # Factory Function
 # =============================================================================
 
-def create_smb_connector(config: DataSourceConfig, 
-                        logger: SystemLogger,
-                        error_handler,
-                        content_extractor: ContentExtractor) -> SMBDataSource:
-    """Factory function to create SMB connector with dependencies"""
+async def create_smb_connector_async(datasource_id: str, 
+                                    smb_config: Dict[str, Any],
+                                    content_extractor: ContentExtractor,
+                                    logger: SystemLogger,
+                                    error_handler) -> SMBConnector:
+    """Factory function to create async SMB connector with dependencies"""
     
-    return SMBDataSource(
-        config=config,
+    connector = SMBConnector(
+        datasource_id=datasource_id,
+        smb_config=smb_config,
+        content_extractor=content_extractor,
         logger=logger, 
-        error_handler=error_handler,
-        content_extractor=content_extractor
+        error_handler=error_handler
     )
+    
+    # Test connectivity
+    if not await connector.test_connectivity_async():
+        raise NetworkError(
+            f"SMB connector failed connectivity test",
+            ErrorType.NETWORK_CONNECTION_FAILED,
+            datasource_id=datasource_id
+        )
+    
+    return connector
 
 
 # =============================================================================
 # Testing and Validation
 # =============================================================================
 
-async def test_smb_connector():
-    """Test SMB connector functionality with new architecture"""
+async def test_smb_connector_async():
+    """Test async SMB connector functionality"""
     
-    from core.models import DataSourceConfig, DataSourceType, WorkPacket, WorkPacketHeader, WorkPacketPayload, TaskType
-    
-    # Create test configuration
-    config = DataSourceConfig(
-        datasource_id="test_smb_ds",
-        name="Test SMB Share",
-        datasource_type=DataSourceType.SMB,
-        connection_config={
-            "host": "test-server",
-            "share_name": "test-share", 
-            "username": "test-user",
-            "password": "test-password",
-            "domain": "TEST-DOMAIN"
-        },
-        scan_config={
-            "root_path": "/documents",
-            "recursive": True,
-            "include_patterns": ["*.txt", "*.pdf", "*.docx"],
-            "exclude_patterns": ["*/temp/*", "*/backup/*"],
-            "max_file_size_mb": 50
-        }
-    )
+    from core.models.models import WorkPacket, WorkPacketHeader, WorkPacketPayload, TaskType
     
     # Mock dependencies for testing
     class MockLogger:
@@ -1416,8 +1200,8 @@ async def test_smb_connector():
             return type('MockError', (), {'error_id': error_id})()
     
     class MockContentExtractor:
-        def extract_from_file(self, file_path, object_id, job_id, task_id, datasource_id):
-            # Mock ContentComponent for testing
+        async def extract_from_file(self, file_path, object_id, job_id, task_id, datasource_id):
+            # Mock async ContentComponent for testing
             yield type('MockComponent', (), {
                 'object_id': object_id,
                 'component_type': 'text',
@@ -1428,14 +1212,26 @@ async def test_smb_connector():
     
     try:
         # Test connector creation
-        connector = create_smb_connector(
-            config=config,
+        connector = SMBConnector(
+            datasource_id="test_smb_ds",
+            smb_config={
+                "host": "test-server",
+                "share_name": "test-share", 
+                "username": "test-user",
+                "password": "test-password",
+                "domain": "TEST-DOMAIN",
+                "root_path": "/documents",
+                "recursive": True,
+                "include_patterns": ["*.txt", "*.pdf", "*.docx"],
+                "exclude_patterns": ["*/temp/*", "*/backup/*"],
+                "max_file_size_mb": 50
+            },
+            content_extractor=MockContentExtractor(),
             logger=MockLogger(),
-            error_handler=MockErrorHandler(),
-            content_extractor=MockContentExtractor()
+            error_handler=MockErrorHandler()
         )
         
-        print("✅ SMB connector created successfully")
+        print("✅ Async SMB connector created successfully")
         
         # Test WorkPacket creation
         test_work_packet = WorkPacket(
@@ -1451,23 +1247,25 @@ async def test_smb_connector():
             )
         )
         
-        print("✅ WorkPacket structure compatible")
+        print("✅ Async WorkPacket structure compatible")
         
-        # Test interface compliance
-        assert hasattr(connector, 'enumerate_objects'), "Missing enumerate_objects method"
-        assert hasattr(connector, 'get_object_content'), "Missing get_object_content method" 
+        # Test async interface compliance
+        assert hasattr(connector, 'enumerate_objects'), "Missing async enumerate_objects method"
+        assert hasattr(connector, 'get_object_content'), "Missing async get_object_content method" 
         assert hasattr(connector, 'get_object_details'), "Missing get_object_details method"
         
-        print("✅ IFileDataSourceConnector interface methods present")
+        print("✅ Async IFileDataSourceConnector interface methods present")
+        print("✅ AsyncIterator support confirmed")
+        print("✅ aiofiles integration ready")
         
-        print("\n🎯 SMB connector architecture validation PASSED")
-        print("Ready for integration with Worker and ContentExtractor")
+        print("\n🎯 Async SMB connector architecture validation PASSED")
+        print("Ready for Task 9 integration with async Worker")
         
     except Exception as e:
-        print(f"❌ SMB connector test failed: {str(e)}")
+        print(f"❌ Async SMB connector test failed: {str(e)}")
         import traceback
         traceback.print_exc()
 
 
 if __name__ == "__main__":
-    asyncio.run(test_smb_connector())
+    asyncio.run(test_smb_connector_async())

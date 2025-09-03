@@ -5,14 +5,16 @@ database operations. This class is fully integrated with the system's
 logging and error handling frameworks.
 
 UPDATED: Added missing methods required for connector integration.
+UPDATED: Converted to async/await pattern with configuration caching.
 """
 
 import re
+import asyncio
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import joinedload
-from sqlalchemy import create_engine, select, update, text, inspect, Table, MetaData, func, delete
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy import select, update, text, inspect, Table, MetaData, func, delete
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.exc import SQLAlchemyError
 
 # Import all ORM models from schema definitions
@@ -39,6 +41,59 @@ from ..logging.system_logger import SystemLogger
 from ..errors import ErrorHandler
 
 
+class ConfigCache:
+    """Configuration cache with LRU eviction and 24-hour expiry."""
+    
+    def __init__(self, max_general_items: int = 10, max_classifier_items: int = 70):
+        self.general_cache: Dict[str, Any] = {}
+        self.classifier_cache: Dict[str, Any] = {}
+        self.cache_timestamps: Dict[str, datetime] = {}
+        self.max_general = max_general_items
+        self.max_classifier = max_classifier_items
+        self.cache_duration = timedelta(hours=24)
+    
+    async def get_or_fetch(self, cache_key: str, fetch_func, is_classifier: bool = False):
+        """Get from cache or fetch with LRU eviction and 24-hour expiry."""
+        now = datetime.now(timezone.utc)
+        
+        # Check if item exists and is not expired
+        if cache_key in self.cache_timestamps:
+            if now - self.cache_timestamps[cache_key] < self.cache_duration:
+                cache = self.classifier_cache if is_classifier else self.general_cache
+                if cache_key in cache:
+                    # Move to end (mark as recently used)
+                    value = cache.pop(cache_key)
+                    cache[cache_key] = value
+                    return value
+            else:
+                # Remove expired item
+                self._remove_item(cache_key, is_classifier)
+        
+        # Fetch new value
+        value = await fetch_func()
+        
+        # Add to appropriate cache
+        cache = self.classifier_cache if is_classifier else self.general_cache
+        max_items = self.max_classifier if is_classifier else self.max_general
+        
+        # Evict oldest item if cache is full
+        if len(cache) >= max_items:
+            oldest_key = next(iter(cache))
+            self._remove_item(oldest_key, is_classifier)
+        
+        # Add new item
+        cache[cache_key] = value
+        self.cache_timestamps[cache_key] = now
+        
+        return value
+    
+    def _remove_item(self, cache_key: str, is_classifier: bool):
+        """Remove item from appropriate cache and timestamps."""
+        cache = self.classifier_cache if is_classifier else self.general_cache
+        cache.pop(cache_key, None)
+        self.cache_timestamps.pop(cache_key, None)
+
+
 class DatabaseInterface:
     """
     The primary interface for interacting with the application's central database.
@@ -47,20 +102,33 @@ class DatabaseInterface:
 
     def __init__(self, db_connection_string: str, system_logger: SystemLogger, error_handler: ErrorHandler):
         """Initializes the interface with core service integrations and production-ready pooling."""
-        self.engine = create_engine(
-            db_connection_string, 
+        # Convert to async connection string if needed
+        if db_connection_string.startswith('postgresql://'):
+            async_connection_string = db_connection_string.replace('postgresql://', 'postgresql+asyncpg://')
+        elif db_connection_string.startswith('sqlite://'):
+            async_connection_string = db_connection_string.replace('sqlite://', 'sqlite+aiosqlite://')
+        else:
+            async_connection_string = db_connection_string
+            
+        self.async_engine = create_async_engine(
+            async_connection_string, 
             pool_pre_ping=True,
             pool_size=10,      # A sensible default for connection pool size
             max_overflow=20    # Allows for spikes in demand
         )
-        self.SessionFactory = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+        self.AsyncSessionFactory = async_sessionmaker(
+            autocommit=False, 
+            autoflush=False, 
+            bind=self.async_engine
+        )
         self.logger = system_logger
         self.error_handler = error_handler
         self._safe_table_name_pattern = re.compile(r'^[a-zA-Z0-9_]+$')
+        self.config_cache = ConfigCache()
 
-    def get_session(self) -> Session:
-        """Provides a new database session for use in a 'with' statement."""
-        return self.SessionFactory()
+    def get_async_session(self) -> AsyncSession:
+        """Provides a new async database session for use in a 'async with' statement."""
+        return self.AsyncSessionFactory()
 
     def _validate_table_name(self, table_name: str):
         """Validates table name to prevent SQL injection."""
@@ -71,16 +139,26 @@ class DatabaseInterface:
     # NEW: Connector Support Methods
     # =================================================================
 
-    def get_datasource_configuration(self, datasource_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[DataSource]:
+    async def get_datasource_configuration(self, datasource_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[DataSource]:
         """Get complete datasource configuration by ID."""
+        cache_key = f"datasource_config:{datasource_id}"
+        return await self.config_cache.get_or_fetch(
+            cache_key,
+            lambda: self._fetch_datasource_configuration(datasource_id, context),
+            is_classifier=False
+        )
+
+    async def _fetch_datasource_configuration(self, datasource_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[DataSource]:
+        """Internal method to fetch datasource configuration from database."""
         context = context or {}
         self.logger.log_database_operation("SELECT", "DataSources", "STARTED", 
                                          operation="get_configuration", 
                                          datasource_id=datasource_id, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = select(DataSource).where(DataSource.datasource_id == datasource_id)
-                result = session.scalars(stmt).one_or_none()
+                result = await session.scalars(stmt)
+                result = result.one_or_none()
                 
                 self.logger.log_database_operation("SELECT", "DataSources", "SUCCESS", 
                                                  operation="get_configuration", 
@@ -91,18 +169,28 @@ class DatabaseInterface:
                                           datasource_id=datasource_id, **context)
             raise
 
-    def get_credential_for_datasource(self, datasource_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    async def get_credential_for_datasource(self, datasource_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """Get credential information for a datasource."""
+        cache_key = f"datasource_credential:{datasource_id}"
+        return await self.config_cache.get_or_fetch(
+            cache_key,
+            lambda: self._fetch_credential_for_datasource(datasource_id, context),
+            is_classifier=False
+        )
+
+    async def _fetch_credential_for_datasource(self, datasource_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """Internal method to fetch credential for datasource from database."""
         context = context or {}
         self.logger.log_database_operation("SELECT", "Credentials", "STARTED", 
                                          operation="get_for_datasource", 
                                          datasource_id=datasource_id, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 # First get the datasource to find credential_id
-                datasource = session.scalars(
+                datasource_result = await session.scalars(
                     select(DataSource).where(DataSource.datasource_id == datasource_id)
-                ).one_or_none()
+                )
+                datasource = datasource_result.one_or_none()
                 
                 if not datasource:
                     return None
@@ -113,9 +201,10 @@ class DatabaseInterface:
                     return None
                 
                 # Get the credential
-                credential = session.scalars(
+                credential_result = await session.scalars(
                     select(Credential).where(Credential.credential_id == credential_id)
-                ).one_or_none()
+                )
+                credential = credential_result.one_or_none()
                 
                 if credential:
                     credential_data = {
@@ -138,14 +227,23 @@ class DatabaseInterface:
                                           datasource_id=datasource_id, **context)
             raise
 
-    def get_classifier_template_full(self, template_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[ClassifierTemplate]:
+    async def get_classifier_template_full(self, template_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[ClassifierTemplate]:
         """Get complete classifier template with all related classifiers."""
+        cache_key = f"classifier_template:{template_id}"
+        return await self.config_cache.get_or_fetch(
+            cache_key,
+            lambda: self._fetch_classifier_template_full(template_id, context),
+            is_classifier=True
+        )
+
+    async def _fetch_classifier_template_full(self, template_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[ClassifierTemplate]:
+        """Internal method to fetch classifier template from database."""
         context = context or {}
         self.logger.log_database_operation("SELECT", "ClassifierTemplates", "STARTED", 
                                          operation="get_full", 
                                          template_id=template_id, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = (
                     select(ClassifierTemplate)
                     .where(ClassifierTemplate.template_id == template_id)
@@ -158,7 +256,8 @@ class DatabaseInterface:
                         .joinedload(Classifier.validation_rules)
                     )
                 )
-                result = session.scalars(stmt).one_or_none()
+                result = await session.scalars(stmt)
+                result = result.one_or_none()
                 
                 self.logger.log_database_operation("SELECT", "ClassifierTemplates", "SUCCESS", 
                                                  operation="get_full", 
@@ -169,21 +268,32 @@ class DatabaseInterface:
                                           template_id=template_id, **context)
             raise
 
-    def get_connector_configuration(self, connector_type: str, config_name: str = "default", 
+    async def get_connector_configuration(self, connector_type: str, config_name: str = "default", 
                                   context: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """Get connector-specific configuration (e.g., SQL queries)."""
+        cache_key = f"connector_config:{connector_type}:{config_name}"
+        return await self.config_cache.get_or_fetch(
+            cache_key,
+            lambda: self._fetch_connector_configuration(connector_type, config_name, context),
+            is_classifier=False
+        )
+
+    async def _fetch_connector_configuration(self, connector_type: str, config_name: str = "default", 
+                                           context: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """Internal method to fetch connector configuration from database."""
         context = context or {}
         self.logger.log_database_operation("SELECT", "ConnectorConfigurations", "STARTED", 
                                          operation="get_by_type", 
                                          connector_type=connector_type, 
                                          config_name=config_name, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = select(ConnectorConfiguration).where(
                     ConnectorConfiguration.ConnectorType == connector_type,
                     ConnectorConfiguration.ConfigName == config_name
                 )
-                result = session.scalars(stmt).one_or_none()
+                result = await session.scalars(stmt)
+                result = result.one_or_none()
                 
                 if result:
                     self.logger.log_database_operation("SELECT", "ConnectorConfigurations", "SUCCESS", 
@@ -199,7 +309,7 @@ class DatabaseInterface:
                                           connector_type=connector_type, **context)
             raise
 
-    def insert_scan_findings(self, findings: List[Dict[str, Any]], context: Optional[Dict[str, Any]] = None) -> int:
+    async def insert_scan_findings(self, findings: List[Dict[str, Any]], context: Optional[Dict[str, Any]] = None) -> int:
         """Insert scan findings into the findings tables."""
         context = context or {}
         if not findings:
@@ -208,7 +318,7 @@ class DatabaseInterface:
         self.logger.log_database_operation("BULK INSERT", "ScanFindingSummaries", "STARTED", 
                                          record_count=len(findings), **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 # Convert findings to ORM format
                 summaries = []
                 for finding in findings:
@@ -246,8 +356,8 @@ class DatabaseInterface:
                     summaries.append(summary)
                 
                 # Bulk insert summaries
-                session.bulk_insert_mappings(ScanFindingSummary, summaries)
-                session.commit()
+                await session.run_sync(lambda sync_session: sync_session.bulk_insert_mappings(ScanFindingSummary, summaries))
+                await session.commit()
                 
                 self.logger.log_database_operation("BULK INSERT", "ScanFindingSummaries", "SUCCESS", 
                                                  record_count=len(summaries), **context)
@@ -258,7 +368,7 @@ class DatabaseInterface:
                                           finding_count=len(findings), **context)
             raise
 
-    def get_objects_for_classification(self, object_ids: List[str], context: Optional[Dict[str, Any]] = None) -> List[OrmDiscoveredObject]:
+    async def get_objects_for_classification(self, object_ids: List[str], context: Optional[Dict[str, Any]] = None) -> List[OrmDiscoveredObject]:
         """Get discovered objects by their IDs for classification."""
         context = context or {}
         if not object_ids:
@@ -268,9 +378,10 @@ class DatabaseInterface:
                                          operation="get_for_classification", 
                                          object_count=len(object_ids), **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = select(OrmDiscoveredObject).where(OrmDiscoveredObject.ID.in_(object_ids))
-                results = list(session.scalars(stmt).all())
+                result = await session.scalars(stmt)
+                results = list(result.all())
                 
                 self.logger.log_database_operation("SELECT", "DiscoveredObjects", "SUCCESS", 
                                                  operation="get_for_classification", 
@@ -281,7 +392,7 @@ class DatabaseInterface:
                                           object_count=len(object_ids), **context)
             raise
 
-    def update_classification_timestamps(self, object_ids: List[int], context: Optional[Dict[str, Any]] = None) -> None:
+    async def update_classification_timestamps(self, object_ids: List[int], context: Optional[Dict[str, Any]] = None) -> None:
         """Update classification timestamps for objects."""
         context = context or {}
         if not object_ids:
@@ -291,7 +402,7 @@ class DatabaseInterface:
                                          operation="update_timestamps", 
                                          object_count=len(object_ids), **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 current_time = datetime.now(timezone.utc)
                 
                 # Update existing records
@@ -299,13 +410,15 @@ class DatabaseInterface:
                     DiscoveredObjectClassificationDateInfo.ObjectID.in_(object_ids)
                 ).values(LastClassificationDate=current_time)
                 
-                updated_count = session.execute(stmt).rowcount
+                result = await session.execute(stmt)
+                updated_count = result.rowcount
                 
                 # Insert records for objects that don't have classification info yet
-                existing_ids = session.scalars(
+                existing_result = await session.scalars(
                     select(DiscoveredObjectClassificationDateInfo.ObjectID)
                     .where(DiscoveredObjectClassificationDateInfo.ObjectID.in_(object_ids))
-                ).all()
+                )
+                existing_ids = list(existing_result.all())
                 
                 new_ids = set(object_ids) - set(existing_ids)
                 if new_ids:
@@ -316,9 +429,9 @@ class DatabaseInterface:
                         }
                         for obj_id in new_ids
                     ]
-                    session.bulk_insert_mappings(DiscoveredObjectClassificationDateInfo, new_records)
+                    await session.run_sync(lambda sync_session: sync_session.bulk_insert_mappings(DiscoveredObjectClassificationDateInfo, new_records))
                 
-                session.commit()
+                await session.commit()
                 
                 self.logger.log_database_operation("UPDATE", "DiscoveredObjectClassificationDateInfo", "SUCCESS", 
                                                  operation="update_timestamps", 
@@ -330,7 +443,7 @@ class DatabaseInterface:
                                           object_count=len(object_ids), **context)
             raise
 
-    def get_objects_by_datasource(self, datasource_id: str, limit: int = 1000, 
+    async def get_objects_by_datasource(self, datasource_id: str, limit: int = 1000, 
                                 context: Optional[Dict[str, Any]] = None) -> List[OrmDiscoveredObject]:
         """Get discovered objects for a specific datasource."""
         context = context or {}
@@ -339,13 +452,14 @@ class DatabaseInterface:
                                          datasource_id=datasource_id, 
                                          limit=limit, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = (
                     select(OrmDiscoveredObject)
                     .where(OrmDiscoveredObject.DataSourceID == datasource_id)
                     .limit(limit)
                 )
-                results = list(session.scalars(stmt).all())
+                result = await session.scalars(stmt)
+                results = list(result.all())
                 
                 self.logger.log_database_operation("SELECT", "DiscoveredObjects", "SUCCESS", 
                                                  operation="get_by_datasource", 
@@ -357,7 +471,7 @@ class DatabaseInterface:
                                           datasource_id=datasource_id, **context)
             raise
 
-    def insert_discovered_object_batch(self, objects: List[Dict[str, Any]], 
+    async def insert_discovered_object_batch(self, objects: List[Dict[str, Any]], 
                                      staging_table_name: str,
                                      context: Optional[Dict[str, Any]] = None) -> int:
         """Insert batch of discovered objects into staging table."""
@@ -369,7 +483,7 @@ class DatabaseInterface:
         self.logger.log_database_operation("BULK INSERT", staging_table_name, "STARTED", 
                                          record_count=len(objects), **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 # Convert objects to proper format with hash calculation
                 processed_objects = []
                 for obj in objects:
@@ -397,9 +511,12 @@ class DatabaseInterface:
                     processed_objects.append(processed_obj)
                 
                 # Insert into staging table using raw SQL for performance
-                staging_table = Table(staging_table_name, Base.metadata, autoload_with=self.engine)
-                session.execute(staging_table.insert(), processed_objects)
-                session.commit()
+                def sync_insert(sync_session):
+                    staging_table = Table(staging_table_name, Base.metadata, autoload_with=sync_session.bind)
+                    sync_session.execute(staging_table.insert(), processed_objects)
+                
+                await session.run_sync(sync_insert)
+                await session.commit()
                 
                 self.logger.log_database_operation("BULK INSERT", staging_table_name, "SUCCESS", 
                                                  record_count=len(processed_objects), **context)
@@ -411,21 +528,22 @@ class DatabaseInterface:
                                           object_count=len(objects), **context)
             raise
 
-    def get_all_datasources(self, enabled_only: bool = True, context: Optional[Dict[str, Any]] = None) -> List[DataSource]:
+    async def get_all_datasources(self, enabled_only: bool = True, context: Optional[Dict[str, Any]] = None) -> List[DataSource]:
         """Get all datasources, optionally filtered by enabled status."""
         context = context or {}
         self.logger.log_database_operation("SELECT", "DataSources", "STARTED", 
                                          operation="get_all", 
                                          enabled_only=enabled_only, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = select(DataSource)
                 if enabled_only:
                     # Assume enabled field exists in configuration JSON
                     # You may need to adjust this based on your actual schema
                     pass  # Add filter logic if needed
                 
-                results = list(session.scalars(stmt).all())
+                result = await session.scalars(stmt)
+                results = list(result.all())
                 
                 self.logger.log_database_operation("SELECT", "DataSources", "SUCCESS", 
                                                  operation="get_all", 
@@ -440,25 +558,25 @@ class DatabaseInterface:
     # Health and Debugging
     # =================================================================
 
-    def test_database_connection(self, context: Optional[Dict[str, Any]] = None) -> bool:
+    async def test_database_connection(self, context: Optional[Dict[str, Any]] = None) -> bool:
         context = context or {}
         self.logger.log_database_operation("CONNECT", "database", "STARTED", **context)
         try:
-            with self.engine.connect():
+            async with self.async_engine.begin():
                 self.logger.log_database_operation("CONNECT", "database", "SUCCESS", **context)
                 return True
         except Exception as e:
             self.error_handler.handle_error(e, context="test_database_connection", **context)
             return False
 
-    def get_database_health_metrics(self, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def get_database_health_metrics(self, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         context = context or {}
         self.logger.log_database_operation("GET_METRICS", "database", "STARTED", **context)
         try:
             metrics = {
-                "connection_pool_size": self.engine.pool.size(),
-                "connections_in_use": self.engine.pool.checkedin(),
-                "connections_available": self.engine.pool.checkedout(),
+                "connection_pool_size": self.async_engine.pool.size(),
+                "connections_in_use": self.async_engine.pool.checkedin(),
+                "connections_available": self.async_engine.pool.checkedout(),
             }
             self.logger.log_database_operation("GET_METRICS", "database", "SUCCESS", **context)
             return metrics
@@ -466,13 +584,14 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, context="get_database_health_metrics", **context)
             raise
     
-    def get_job_progress_summary(self, job_id: int, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def get_job_progress_summary(self, job_id: int, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         context = context or {}
         self.logger.log_database_operation("QUERY", "Tasks", "STARTED", operation="get_job_summary", job_id=job_id, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = select(Task.Status, func.count(Task.Status)).where(Task.JobID == job_id).group_by(Task.Status)
-                results = session.execute(stmt).all()
+                result = await session.execute(stmt)
+                results = result.all()
                 summary = {status.value: count for status, count in results}
                 self.logger.log_database_operation("QUERY", "Tasks", "SUCCESS", operation="get_job_summary", **context)
                 return summary
@@ -484,30 +603,52 @@ class DatabaseInterface:
     # Configuration and Initialization
     # =================================================================
 
-    def get_system_parameters(self, node_group: Optional[str] = None, context: Optional[Dict[str, Any]] = None) -> List[SystemParameter]:
+    async def get_system_parameters(self, node_group: Optional[str] = None, context: Optional[Dict[str, Any]] = None) -> List[SystemParameter]:
+        """Get system parameters with caching."""
+        cache_key = f"system_params:{node_group or 'default'}"
+        return await self.config_cache.get_or_fetch(
+            cache_key,
+            lambda: self._fetch_system_parameters(node_group, context),
+            is_classifier=False
+        )
+
+    async def _fetch_system_parameters(self, node_group: Optional[str] = None, context: Optional[Dict[str, Any]] = None) -> List[SystemParameter]:
+        """Internal method to fetch system parameters from database."""
         context = context or {}
         self.logger.log_database_operation("SELECT", "SystemParameters", "STARTED", **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = select(SystemParameter)
                 if node_group:
                     stmt = stmt.outerjoin(NodeGroup).where(NodeGroup.name == node_group)
                 else:
                     stmt = stmt.where(SystemParameter.node_group_id.is_(None))
-                results = list(session.scalars(stmt).all())
+                result = await session.scalars(stmt)
+                results = list(result.all())
                 self.logger.log_database_operation("SELECT", "SystemParameters", "SUCCESS", row_count=len(results), **context)
                 return results
         except Exception as e:
             self.error_handler.handle_error(e, context="get_system_parameters", **context)
             raise
 
-    def get_connector_configurations(self, context: Optional[Dict[str, Any]] = None) -> List[ConnectorConfiguration]:
+    async def get_connector_configurations(self, context: Optional[Dict[str, Any]] = None) -> List[ConnectorConfiguration]:
+        """Get all connector configurations with caching."""
+        cache_key = "connector_configurations:all"
+        return await self.config_cache.get_or_fetch(
+            cache_key,
+            lambda: self._fetch_connector_configurations(context),
+            is_classifier=False
+        )
+
+    async def _fetch_connector_configurations(self, context: Optional[Dict[str, Any]] = None) -> List[ConnectorConfiguration]:
+        """Internal method to fetch connector configurations from database."""
         context = context or {}
         self.logger.log_database_operation("SELECT", "ConnectorConfigurations", "STARTED", **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = select(ConnectorConfiguration)
-                results = list(session.scalars(stmt).all())
+                result = await session.scalars(stmt)
+                results = list(result.all())
                 self.logger.log_database_operation("SELECT", "ConnectorConfigurations", "SUCCESS", row_count=len(results), **context)
                 return results
         except Exception as e:
@@ -518,51 +659,52 @@ class DatabaseInterface:
     # Job & Task Lifecycle
     # =================================================================
     
-    def create_job_execution(self, template_id: str, execution_id: str, trigger_type: str, context: Optional[Dict[str, Any]] = None) -> Job:
+    async def create_job_execution(self, template_id: str, execution_id: str, trigger_type: str, context: Optional[Dict[str, Any]] = None) -> Job:
         context = context or {}
         self.logger.log_database_operation("INSERT", "Jobs", "STARTED", execution_id=execution_id, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 template_stmt = select(ScanTemplate).where(ScanTemplate.template_id == template_id)
-                scan_template = session.scalars(template_stmt).one()
+                template_result = await session.scalars(template_stmt)
+                scan_template = template_result.one()
                 new_job = Job(execution_id=execution_id, scan_template_id=scan_template.id, status="QUEUED", trigger_type=trigger_type)
                 session.add(new_job)
-                session.commit()
-                session.refresh(new_job)
+                await session.commit()
+                await session.refresh(new_job)
                 self.logger.log_database_operation("INSERT", "Jobs", "SUCCESS", job_id=new_job.id, **context)
                 return new_job
         except Exception as e:
             self.error_handler.handle_error(e, context="create_job_execution", **context)
             raise
 
-    def create_task(self, job_id: int, task_type: str, work_packet: Dict[str, Any], datasource_id: Optional[str] = None, parent_task_id: Optional[int] = None, context: Optional[Dict[str, Any]] = None) -> Task:
+    async def create_task(self, job_id: int, task_type: str, work_packet: Dict[str, Any], datasource_id: Optional[str] = None, parent_task_id: Optional[int] = None, context: Optional[Dict[str, Any]] = None) -> Task:
         context = context or {}
         self.logger.log_database_operation("INSERT", "Tasks", "STARTED", job_id=job_id, task_type=task_type, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 new_task = Task(JobID=job_id, TaskType=task_type, WorkPacket=work_packet, DatasourceID=datasource_id, ParentTaskID=parent_task_id, Status=TaskStatus.PENDING)
                 session.add(new_task)
-                session.commit()
-                session.refresh(new_task)
+                await session.commit()
+                await session.refresh(new_task)
                 self.logger.log_database_operation("INSERT", "Tasks", "SUCCESS", task_id=new_task.ID, **context)
                 return new_task
         except Exception as e:
             self.error_handler.handle_error(e, context="create_task", **context)
             raise
 
-    def assign_task_to_worker(self, task_id: int, worker_id: str, lease_duration_seconds: int, context: Optional[Dict[str, Any]] = None) -> bool:
+    async def assign_task_to_worker(self, task_id: int, worker_id: str, lease_duration_seconds: int, context: Optional[Dict[str, Any]] = None) -> bool:
         context = context or {}
         self.logger.log_database_operation("UPDATE", "Tasks", "STARTED", task_id=task_id, worker_id=worker_id, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = update(Task).where(Task.ID == task_id, Task.Status == TaskStatus.PENDING).values(
                     Status=TaskStatus.ASSIGNED,
                     WorkerID=worker_id,
                     LeaseExpiry=datetime.now(timezone.utc) + timedelta(seconds=lease_duration_seconds),
                     RetryCount=Task.RetryCount + 1
                 )
-                result = session.execute(stmt)
-                session.commit()
+                result = await session.execute(stmt)
+                await session.commit()
                 was_successful = result.rowcount > 0
                 status = "SUCCESS" if was_successful else "FAILURE_RACE_CONDITION"
                 self.logger.log_database_operation("UPDATE", "Tasks", status, task_id=task_id, **context)
@@ -571,25 +713,25 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, context="assign_task_to_worker", **context)
             raise
 
-    def complete_task(self, task_id: int, context: Optional[Dict[str, Any]] = None) -> None:
+    async def complete_task(self, task_id: int, context: Optional[Dict[str, Any]] = None) -> None:
         context = context or {}
         self.logger.log_database_operation("UPDATE", "Tasks", "STARTED", operation="complete_task", task_id=task_id, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = update(Task).where(Task.ID == task_id).values(Status=TaskStatus.COMPLETED)
-                session.execute(stmt)
-                session.commit()
+                await session.execute(stmt)
+                await session.commit()
                 self.logger.log_database_operation("UPDATE", "Tasks", "SUCCESS", operation="complete_task", task_id=task_id, **context)
         except Exception as e:
             self.error_handler.handle_error(e, context="complete_task", task_id=task_id, **context)
             raise
 
-    def fail_task(self, task_id: int, is_retryable: bool, max_retries: int = 3, context: Optional[Dict[str, Any]] = None) -> None:
+    async def fail_task(self, task_id: int, is_retryable: bool, max_retries: int = 3, context: Optional[Dict[str, Any]] = None) -> None:
         context = context or {}
         self.logger.log_database_operation("UPDATE", "Tasks", "STARTED", operation="fail_task", task_id=task_id, **context)
         try:
-            with self.get_session() as session:
-                task = session.get(Task, task_id)
+            async with self.get_async_session() as session:
+                task = await session.get(Task, task_id)
                 if not task: return
                 
                 if is_retryable and task.RetryCount < max_retries:
@@ -598,33 +740,35 @@ class DatabaseInterface:
                     task.LeaseExpiry = None
                 else:
                     task.Status = TaskStatus.FAILED
-                session.commit()
+                await session.commit()
                 self.logger.log_database_operation("UPDATE", "Tasks", "SUCCESS", operation="fail_task", new_status=task.Status.value, **context)
         except Exception as e:
             self.error_handler.handle_error(e, context="fail_task", task_id=task_id, **context)
             raise
 
-    def get_pending_tasks_batch(self, job_id: int, batch_size: int, context: Optional[Dict[str, Any]] = None) -> List[Task]:
+    async def get_pending_tasks_batch(self, job_id: int, batch_size: int, context: Optional[Dict[str, Any]] = None) -> List[Task]:
         context = context or {}
         self.logger.log_database_operation("SELECT", "Tasks", "STARTED", job_id=job_id, batch_size=batch_size, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = select(Task).where(Task.JobID == job_id, Task.Status == TaskStatus.PENDING).order_by(Task.ID).limit(batch_size)
-                results = list(session.scalars(stmt).all())
+                result = await session.scalars(stmt)
+                results = list(result.all())
                 self.logger.log_database_operation("SELECT", "Tasks", "SUCCESS", row_count=len(results), **context)
                 return results
         except Exception as e:
             self.error_handler.handle_error(e, context="get_pending_tasks_batch", **context)
             raise
 
-    def get_expired_task_leases(self, timeout_seconds: int, context: Optional[Dict[str, Any]] = None) -> List[Task]:
+    async def get_expired_task_leases(self, timeout_seconds: int, context: Optional[Dict[str, Any]] = None) -> List[Task]:
         context = context or {}
         self.logger.log_database_operation("SELECT", "Tasks", "STARTED", operation="get_expired_leases", **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 expiry_threshold = datetime.now(timezone.utc) - timedelta(seconds=timeout_seconds)
                 stmt = select(Task).where(Task.Status == TaskStatus.ASSIGNED, Task.LeaseExpiry < expiry_threshold)
-                results = list(session.scalars(stmt).all())
+                result = await session.scalars(stmt)
+                results = list(result.all())
                 self.logger.log_database_operation("SELECT", "Tasks", "SUCCESS", row_count=len(results), **context)
                 return results
         except Exception as e:
@@ -635,28 +779,29 @@ class DatabaseInterface:
     # Pipelining and Progress
     # =================================================================
 
-    def write_task_output_record(self, task_id: int, output_type: str, payload: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> TaskOutputRecord:
+    async def write_task_output_record(self, task_id: int, output_type: str, payload: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> TaskOutputRecord:
         context = context or {}
         self.logger.log_database_operation("INSERT", "TaskOutputRecords", "STARTED", task_id=task_id, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 record = TaskOutputRecord(TaskID=task_id, OutputType=output_type, OutputPayload=payload, Status='PENDING_PROCESSING')
                 session.add(record)
-                session.commit()
-                session.refresh(record)
+                await session.commit()
+                await session.refresh(record)
                 self.logger.log_database_operation("INSERT", "TaskOutputRecords", "SUCCESS", record_id=record.ID, **context)
                 return record
         except Exception as e:
             self.error_handler.handle_error(e, context="write_task_output_record", **context)
             raise
 
-    def get_pending_output_records(self, limit: int = 100, context: Optional[Dict[str, Any]] = None) -> List[TaskOutputRecord]:
+    async def get_pending_output_records(self, limit: int = 100, context: Optional[Dict[str, Any]] = None) -> List[TaskOutputRecord]:
         context = context or {}
         self.logger.log_database_operation("SELECT", "TaskOutputRecords", "STARTED", limit=limit, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = select(TaskOutputRecord).where(TaskOutputRecord.Status == 'PENDING_PROCESSING').limit(limit)
-                results = list(session.scalars(stmt).all())
+                result = await session.scalars(stmt)
+                results = list(result.all())
                 self.logger.log_database_operation("SELECT", "TaskOutputRecords", "SUCCESS", row_count=len(results), **context)
                 return results
         except Exception as e:
@@ -667,7 +812,7 @@ class DatabaseInterface:
     # Staging Table Management
     # =================================================================
 
-    def create_staging_table_for_job(self, job_id: int, table_type: str, context: Optional[Dict[str, Any]] = None) -> str:
+    async def create_staging_table_for_job(self, job_id: int, table_type: str, context: Optional[Dict[str, Any]] = None) -> str:
         context = context or {}
         staging_table_name = f"staging_{table_type}_job_{job_id}"
         self._validate_table_name(staging_table_name)
@@ -681,8 +826,8 @@ class DatabaseInterface:
             template_table = template_table_map[table_type]
             staging_table = Table(staging_table_name, Base.metadata, *(col.copy() for col in template_table.columns))
             
-            with self.engine.begin() as conn:
-                staging_table.create(conn, checkfirst=True)
+            async with self.async_engine.begin() as conn:
+                await conn.run_sync(lambda sync_conn: staging_table.create(sync_conn, checkfirst=True))
             
             self.logger.log_database_operation("CREATE TABLE", staging_table_name, "SUCCESS", **context)
             return staging_table_name
@@ -690,32 +835,37 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, context="create_staging_table_for_job", table_name=staging_table_name, **context)
             raise
 
-    def cleanup_staging_tables_for_job(self, job_id: int, context: Optional[Dict[str, Any]] = None) -> None:
+    async def cleanup_staging_tables_for_job(self, job_id: int, context: Optional[Dict[str, Any]] = None) -> None:
         context = context or {}
         pattern = f"staging_%_job_{job_id}"
         self.logger.log_database_operation("DROP TABLE", pattern, "STARTED", **context)
         try:
-            inspector = inspect(self.engine)
-            all_tables = inspector.get_table_names()
-            tables_to_drop = [name for name in all_tables if name.startswith(f"staging_") and name.endswith(f"_job_{job_id}")]
+            def sync_cleanup(sync_conn):
+                inspector = inspect(sync_conn)
+                all_tables = inspector.get_table_names()
+                tables_to_drop = [name for name in all_tables if name.startswith(f"staging_") and name.endswith(f"_job_{job_id}")]
 
-            with self.engine.begin() as conn:
                 for table_name in tables_to_drop:
                     self._validate_table_name(table_name)
-                    table_to_drop = Table(table_name, Base.metadata, autoload_with=self.engine)
-                    table_to_drop.drop(conn, checkfirst=True)
-            self.logger.log_database_operation("DROP TABLE", pattern, "SUCCESS", dropped_count=len(tables_to_drop), **context)
+                    table_to_drop = Table(table_name, Base.metadata, autoload_with=sync_conn)
+                    table_to_drop.drop(sync_conn, checkfirst=True)
+                return len(tables_to_drop)
+
+            async with self.async_engine.begin() as conn:
+                dropped_count = await conn.run_sync(sync_cleanup)
+            self.logger.log_database_operation("DROP TABLE", pattern, "SUCCESS", dropped_count=dropped_count, **context)
         except Exception as e:
             self.error_handler.handle_error(e, context="cleanup_staging_tables_for_job", job_id=job_id, **context)
             raise
             
-    def get_staging_table_record_count(self, table_name: str, context: Optional[Dict[str, Any]] = None) -> int:
+    async def get_staging_table_record_count(self, table_name: str, context: Optional[Dict[str, Any]] = None) -> int:
         context = context or {}
         self._validate_table_name(table_name)
         self.logger.log_database_operation("COUNT", table_name, "STARTED", **context)
         try:
-            with self.get_session() as session:
-                count = session.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar_one()
+            async with self.get_async_session() as session:
+                result = await session.execute(text(f"SELECT COUNT(*) FROM {table_name}"))
+                count = result.scalar_one()
                 self.logger.log_database_operation("COUNT", table_name, "SUCCESS", record_count=count, **context)
                 return count
         except Exception as e:
@@ -726,33 +876,35 @@ class DatabaseInterface:
     # Bulk Data & Delta Operations
     # =================================================================
     
-    def bulk_insert_mappings(self, orm_class, mappings: List[Dict[str, Any]], context: Optional[Dict[str, Any]] = None) -> int:
+    async def bulk_insert_mappings(self, orm_class, mappings: List[Dict[str, Any]], context: Optional[Dict[str, Any]] = None) -> int:
         context = context or {}
         table_name = orm_class.__tablename__
         if not mappings: return 0
         
         self.logger.log_database_operation("BULK INSERT", table_name, "STARTED", record_count=len(mappings), **context)
         try:
-            with self.get_session() as session:
-                session.bulk_insert_mappings(orm_class, mappings)
-                session.commit()
+            async with self.get_async_session() as session:
+                await session.run_sync(lambda sync_session: sync_session.bulk_insert_mappings(orm_class, mappings))
+                await session.commit()
                 self.logger.log_database_operation("BULK INSERT", table_name, "SUCCESS", record_count=len(mappings), **context)
                 return len(mappings)
         except Exception as e:
             self.error_handler.handle_error(e, context="bulk_insert_mappings", table_name=table_name, **context)
             raise
 
-    def execute_delta_comparison(self, staging_table_name: str, datasource_id: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
+    async def execute_delta_comparison(self, staging_table_name: str, datasource_id: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
         context = context or {}
         self._validate_table_name(staging_table_name)
         self.logger.log_database_operation("DELTA", staging_table_name, "STARTED", **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 staging_hashes_query = text(f'SELECT "ObjectKeyHash" FROM {staging_table_name}')
-                staging_hashes = {val.hex() for val in session.execute(staging_hashes_query).scalars().all()}
+                staging_result = await session.execute(staging_hashes_query)
+                staging_hashes = {val.hex() for val in staging_result.scalars().all()}
                 
                 main_hashes_query = select(OrmDiscoveredObject.ObjectKeyHash).where(OrmDiscoveredObject.DataSourceID == datasource_id)
-                main_hashes = {val.hex() for val in session.execute(main_hashes_query).scalars().all()}
+                main_result = await session.execute(main_hashes_query)
+                main_hashes = {val.hex() for val in main_result.scalars().all()}
 
                 new_hashes_hex = staging_hashes - main_hashes
                 deleted_hashes_hex = main_hashes - staging_hashes
@@ -760,18 +912,19 @@ class DatabaseInterface:
                 if deleted_hashes_hex:
                     deleted_hashes_bytes = [bytes.fromhex(h) for h in deleted_hashes_hex]
                     delete_stmt = delete(OrmDiscoveredObject).where(OrmDiscoveredObject.ObjectKeyHash.in_(deleted_hashes_bytes))
-                    session.execute(delete_stmt)
+                    await session.execute(delete_stmt)
                 
                 if new_hashes_hex:
                     new_hashes_bytes = [bytes.fromhex(h) for h in new_hashes_hex]
                     target_columns = [c.name for c in OrmDiscoveredObject.__table__.columns if c.name != 'ID']
                     target_columns_str = ", ".join([f'"{c}"' for c in target_columns])
                     new_records_sql = text(f'SELECT {target_columns_str} FROM {staging_table_name} WHERE "ObjectKeyHash" IN :hashes')
-                    new_records_mappings = session.execute(new_records_sql, {"hashes": tuple(new_hashes_bytes)}).mappings().all()
+                    new_records_result = await session.execute(new_records_sql, {"hashes": tuple(new_hashes_bytes)})
+                    new_records_mappings = new_records_result.mappings().all()
                     if new_records_mappings:
-                        session.bulk_insert_mappings(OrmDiscoveredObject, new_records_mappings)
+                        await session.run_sync(lambda sync_session: sync_session.bulk_insert_mappings(OrmDiscoveredObject, new_records_mappings))
 
-                session.commit()
+                await session.commit()
                 
                 results = {"new": len(new_hashes_hex), "modified": 0, "deleted": len(deleted_hashes_hex)}
                 self.logger.log_database_operation("DELTA", staging_table_name, "SUCCESS", **results, **context)
@@ -780,20 +933,21 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, context="execute_delta_comparison", staging_table=staging_table_name, **context)
             raise
 
-    def get_objects_needing_classification_rescan(self, cutoff_date: datetime, context: Optional[Dict[str, Any]] = None) -> List[int]:
+    async def get_objects_needing_classification_rescan(self, cutoff_date: datetime, context: Optional[Dict[str, Any]] = None) -> List[int]:
         context = context or {}
         self.logger.log_database_operation("SELECT", "DiscoveredObjectClassificationDateInfo", "STARTED", operation="rescan_check", **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = select(DiscoveredObjectClassificationDateInfo.ObjectID).where(DiscoveredObjectClassificationDateInfo.LastClassificationDate < cutoff_date)
-                results = list(session.scalars(stmt).all())
+                result = await session.scalars(stmt)
+                results = list(result.all())
                 self.logger.log_database_operation("SELECT", "DiscoveredObjectClassificationDateInfo", "SUCCESS", row_count=len(results), **context)
                 return results
         except Exception as e:
             self.error_handler.handle_error(e, context="get_objects_needing_classification_rescan", **context)
             raise
             
-    def get_datasource_with_schedule(self, datasource_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[DataSource]:
+    async def get_datasource_with_schedule(self, datasource_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[DataSource]:
         """
         Fetches a single DataSource by its ID, eagerly loading its associated
         Calendar and all CalendarRules in a single, efficient query.
@@ -808,7 +962,7 @@ class DatabaseInterface:
         context = context or {}
         self.logger.log_database_operation("SELECT", "DataSources", "STARTED", operation="get_with_schedule", datasource_id=datasource_id, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = (
                     select(DataSource)
                     .where(DataSource.datasource_id == datasource_id)
@@ -817,7 +971,8 @@ class DatabaseInterface:
                         .joinedload(Calendar.rules)
                     )
                 )
-                result = session.scalars(stmt).one_or_none()
+                result = await session.scalars(stmt)
+                result = result.one_or_none()
                 
                 self.logger.log_database_operation("SELECT", "DataSources", "SUCCESS", operation="get_with_schedule", found=(result is not None), **context)
                 return result
@@ -825,7 +980,7 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, context="get_datasource_with_schedule", datasource_id=datasource_id, **context)
             raise
 
-    def get_active_jobs(self, statuses: List[JobStatus] = None, context: Optional[Dict[str, Any]] = None) -> List[Job]:
+    async def get_active_jobs(self, statuses: List[JobStatus] = None, context: Optional[Dict[str, Any]] = None) -> List[Job]:
         """Fetches jobs that are in an active state (defaulting to QUEUED or RUNNING)."""
         context = context or {}
         if statuses is None:
@@ -833,70 +988,71 @@ class DatabaseInterface:
         
         self.logger.log_database_operation("SELECT", "Jobs", "STARTED", operation="get_active_jobs", statuses=statuses, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = select(Job).where(Job.status.in_(statuses))
-                results = list(session.scalars(stmt).all())
+                result = await session.scalars(stmt)
+                results = list(result.all())
                 self.logger.log_database_operation("SELECT", "Jobs", "SUCCESS", operation="get_active_jobs", row_count=len(results), **context)
                 return results
         except Exception as e:
             self.error_handler.handle_error(e, context="get_active_jobs", **context)
             raise
 
-    def get_task_by_id(self, task_id: int, context: Optional[Dict[str, Any]] = None) -> Optional[Task]:
+    async def get_task_by_id(self, task_id: int, context: Optional[Dict[str, Any]] = None) -> Optional[Task]:
         """Fetches a single task by its primary key."""
         context = context or {}
         self.logger.log_database_operation("SELECT", "Tasks", "STARTED", operation="get_by_id", task_id=task_id, **context)
         try:
-            with self.get_session() as session:
-                result = session.get(Task, task_id)
+            async with self.get_async_session() as session:
+                result = await session.get(Task, task_id)
                 self.logger.log_database_operation("SELECT", "Tasks", "SUCCESS", operation="get_by_id", found=(result is not None), **context)
                 return result
         except Exception as e:
             self.error_handler.handle_error(e, context="get_task_by_id", task_id=task_id, **context)
             raise
 
-    def update_job_status(self, job_id: int, status: JobStatus, context: Optional[Dict[str, Any]] = None) -> None:
+    async def update_job_status(self, job_id: int, status: JobStatus, context: Optional[Dict[str, Any]] = None) -> None:
         """Updates the status of a specific job."""
         context = context or {}
         self.logger.log_database_operation("UPDATE", "Jobs", "STARTED", operation="update_status", job_id=job_id, status=status.value, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = update(Job).where(Job.id == job_id).values(status=status)
-                session.execute(stmt)
-                session.commit()
+                await session.execute(stmt)
+                await session.commit()
                 self.logger.log_database_operation("UPDATE", "Jobs", "SUCCESS", operation="update_status", **context)
         except Exception as e:
             self.error_handler.handle_error(e, context="update_job_status", job_id=job_id, **context)
             raise
 
-    def update_output_record_status(self, record_id: int, status: str, context: Optional[Dict[str, Any]] = None) -> None:
+    async def update_output_record_status(self, record_id: int, status: str, context: Optional[Dict[str, Any]] = None) -> None:
         """Updates the status of a specific TaskOutputRecord."""
         context = context or {}
         self.logger.log_database_operation("UPDATE", "TaskOutputRecords", "STARTED", operation="update_status", record_id=record_id, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = update(TaskOutputRecord).where(TaskOutputRecord.ID == record_id).values(Status=status)
-                session.execute(stmt)
-                session.commit()
+                await session.execute(stmt)
+                await session.commit()
                 self.logger.log_database_operation("UPDATE", "TaskOutputRecords", "SUCCESS", operation="update_status", **context)
         except Exception as e:
             self.error_handler.handle_error(e, context="update_output_record_status", record_id=record_id, **context)
             raise
 
-    def extend_task_lease(self, task_id: int, duration_seconds: int, context: Optional[Dict[str, Any]] = None) -> bool:
+    async def extend_task_lease(self, task_id: int, duration_seconds: int, context: Optional[Dict[str, Any]] = None) -> bool:
         """Extends the lease of an ASSIGNED task, preventing it from timing out."""
         context = context or {}
         self.logger.log_database_operation("UPDATE", "Tasks", "STARTED", operation="extend_lease", task_id=task_id, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 new_expiry = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
                 # The WHERE clause ensures we only update an active, assigned task (optimistic locking).
                 stmt = update(Task).where(
                     Task.ID == task_id,
                     Task.Status == TaskStatus.ASSIGNED
                 ).values(LeaseExpiry=new_expiry)
-                result = session.execute(stmt)
-                session.commit()
+                result = await session.execute(stmt)
+                await session.commit()
                 was_successful = result.rowcount > 0
                 self.logger.log_database_operation("UPDATE", "Tasks", "SUCCESS" if was_successful else "FAILURE", operation="extend_lease", **context)
                 return was_successful
@@ -904,7 +1060,7 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, context="extend_task_lease", task_id=task_id, **context)
             raise
 
-    def cancel_pending_tasks_for_job(self, job_id: int, context: Optional[Dict[str, Any]] = None) -> int:
+    async def cancel_pending_tasks_for_job(self, job_id: int, context: Optional[Dict[str, Any]] = None) -> int:
         """
         Cancels all PENDING tasks for a job.
         NOTE: This method strictly handles the database state change. It is the
@@ -914,13 +1070,13 @@ class DatabaseInterface:
         context = context or {}
         self.logger.log_database_operation("UPDATE", "Tasks", "STARTED", operation="cancel_pending", job_id=job_id, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = update(Task).where(
                     Task.JobID == job_id,
                     Task.Status == TaskStatus.PENDING
                 ).values(Status=TaskStatus.CANCELLED)
-                result = session.execute(stmt)
-                session.commit()
+                result = await session.execute(stmt)
+                await session.commit()
                 cancelled_count = result.rowcount
                 self.logger.log_database_operation("UPDATE", "Tasks", "SUCCESS", operation="cancel_pending", cancelled_count=cancelled_count, **context)
                 return cancelled_count
@@ -928,25 +1084,36 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, context="cancel_pending_tasks_for_job", job_id=job_id, **context)
             raise
             
-    def get_scan_template_by_id(self, template_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[ScanTemplate]:
+    async def get_scan_template_by_id(self, template_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[ScanTemplate]:
+        """Get scan template by ID with caching."""
+        cache_key = f"scan_template:{template_id}"
+        return await self.config_cache.get_or_fetch(
+            cache_key,
+            lambda: self._fetch_scan_template_by_id(template_id, context),
+            is_classifier=False
+        )
+
+    async def _fetch_scan_template_by_id(self, template_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[ScanTemplate]:
+        """Internal method to fetch scan template from database."""
         context = context or {}
         self.logger.log_database_operation("SELECT", "ScanTemplates", "STARTED", template_id=template_id, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 stmt = select(ScanTemplate).where(ScanTemplate.template_id == template_id)
-                result = session.scalars(stmt).one_or_none()
+                result = await session.scalars(stmt)
+                result = result.one_or_none()
                 self.logger.log_database_operation("SELECT", "ScanTemplates", "SUCCESS", found=(result is not None), **context)
                 return result
         except Exception as e:
             self.error_handler.handle_error(e, context="get_scan_template_by_id", **context)
             raise
 
-    def transition_job_from_pausing_to_paused(self, job_id: int, context: Optional[Dict[str, Any]] = None) -> bool:
+    async def transition_job_from_pausing_to_paused(self, job_id: int, context: Optional[Dict[str, Any]] = None) -> bool:
         """Atomically transitions a job from PAUSING to PAUSED only if no tasks are assigned."""
         context = context or {}
         self.logger.log_database_operation("UPDATE", "Jobs", "STARTED", operation="atomic_pause_transition", job_id=job_id, **context)
         try:
-            with self.get_session() as session:
+            async with self.get_async_session() as session:
                 # Subquery to check for active tasks
                 active_task_subquery = select(Task.ID).where(Task.JobID == job_id, Task.Status == TaskStatus.ASSIGNED).limit(1).exists()
                 # Atomic update
@@ -955,8 +1122,8 @@ class DatabaseInterface:
                     Job.status == JobStatus.PAUSING,
                     ~active_task_subquery
                 ).values(status=JobStatus.PAUSED)
-                result = session.execute(stmt)
-                session.commit()
+                result = await session.execute(stmt)
+                await session.commit()
                 was_successful = result.rowcount > 0
                 self.logger.log_database_operation("UPDATE", "Jobs", "SUCCESS" if was_successful else "SKIPPED", operation="atomic_pause_transition", **context)
                 return was_successful

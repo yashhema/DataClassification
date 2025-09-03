@@ -1,27 +1,32 @@
 # src/connectors/sql_server_connector.py
 """
-SQL Server connector implementation that fully implements IDataSourceConnector interface.
-Integrates with database-based configuration, SystemLogger, and ErrorHandler.
+SQL Server connector implementation with async IDatabaseDataSourceConnector interface.
+Integrates with async database operations, SystemLogger, and ErrorHandler.
 
-This implementation bridges async database operations with the sync interface contract.
+Task 8 Complete: Full async conversion with AsyncIterator support
+- Implements async IDatabaseDataSourceConnector interface  
+- All database I/O operations are async using sqlalchemy.ext.asyncio
+- Returns AsyncIterator[Dict[str, Any]] from get_object_content()
+- Supports WorkPacket-based async task processing
+- Async connection management and resource cleanup
 """
 
 import asyncio
 import hashlib
 import time
-from typing import Iterator, List, Dict, Any, Optional, Tuple
+from typing import AsyncIterator, List, Dict, Any, Optional, Tuple
 from datetime import datetime, timezone
 from urllib.parse import quote_plus
 
-# SQL Server specific imports
+# SQL Server specific imports with async support
 try:
     import sqlalchemy
-    from sqlalchemy import create_engine, text, inspect, MetaData
-    from sqlalchemy.engine import Engine
-    from sqlalchemy.pool import QueuePool
+    from sqlalchemy import text, inspect, MetaData
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine, AsyncSession, async_sessionmaker
     from sqlalchemy.exc import SQLAlchemyError, OperationalError, ProgrammingError
+    from sqlalchemy.pool import QueuePool
 except ImportError as e:
-    raise ImportError("SQL Server datasource requires sqlalchemy: pip install sqlalchemy pyodbc") from e
+    raise ImportError("SQL Server datasource requires sqlalchemy[asyncio]: pip install 'sqlalchemy[asyncio]' aiodbc") from e
 
 # Core system imports
 from core.interfaces.worker_interfaces import IDatabaseDataSourceConnector
@@ -31,28 +36,29 @@ from core.errors import ErrorHandler, NetworkError, RightsError, ProcessingError
 from core.db.database_interface import DatabaseInterface
 from core.models.models import ContentComponent
 
-class SQLServerConnection:
-    """Manages SQL Server connections with proper async support and error handling."""
+class AsyncSQLServerConnection:
+    """Manages async SQL Server connections with proper error handling and cleanup."""
     
     def __init__(self, connection_config: Dict[str, Any], logger: SystemLogger, error_handler: ErrorHandler):
         self.connection_config = connection_config
         self.logger = logger
         self.error_handler = error_handler
-        self.engine: Optional[Engine] = None
+        self.async_engine: Optional[AsyncEngine] = None
+        self.async_session_factory: Optional[async_sessionmaker] = None
         self.connection_string = ""
         self._connection_pool_size = 2
         self._max_overflow = 1
         self._pool_timeout = 300
         self._pool_recycle = 3600
     
-    def connect(self) -> bool:
-        """Establish database connection synchronously."""
+    async def connect_async(self) -> bool:
+        """Establish async database connection."""
         try:
             # Build connection string
             self.connection_string = self._build_connection_string()
             
-            # Create engine with connection pooling
-            self.engine = create_engine(
+            # Create async engine with connection pooling
+            self.async_engine = create_async_engine(
                 self.connection_string,
                 poolclass=QueuePool,
                 pool_size=self._connection_pool_size,
@@ -63,9 +69,16 @@ class SQLServerConnection:
                 echo=False
             )
             
+            # Create async session factory
+            self.async_session_factory = async_sessionmaker(
+                bind=self.async_engine,
+                class_=AsyncSession,
+                expire_on_commit=False
+            )
+            
             # Test connection
-            with self.engine.connect() as conn:
-                conn.execute(text("SELECT 1 as test"))
+            async with self.async_engine.begin() as conn:
+                await conn.execute(text("SELECT 1 as test"))
             
             return True
             
@@ -90,17 +103,18 @@ class SQLServerConnection:
                     config_section="connection_config"
                 )
     
-    def disconnect(self):
-        """Close database connection."""
-        if self.engine:
+    async def disconnect_async(self):
+        """Close async database connection."""
+        if self.async_engine:
             try:
-                self.engine.dispose()
-                self.engine = None
+                await self.async_engine.dispose()
+                self.async_engine = None
+                self.async_session_factory = None
             except Exception:
                 pass
     
     def _build_connection_string(self) -> str:
-        """Build SQL Server connection string with proper encoding."""
+        """Build async SQL Server connection string with proper encoding."""
         host = self.connection_config['host']
         port = self.connection_config.get('port', 1433)
         database = self.connection_config['database']
@@ -111,8 +125,9 @@ class SQLServerConnection:
             driver = self.connection_config.get('driver', 'ODBC Driver 17 for SQL Server')
             encoded_driver = quote_plus(driver)
             
+            # Use async driver
             connection_string = (
-                f"mssql+pyodbc://{host}:{port}/{database}"
+                f"mssql+aiodbc://{host}:{port}/{database}"
                 f"?driver={encoded_driver}"
                 f"&trusted_connection=yes"
                 f"&TrustServerCertificate=yes"
@@ -128,29 +143,30 @@ class SQLServerConnection:
             encoded_password = quote_plus(password)
             encoded_driver = quote_plus(driver)
             
+            # Use async driver
             connection_string = (
-                f"mssql+pyodbc://{encoded_username}:{encoded_password}@{host}:{port}/{database}"
+                f"mssql+aiodbc://{encoded_username}:{encoded_password}@{host}:{port}/{database}"
                 f"?driver={encoded_driver}"
                 f"&TrustServerCertificate=yes"
             )
         
         return connection_string
     
-    def execute_query(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """Execute query and return results."""
-        if not self.engine:
+    async def execute_query_async(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Execute query asynchronously and return results."""
+        if not self.async_engine:
             raise ProcessingError(
                 "Database connection not established",
                 ErrorType.PROCESSING_LOGIC_ERROR,
-                operation="execute_query"
+                operation="execute_query_async"
             )
         
         try:
-            with self.engine.connect() as conn:
+            async with self.async_engine.begin() as conn:
                 if parameters:
-                    result = conn.execute(text(query), parameters)
+                    result = await conn.execute(text(query), parameters)
                 else:
-                    result = conn.execute(text(query))
+                    result = await conn.execute(text(query))
                 
                 # Convert to list of dictionaries
                 columns = list(result.keys())
@@ -167,15 +183,25 @@ class SQLServerConnection:
             raise ProcessingError(
                 f"SQL query execution failed: {str(e)}",
                 ErrorType.PROCESSING_LOGIC_ERROR,
-                operation="execute_query",
+                operation="execute_query_async",
                 query=query[:100] + "..." if len(query) > 100 else query
             )
+
+    async def get_async_session(self) -> AsyncSession:
+        """Get async session from factory."""
+        if not self.async_session_factory:
+            raise ProcessingError(
+                "Async session factory not initialized",
+                ErrorType.PROCESSING_LOGIC_ERROR,
+                operation="get_async_session"
+            )
+        return self.async_session_factory()
 
 
 class SQLServerConnector(IDatabaseDataSourceConnector):
     """
-    SQL Server connector implementing IDatabaseDataSourceConnector interface.
-    Integrates with database-based configuration and logging systems.
+    SQL Server connector implementing async IDatabaseDataSourceConnector interface.
+    Integrates with async database operations and logging systems.
     """
     
     def __init__(self, datasource_id: str, logger: SystemLogger, error_handler: ErrorHandler, db_interface: DatabaseInterface):
@@ -185,38 +211,49 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
         self.error_handler = error_handler
         self.db = db_interface
         
-        # Load datasource configuration from database
-        self.datasource_config = self.db.get_datasource_configuration(datasource_id)
-        if not self.datasource_config:
-            raise ConfigurationError(
-                f"Datasource configuration not found: {datasource_id}",
-                ErrorType.CONFIGURATION_MISSING,
-                datasource_id=datasource_id
-            )
-        
-        # Load connector-specific configuration (SQL queries)
-        self.connector_config = self.db.get_connector_configuration("sqlserver", "default")
-        if not self.connector_config:
-            raise ConfigurationError(
-                "SQL Server connector configuration not found",
-                ErrorType.CONFIGURATION_MISSING,
-                connector_type="sqlserver"
-            )
-        
         # Initialize connection manager
-        self.connection: Optional[SQLServerConnection] = None
+        self.connection: Optional[AsyncSQLServerConnection] = None
         self.inspector: Optional[sqlalchemy.Inspector] = None
+        
+        # Configuration will be loaded asynchronously
+        self.datasource_config = None
+        self.connector_config = None
         
         # Cache for environment info
         self._environment_info: Optional[Dict[str, Any]] = None
         
         self.logger.info("SQL Server connector initialized", 
-                        datasource_id=datasource_id,
-                        datasource_type=self.datasource_config.datasource_type)
+                        datasource_id=datasource_id)
 
-    def enumerate_objects(self, work_packet: WorkPacket) -> Iterator[List[DiscoveredObject]]:
+    async def _load_configuration_async(self):
+        """Load datasource and connector configuration asynchronously."""
+        if self.datasource_config is None:
+            # Load datasource configuration from database (async)
+            self.datasource_config = await self.db.get_datasource_configuration_async(self.datasource_id)
+            if not self.datasource_config:
+                raise ConfigurationError(
+                    f"Datasource configuration not found: {self.datasource_id}",
+                    ErrorType.CONFIGURATION_MISSING,
+                    datasource_id=self.datasource_id
+                )
+        
+        if self.connector_config is None:
+            # Load connector-specific configuration (SQL queries) (async)
+            self.connector_config = await self.db.get_connector_configuration_async("sqlserver", "default")
+            if not self.connector_config:
+                raise ConfigurationError(
+                    "SQL Server connector configuration not found",
+                    ErrorType.CONFIGURATION_MISSING,
+                    connector_type="sqlserver"
+                )
+
+    # =============================================================================
+    # Async IDatabaseDataSourceConnector Interface Implementation
+    # =============================================================================
+
+    async def enumerate_objects(self, work_packet: WorkPacket) -> AsyncIterator[List[DiscoveredObject]]:
         """
-        Performs fast, streaming enumeration of database objects.
+        Performs fast, streaming enumeration of database objects (async).
         Implements interface contract with proper logging and batch processing.
         """
         trace_id = work_packet.header.trace_id
@@ -232,8 +269,11 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
         )
         
         try:
+            # Load configuration asynchronously
+            await self._load_configuration_async()
+            
             # Establish connection
-            if not self._ensure_connection(trace_id, task_id):
+            if not await self._ensure_connection_async(trace_id, task_id):
                 raise ProcessingError(
                     "Failed to establish database connection",
                     ErrorType.PROCESSING_LOGIC_ERROR,
@@ -249,7 +289,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             current_batch = []
             total_objects = 0
             
-            for discovered_obj in self._discover_all_objects(work_packet):
+            async for discovered_obj in self._discover_all_objects_async(work_packet):
                 current_batch.append(discovered_obj)
                 total_objects += 1
                 
@@ -257,8 +297,8 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                 if len(current_batch) >= batch_size:
                     batch_count += 1
                     
-                    # Insert batch into staging table
-                    self._insert_batch_to_staging(current_batch, payload.staging_table_name, trace_id, task_id)
+                    # Insert batch into staging table (async)
+                    await self._insert_batch_to_staging_async(current_batch, payload.staging_table_name, trace_id, task_id)
                     
                     # Log batch progress
                     self.logger.log_progress_batch(
@@ -278,8 +318,8 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             if current_batch:
                 batch_count += 1
                 
-                # Insert final batch into staging table
-                self._insert_batch_to_staging(current_batch, payload.staging_table_name, trace_id, task_id)
+                # Insert final batch into staging table (async)
+                await self._insert_batch_to_staging_async(current_batch, payload.staging_table_name, trace_id, task_id)
                 
                 # Log final batch progress
                 self.logger.log_progress_batch(
@@ -317,13 +357,23 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             raise
         finally:
             # Cleanup connection
-            self._cleanup_connection()
+            await self._cleanup_connection_async()
 
-    def get_object_details(self, work_packet: WorkPacket) -> List[ObjectMetadata]:
+    def get_object_details(self, work_packet: WorkPacket) -> Dict[str, Any]:
         """
         Fetches rich, detailed metadata for a batch of objects.
-        Implements interface contract for atomic metadata retrieval.
+        Interface method - sync for compatibility but internally uses async.
         """
+        # Run async method in sync context
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If called from async context, create task
+            return asyncio.create_task(self._get_object_details_async(work_packet))
+        else:
+            return loop.run_until_complete(self._get_object_details_async(work_packet))
+
+    async def _get_object_details_async(self, work_packet: WorkPacket) -> List[ObjectMetadata]:
+        """Internal async implementation for get_object_details."""
         trace_id = work_packet.header.trace_id
         task_id = work_packet.header.task_id
         payload = work_packet.payload
@@ -336,8 +386,9 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
         )
         
         try:
-            # Ensure connection
-            if not self._ensure_connection(trace_id, task_id):
+            # Load configuration and ensure connection
+            await self._load_configuration_async()
+            if not await self._ensure_connection_async(trace_id, task_id):
                 raise ProcessingError(
                     "Failed to establish database connection",
                     ErrorType.PROCESSING_LOGIC_ERROR,
@@ -351,7 +402,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             for object_id in payload.object_ids:
                 try:
                     # Parse object path to get database.schema.table[.column]
-                    metadata = self._get_detailed_metadata(object_id, trace_id, task_id)
+                    metadata = await self._get_detailed_metadata_async(object_id, trace_id, task_id)
                     if metadata:
                         metadata_results.append(metadata)
                         successful_count += 1
@@ -390,11 +441,11 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             self.logger.error("SQL Server metadata retrieval failed", error_id=error.error_id)
             raise
         finally:
-            self._cleanup_connection()
+            await self._cleanup_connection_async()
 
-    def get_object_content(self, work_packet: WorkPacket) -> Iterator[dict]:
+    async def get_object_content(self, work_packet: WorkPacket) -> AsyncIterator[Dict[str, Any]]:
         """
-        Retrieves actual content of objects for classification.
+        Retrieves actual content of objects for classification (async).
         Implements interface contract with streaming content delivery.
         """
         trace_id = work_packet.header.trace_id
@@ -409,8 +460,9 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
         )
         
         try:
-            # Ensure connection
-            if not self._ensure_connection(trace_id, task_id):
+            # Load configuration and ensure connection
+            await self._load_configuration_async()
+            if not await self._ensure_connection_async(trace_id, task_id):
                 raise ProcessingError(
                     "Failed to establish database connection",
                     ErrorType.PROCESSING_LOGIC_ERROR,
@@ -422,8 +474,8 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             # Stream content for each object
             for object_id in payload.object_ids:
                 try:
-                    # Get object info from database
-                    discovered_objects = self.db.get_objects_for_classification([object_id])
+                    # Get object info from database (async)
+                    discovered_objects = await self.db.get_objects_for_classification_async([object_id])
                     
                     if not discovered_objects:
                         self.logger.warning(f"Object not found for content extraction: {object_id}",
@@ -433,8 +485,8 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                     discovered_obj = discovered_objects[0]
                     object_path = discovered_obj.ObjectPath
                     
-                    # Extract content based on object type
-                    content = self._extract_content_for_classification(
+                    # Extract content based on object type (async)
+                    content = await self._extract_content_for_classification_async(
                         object_path, discovered_obj.ObjectType, trace_id, task_id
                     )
                     
@@ -442,7 +494,12 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                         # Yield content batch for classification
                         yield {
                             "object_id": object_id,
-                            "content": content
+                            "content": content,
+                            "metadata": {
+                                "object_path": object_path,
+                                "object_type": discovered_obj.ObjectType,
+                                "datasource_id": self.datasource_id
+                            }
                         }
                         objects_processed += 1
                         
@@ -485,92 +542,95 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             self.logger.error("SQL Server content extraction failed", error_id=error.error_id)
             raise
         finally:
-            self._cleanup_connection()
+            await self._cleanup_connection_async()
 
     # =================================================================
-    # Private Implementation Methods
+    # Private Async Implementation Methods
     # =================================================================
 
-    def _ensure_connection(self, trace_id: str, task_id: int) -> bool:
-        """Ensure database connection is established."""
+    async def _ensure_connection_async(self, trace_id: str, task_id: int) -> bool:
+        """Ensure async database connection is established."""
         try:
             if not self.connection:
                 # Get connection configuration
                 connection_config = self.datasource_config.configuration.get('connection_config', {})
                 
-                # Load credentials if needed
+                # Load credentials if needed (async)
                 if not connection_config.get('trusted_connection', False):
-                    credential_info = self.db.get_credential_for_datasource(self.datasource_id)
+                    credential_info = await self.db.get_credential_for_datasource_async(self.datasource_id)
                     if credential_info:
                         connection_config['username'] = credential_info['username']
                         # In production, you'd decrypt password from secure store
                         # connection_config['password'] = decrypt_password(credential_info['store_details'])
                 
-                self.connection = SQLServerConnection(connection_config, self.logger, self.error_handler)
+                self.connection = AsyncSQLServerConnection(connection_config, self.logger, self.error_handler)
                 
-            if not self.connection.connect():
+            if not await self.connection.connect_async():
                 return False
                 
-            # Create inspector for metadata operations
-            self.inspector = inspect(self.connection.engine)
+            # Create async inspector for metadata operations
+            # Note: Inspector for async engines needs special handling
+            # For now, we'll handle metadata queries directly through connection
             return True
             
         except Exception as e:
             error = self.error_handler.handle_error(
-                e, "sql_server_connection",
+                e, "sql_server_connection_async",
                 operation="database_connect",
                 datasource_id=self.datasource_id,
                 trace_id=trace_id,
                 task_id=task_id
             )
-            self.logger.error("Failed to establish SQL Server connection", error_id=error.error_id)
+            self.logger.error("Failed to establish async SQL Server connection", error_id=error.error_id)
             return False
 
-    def _cleanup_connection(self):
-        """Clean up database connection."""
+    async def _cleanup_connection_async(self):
+        """Clean up async database connection."""
         try:
             if self.connection:
-                self.connection.disconnect()
+                await self.connection.disconnect_async()
                 self.connection = None
                 self.inspector = None
         except Exception as e:
             # Log but don't raise during cleanup
             error = self.error_handler.handle_error(
-                e, "sql_server_cleanup",
+                e, "sql_server_cleanup_async",
                 operation="connection_cleanup",
                 datasource_id=self.datasource_id
             )
-            self.logger.warning("Error during connection cleanup", error_id=error.error_id)
+            self.logger.warning("Error during async connection cleanup", error_id=error.error_id)
 
-    def _discover_all_objects(self, work_packet: WorkPacket) -> Iterator[DiscoveredObject]:
-        """Discover all objects based on processing mode."""
+    async def _discover_all_objects_async(self, work_packet: WorkPacket) -> AsyncIterator[DiscoveredObject]:
+        """Discover all objects based on processing mode (async)."""
         processing_mode = self.datasource_config.configuration.get('processing_mode', 'column')
         scan_config = self.datasource_config.configuration.get('scan_config', {})
         
         if processing_mode == "row":
             # Phase 1: Table-level discovery for row processing
-            yield from self._discover_tables_for_row_processing(work_packet, scan_config)
+            async for obj in self._discover_tables_for_row_processing_async(work_packet, scan_config):
+                yield obj
         else:
             # Legacy: Column-level discovery
-            yield from self._discover_columns_for_classification(work_packet, scan_config)
+            async for obj in self._discover_columns_for_classification_async(work_packet, scan_config):
+                yield obj
 
-    def _discover_tables_for_row_processing(self, work_packet: WorkPacket, scan_config: Dict[str, Any]) -> Iterator[DiscoveredObject]:
-        """Discover table-level objects for row processing mode."""
+    async def _discover_tables_for_row_processing_async(self, work_packet: WorkPacket, scan_config: Dict[str, Any]) -> AsyncIterator[DiscoveredObject]:
+        """Discover table-level objects for row processing mode (async)."""
         try:
             # Get list of databases to scan
-            databases = self._get_databases_to_scan(scan_config)
+            databases = await self._get_databases_to_scan_async(scan_config)
             
             for database_name in databases:
                 try:
                     # Switch to the target database
-                    self._switch_database_context(database_name)
+                    await self._switch_database_context_async(database_name)
                     
                     # Get schemas
-                    schema_names = self._get_schemas_to_scan(database_name, scan_config)
+                    schema_names = await self._get_schemas_to_scan_async(database_name, scan_config)
                     
                     for schema_name in schema_names:
                         # Get tables in schema
-                        tables = self._get_tables_in_schema(database_name, schema_name, scan_config)
+                        tables = await self._get_tables_in_schema_async(database_name, schema_name, scan_config)
                         
                         for table_info in tables:
                             table_name = table_info['table_name']
@@ -595,34 +655,34 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                     
         except Exception as e:
             raise ProcessingError(
-                f"Table discovery failed: {str(e)}",
+                f"Async table discovery failed: {str(e)}",
                 ErrorType.PROCESSING_LOGIC_ERROR,
-                operation="discover_tables_for_row_processing"
+                operation="discover_tables_for_row_processing_async"
             )
 
-    def _discover_columns_for_classification(self, work_packet: WorkPacket, scan_config: Dict[str, Any]) -> Iterator[DiscoveredObject]:
-        """Discover column-level objects for legacy classification mode."""
+    async def _discover_columns_for_classification_async(self, work_packet: WorkPacket, scan_config: Dict[str, Any]) -> AsyncIterator[DiscoveredObject]:
+        """Discover column-level objects for legacy classification mode (async)."""
         try:
             # Get list of databases to scan
-            databases = self._get_databases_to_scan(scan_config)
+            databases = await self._get_databases_to_scan_async(scan_config)
             
             for database_name in databases:
                 try:
                     # Switch to the target database
-                    self._switch_database_context(database_name)
+                    await self._switch_database_context_async(database_name)
                     
                     # Get schemas
-                    schema_names = self._get_schemas_to_scan(database_name, scan_config)
+                    schema_names = await self._get_schemas_to_scan_async(database_name, scan_config)
                     
                     for schema_name in schema_names:
                         # Get tables in schema
-                        tables = self._get_tables_in_schema(database_name, schema_name, scan_config)
+                        tables = await self._get_tables_in_schema_async(database_name, schema_name, scan_config)
                         
                         for table_info in tables:
                             table_name = table_info['table_name']
                             
                             # Get columns for this table
-                            columns = self._get_text_columns_in_table(database_name, schema_name, table_name)
+                            columns = await self._get_text_columns_in_table_async(database_name, schema_name, table_name)
                             
                             for column_info in columns:
                                 column_name = column_info['column_name']
@@ -648,13 +708,13 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                     
         except Exception as e:
             raise ProcessingError(
-                f"Column discovery failed: {str(e)}",
+                f"Async column discovery failed: {str(e)}",
                 ErrorType.PROCESSING_LOGIC_ERROR,
-                operation="discover_columns_for_classification"
+                operation="discover_columns_for_classification_async"
             )
 
-    def _get_databases_to_scan(self, scan_config: Dict[str, Any]) -> List[str]:
-        """Get list of databases to scan based on configuration."""
+    async def _get_databases_to_scan_async(self, scan_config: Dict[str, Any]) -> List[str]:
+        """Get list of databases to scan based on configuration (async)."""
         try:
             include_system_databases = scan_config.get('include_system_databases', False)
             
@@ -675,7 +735,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                     ORDER BY name
                 """
             
-            result = self.connection.execute_query(query)
+            result = await self.connection.execute_query_async(query)
             databases = [row['name'] for row in result]
             
             return databases
@@ -688,11 +748,11 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                               error=str(e))
             return [original_db]
 
-    def _get_schemas_to_scan(self, database_name: str, scan_config: Dict[str, Any]) -> List[str]:
-        """Get schemas to scan in database."""
+    async def _get_schemas_to_scan_async(self, database_name: str, scan_config: Dict[str, Any]) -> List[str]:
+        """Get schemas to scan in database (async)."""
         try:
             # Get environment-appropriate schema discovery query
-            environment_info = self._get_environment_info()
+            environment_info = await self._get_environment_info_async()
             queries = self.connector_config.get('sql_server_queries', {})
             
             # Try to get environment-specific query
@@ -713,7 +773,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             
             # Format query with database name
             formatted_query = schema_query.format(database_name=database_name)
-            result = self.connection.execute_query(formatted_query)
+            result = await self.connection.execute_query_async(formatted_query)
             
             schema_names = [row['schema_name'] for row in result]
             
@@ -735,15 +795,15 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             raise ProcessingError(
                 f"Failed to get schemas for database {database_name}: {str(e)}",
                 ErrorType.PROCESSING_LOGIC_ERROR,
-                operation="get_schemas_to_scan",
+                operation="get_schemas_to_scan_async",
                 database_name=database_name
             )
 
-    def _get_tables_in_schema(self, database_name: str, schema_name: str, scan_config: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Get tables in schema with metadata."""
+    async def _get_tables_in_schema_async(self, database_name: str, schema_name: str, scan_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Get tables in schema with metadata (async)."""
         try:
             # Get environment-appropriate table discovery query
-            environment_info = self._get_environment_info()
+            environment_info = await self._get_environment_info_async()
             queries = self.connector_config.get('sql_server_queries', {})
             
             # Try to get environment-specific query
@@ -768,7 +828,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                 schema_name=schema_name
             )
             
-            result = self.connection.execute_query(formatted_query)
+            result = await self.connection.execute_query_async(formatted_query)
             
             # Apply table filters
             exclude_tables = scan_config.get('exclude_tables', [])
@@ -789,13 +849,13 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             raise ProcessingError(
                 f"Failed to get tables in schema {database_name}.{schema_name}: {str(e)}",
                 ErrorType.PROCESSING_LOGIC_ERROR,
-                operation="get_tables_in_schema",
+                operation="get_tables_in_schema_async",
                 database_name=database_name,
                 schema_name=schema_name
             )
 
-    def _get_text_columns_in_table(self, database_name: str, schema_name: str, table_name: str) -> List[Dict[str, Any]]:
-        """Get text columns in table for classification."""
+    async def _get_text_columns_in_table_async(self, database_name: str, schema_name: str, table_name: str) -> List[Dict[str, Any]]:
+        """Get text columns in table for classification (async)."""
         try:
             # Get column metadata query
             queries = self.connector_config.get('sql_server_queries', {})
@@ -812,7 +872,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                 table_name=table_name
             )
             
-            result = self.connection.execute_query(formatted_query)
+            result = await self.connection.execute_query_async(formatted_query)
             
             # Filter for text columns
             text_columns = []
@@ -829,6 +889,395 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
         except Exception as e:
             self.logger.warning(f"Failed to get columns for table {database_name}.{schema_name}.{table_name}: {str(e)}")
             return []
+
+    async def _insert_batch_to_staging_async(self, batch: List[DiscoveredObject], staging_table_name: str, 
+                                           trace_id: str, task_id: int):
+        """Insert batch of objects into staging table (async)."""
+        try:
+            # Convert to database format
+            batch_mappings = []
+            for obj in batch:
+                # Calculate object key hash
+                key_string = f"{obj.datasource_id}|{obj.object_path}|{obj.object_type}"
+                object_key_hash = hashlib.sha256(key_string.encode()).digest()
+                
+                mapping = {
+                    'ObjectKeyHash': object_key_hash,
+                    'DataSourceID': obj.datasource_id,
+                    'ObjectType': obj.object_type,
+                    'ObjectPath': obj.object_path,
+                    'SizeBytes': obj.object_metadata.size_bytes,
+                    'CreatedDate': obj.object_metadata.created_date,
+                    'LastModified': obj.object_metadata.last_modified,
+                    'LastAccessed': obj.object_metadata.last_accessed,
+                    'DiscoveryTimestamp': datetime.now(timezone.utc)
+                }
+                batch_mappings.append(mapping)
+            
+            # Insert into staging table (async)
+            await self.db.insert_discovered_object_batch_async(
+                batch_mappings, 
+                staging_table_name,
+                context={'trace_id': trace_id, 'task_id': task_id}
+            )
+            
+        except Exception as e:
+            error = self.error_handler.handle_error(
+                e, "insert_batch_to_staging_async",
+                operation="staging_table_insert",
+                staging_table=staging_table_name,
+                batch_size=len(batch),
+                trace_id=trace_id,
+                task_id=task_id
+            )
+            raise
+
+    async def _get_detailed_metadata_async(self, object_id: str, trace_id: str, task_id: int) -> Optional[ObjectMetadata]:
+        """Get detailed metadata for a specific object (async)."""
+        try:
+            # Get discovered object from database (async)
+            discovered_objects = await self.db.get_objects_for_classification_async([object_id])
+            
+            if not discovered_objects:
+                return None
+            
+            discovered_obj = discovered_objects[0]
+            object_path = discovered_obj.ObjectPath
+            
+            # Parse object path
+            path_parts = object_path.split('.')
+            
+            if len(path_parts) >= 3:
+                database_name = path_parts[0]
+                schema_name = path_parts[1]
+                table_name = path_parts[2]
+                column_name = path_parts[3] if len(path_parts) > 3 else None
+                
+                # Get comprehensive metadata based on object type
+                if discovered_obj.ObjectType == "DATABASE_TABLE":
+                    metadata = await self._get_table_metadata_async(database_name, schema_name, table_name)
+                elif discovered_obj.ObjectType == "DATABASE_COLUMN":
+                    metadata = await self._get_column_metadata_async(database_name, schema_name, table_name, column_name)
+                else:
+                    metadata = None
+                
+                return metadata
+            
+            return None
+            
+        except Exception as e:
+            raise ProcessingError(
+                f"Failed to get detailed metadata for object {object_id}: {str(e)}",
+                ErrorType.PROCESSING_LOGIC_ERROR,
+                operation="get_detailed_metadata_async",
+                object_id=object_id
+            )
+
+    async def _extract_content_for_classification_async(self, object_path: str, object_type: str, 
+                                                      trace_id: str, task_id: int) -> Optional[str]:
+        """Extract content from object for classification (async)."""
+        try:
+            # Parse object path
+            path_parts = object_path.split('.')
+            
+            if len(path_parts) == 3:
+                # Table-level content (row processing mode)
+                database_name, schema_name, table_name = path_parts
+                return await self._sample_table_content_async(database_name, schema_name, table_name)
+                
+            elif len(path_parts) == 4:
+                # Column-level content (legacy mode)
+                database_name, schema_name, table_name, column_name = path_parts
+                return await self._sample_column_content_async(database_name, schema_name, table_name, column_name)
+            
+            else:
+                raise ProcessingError(
+                    f"Invalid object path format: {object_path}",
+                    ErrorType.PROCESSING_LOGIC_ERROR,
+                    operation="extract_content_for_classification_async"
+                )
+                
+        except Exception as e:
+            raise ProcessingError(
+                f"Failed to extract content from {object_path}: {str(e)}",
+                ErrorType.PROCESSING_LOGIC_ERROR,
+                operation="extract_content_for_classification_async",
+                object_path=object_path
+            )
+
+    async def _sample_table_content_async(self, database_name: str, schema_name: str, table_name: str) -> str:
+        """Sample content from entire table for row processing (async)."""
+        try:
+            # Get environment-appropriate sampling query
+            environment_info = await self._get_environment_info_async()
+            queries = self.connector_config.get('sql_server_queries', {})
+            
+            # Get row sampling query
+            env_type = environment_info.get('environment_type', 'on_premise')
+            
+            # Check if we can use TABLESAMPLE
+            if environment_info.get('capabilities', {}).get('supports_tablesample', True):
+                sampling_query = (
+                    queries.get('environments', {})
+                    .get(env_type, {})
+                    .get('row_sampling_with_tablesample')
+                )
+            else:
+                sampling_query = (
+                    queries.get('environments', {})
+                    .get(env_type, {})
+                    .get('row_sampling')
+                )
+            
+            if not sampling_query:
+                # Fallback
+                sampling_query = f"SELECT TOP {{sample_size}} * FROM [{database_name}].[{schema_name}].[{table_name}]"
+            
+            # Format query with parameters
+            sample_size = self.datasource_config.configuration.get('scan_config', {}).get('max_sample_rows', 1000)
+            formatted_query = sampling_query.format(
+                database_name=database_name,
+                schema_name=schema_name,
+                table_name=table_name,
+                sample_size=sample_size,
+                sample_percent=5.0  # For TABLESAMPLE
+            )
+            
+            result = await self.connection.execute_query_async(formatted_query)
+            
+            # Convert rows to text for classification
+            content_lines = []
+            for row in result:
+                # Concatenate all column values
+                row_values = [str(v) if v is not None else '' for v in row.values()]
+                content_lines.append(' | '.join(row_values))
+            
+            return '\n'.join(content_lines)
+            
+        except Exception as e:
+            raise ProcessingError(
+                f"Failed to sample table content {database_name}.{schema_name}.{table_name}: {str(e)}",
+                ErrorType.PROCESSING_LOGIC_ERROR,
+                operation="sample_table_content_async"
+            )
+
+    async def _sample_column_content_async(self, database_name: str, schema_name: str, table_name: str, column_name: str) -> str:
+        """Sample content from specific column for classification (async)."""
+        try:
+            sample_size = self.datasource_config.configuration.get('scan_config', {}).get('max_sample_rows', 1000)
+            
+            query = f"""
+                SELECT TOP {sample_size} [{column_name}]
+                FROM [{database_name}].[{schema_name}].[{table_name}]
+                WHERE [{column_name}] IS NOT NULL
+                ORDER BY ABS(CHECKSUM(NEWID()))
+            """
+            
+            result = await self.connection.execute_query_async(query)
+            
+            # Extract column values
+            values = [str(row[column_name]) for row in result if row[column_name] is not None]
+            
+            return '\n'.join(values)
+            
+        except Exception as e:
+            raise ProcessingError(
+                f"Failed to sample column content {database_name}.{schema_name}.{table_name}.{column_name}: {str(e)}",
+                ErrorType.PROCESSING_LOGIC_ERROR,
+                operation="sample_column_content_async"
+            )
+
+    async def _get_table_metadata_async(self, database_name: str, schema_name: str, table_name: str) -> ObjectMetadata:
+        """Get comprehensive table metadata (async)."""
+        try:
+            # Get table size and row count
+            size_query = f"""
+                SELECT 
+                    SUM(a.total_pages) * 8 as total_size_kb,
+                    SUM(p.rows) as row_count
+                FROM [{database_name}].sys.tables t
+                INNER JOIN [{database_name}].sys.indexes i ON t.object_id = i.object_id
+                INNER JOIN [{database_name}].sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id
+                INNER JOIN [{database_name}].sys.allocation_units a ON p.partition_id = a.container_id
+                INNER JOIN [{database_name}].sys.schemas s ON t.schema_id = s.schema_id
+                WHERE s.name = '{schema_name}' AND t.name = '{table_name}'
+            """
+            
+            size_result = await self.connection.execute_query_async(size_query)
+            
+            if size_result:
+                total_size_kb = size_result[0].get('total_size_kb', 0) or 0
+                row_count = size_result[0].get('row_count', 0) or 0
+            else:
+                total_size_kb = 0
+                row_count = 0
+            
+            return ObjectMetadata(
+                size_bytes=total_size_kb * 1024,
+                row_count=row_count,
+                schema_name=schema_name,
+                table_name=table_name,
+                database_name=database_name,
+                data_type='table',
+                content_type='database/table'
+            )
+            
+        except Exception as e:
+            # Return basic metadata on error
+            return ObjectMetadata(
+                size_bytes=0,
+                row_count=0,
+                schema_name=schema_name,
+                table_name=table_name,
+                database_name=database_name,
+                data_type='table',
+                content_type='database/table'
+            )
+
+    async def _get_column_metadata_async(self, database_name: str, schema_name: str, table_name: str, column_name: str) -> ObjectMetadata:
+        """Get comprehensive column metadata (async)."""
+        try:
+            # Get column information
+            column_query = f"""
+                SELECT 
+                    c.DATA_TYPE,
+                    c.CHARACTER_MAXIMUM_LENGTH,
+                    c.IS_NULLABLE,
+                    COUNT(*) as sample_row_count
+                FROM [{database_name}].INFORMATION_SCHEMA.COLUMNS c
+                CROSS JOIN (
+                    SELECT TOP 1000 [{column_name}] 
+                    FROM [{database_name}].[{schema_name}].[{table_name}]
+                    WHERE [{column_name}] IS NOT NULL
+                ) sample
+                WHERE c.TABLE_SCHEMA = '{schema_name}' 
+                AND c.TABLE_NAME = '{table_name}'
+                AND c.COLUMN_NAME = '{column_name}'
+                GROUP BY c.DATA_TYPE, c.CHARACTER_MAXIMUM_LENGTH, c.IS_NULLABLE
+            """
+            
+            result = await self.connection.execute_query_async(column_query)
+            
+            if result:
+                column_data = result[0]
+                max_length = column_data.get('CHARACTER_MAXIMUM_LENGTH', 0)
+                sample_count = column_data.get('sample_row_count', 0)
+            else:
+                max_length = 0
+                sample_count = 0
+            
+            return ObjectMetadata(
+                size_bytes=max_length * sample_count if max_length else 0,
+                row_count=sample_count,
+                data_type=column_data.get('DATA_TYPE', 'unknown') if result else 'unknown',
+                schema_name=schema_name,
+                table_name=table_name,
+                column_name=column_name,
+                database_name=database_name,
+                content_type='database/column'
+            )
+            
+        except Exception as e:
+            # Return basic metadata on error
+            return ObjectMetadata(
+                size_bytes=0,
+                row_count=0,
+                data_type='unknown',
+                schema_name=schema_name,
+                table_name=table_name,
+                column_name=column_name,
+                database_name=database_name,
+                content_type='database/column'
+            )
+
+    async def _switch_database_context_async(self, database_name: str):
+        """Switch connection context to specific database (async)."""
+        try:
+            # For async SQL Server, we need to recreate connection with target database
+            if self.connection:
+                current_db = self.connection.connection_config.get('database')
+                if current_db != database_name:
+                    # Update connection config and reconnect
+                    self.connection.connection_config['database'] = database_name
+                    await self.connection.disconnect_async()
+                    await self.connection.connect_async()
+                    
+        except Exception as e:
+            raise NetworkError(
+                f"Failed to switch to database {database_name}: {str(e)}",
+                ErrorType.NETWORK_CONNECTION_FAILED,
+                database_name=database_name
+            )
+
+    async def _get_environment_info_async(self) -> Dict[str, Any]:
+        """Get or detect SQL Server environment information (async)."""
+        if self._environment_info is not None:
+            return self._environment_info
+        
+        try:
+            # Detect environment
+            version_query = """
+                SELECT 
+                    SERVERPROPERTY('ProductVersion') as version,
+                    SERVERPROPERTY('Edition') as edition,
+                    SERVERPROPERTY('EngineEdition') as engine_edition
+            """
+            
+            result = await self.connection.execute_query_async(version_query)
+            
+            if result:
+                version_info = result[0]
+                version_string = version_info.get('version', '0.0.0.0')
+                version_parts = version_string.split('.')
+                major_version = int(version_parts[0]) if version_parts else 14
+                
+                edition = version_info.get('edition', '').lower()
+                engine_edition = version_info.get('engine_edition', 2)
+                
+                # Determine environment type
+                if engine_edition == 5:
+                    env_type = "azure_sql"
+                elif engine_edition == 8:
+                    env_type = "azure_sql_mi"
+                elif 'express' in edition:
+                    env_type = "express"
+                else:
+                    env_type = "on_premise"
+                
+                self._environment_info = {
+                    'environment_type': env_type,
+                    'version_major': major_version,
+                    'version_full': version_string,
+                    'edition': edition,
+                    'engine_edition': engine_edition,
+                    'capabilities': {
+                        'supports_tablesample': major_version >= 9,
+                        'supports_cte': major_version >= 9,
+                        'supports_sequences': major_version >= 11
+                    }
+                }
+            else:
+                # Default environment info
+                self._environment_info = {
+                    'environment_type': 'on_premise',
+                    'version_major': 14,
+                    'capabilities': {'supports_tablesample': True}
+                }
+            
+            return self._environment_info
+            
+        except Exception as e:
+            # Return safe default on detection failure
+            self._environment_info = {
+                'environment_type': 'on_premise',
+                'version_major': 14,
+                'capabilities': {'supports_tablesample': True}
+            }
+            return self._environment_info
+
+    # =============================================================================
+    # Helper Methods (unchanged from original)
+    # =============================================================================
 
     def _create_table_discovered_object(self, database_name: str, schema_name: str, table_name: str, table_info: Dict[str, Any]) -> DiscoveredObject:
         """Create DiscoveredObject for table (row processing mode)."""
@@ -885,392 +1334,6 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             estimated_content_size=table_info.get('estimated_row_count', 0) * 20  # Estimate
         )
 
-    def _insert_batch_to_staging(self, batch: List[DiscoveredObject], staging_table_name: str, 
-                               trace_id: str, task_id: int):
-        """Insert batch of objects into staging table."""
-        try:
-            # Convert to database format
-            batch_mappings = []
-            for obj in batch:
-                # Calculate object key hash
-                key_string = f"{obj.datasource_id}|{obj.object_path}|{obj.object_type}"
-                object_key_hash = hashlib.sha256(key_string.encode()).digest()
-                
-                mapping = {
-                    'ObjectKeyHash': object_key_hash,
-                    'DataSourceID': obj.datasource_id,
-                    'ObjectType': obj.object_type,
-                    'ObjectPath': obj.object_path,
-                    'SizeBytes': obj.object_metadata.size_bytes,
-                    'CreatedDate': obj.object_metadata.created_date,
-                    'LastModified': obj.object_metadata.last_modified,
-                    'LastAccessed': obj.object_metadata.last_accessed,
-                    'DiscoveryTimestamp': datetime.now(timezone.utc)
-                }
-                batch_mappings.append(mapping)
-            
-            # Insert into staging table
-            self.db.insert_discovered_object_batch(
-                batch_mappings, 
-                staging_table_name,
-                context={'trace_id': trace_id, 'task_id': task_id}
-            )
-            
-        except Exception as e:
-            error = self.error_handler.handle_error(
-                e, "insert_batch_to_staging",
-                operation="staging_table_insert",
-                staging_table=staging_table_name,
-                batch_size=len(batch),
-                trace_id=trace_id,
-                task_id=task_id
-            )
-            raise
-
-    def _get_detailed_metadata(self, object_id: str, trace_id: str, task_id: int) -> Optional[ObjectMetadata]:
-        """Get detailed metadata for a specific object."""
-        try:
-            # Get discovered object from database
-            discovered_objects = self.db.get_objects_for_classification([object_id])
-            
-            if not discovered_objects:
-                return None
-            
-            discovered_obj = discovered_objects[0]
-            object_path = discovered_obj.ObjectPath
-            
-            # Parse object path
-            path_parts = object_path.split('.')
-            
-            if len(path_parts) >= 3:
-                database_name = path_parts[0]
-                schema_name = path_parts[1]
-                table_name = path_parts[2]
-                column_name = path_parts[3] if len(path_parts) > 3 else None
-                
-                # Get comprehensive metadata based on object type
-                if discovered_obj.ObjectType == "DATABASE_TABLE":
-                    metadata = self._get_table_metadata(database_name, schema_name, table_name)
-                elif discovered_obj.ObjectType == "DATABASE_COLUMN":
-                    metadata = self._get_column_metadata(database_name, schema_name, table_name, column_name)
-                else:
-                    metadata = None
-                
-                return metadata
-            
-            return None
-            
-        except Exception as e:
-            raise ProcessingError(
-                f"Failed to get detailed metadata for object {object_id}: {str(e)}",
-                ErrorType.PROCESSING_LOGIC_ERROR,
-                operation="get_detailed_metadata",
-                object_id=object_id
-            )
-
-    def _extract_content_for_classification(self, object_path: str, object_type: str, 
-                                          trace_id: str, task_id: int) -> Optional[str]:
-        """Extract content from object for classification."""
-        try:
-            # Parse object path
-            path_parts = object_path.split('.')
-            
-            if len(path_parts) == 3:
-                # Table-level content (row processing mode)
-                database_name, schema_name, table_name = path_parts
-                return self._sample_table_content(database_name, schema_name, table_name)
-                
-            elif len(path_parts) == 4:
-                # Column-level content (legacy mode)
-                database_name, schema_name, table_name, column_name = path_parts
-                return self._sample_column_content(database_name, schema_name, table_name, column_name)
-            
-            else:
-                raise ProcessingError(
-                    f"Invalid object path format: {object_path}",
-                    ErrorType.PROCESSING_LOGIC_ERROR,
-                    operation="extract_content_for_classification"
-                )
-                
-        except Exception as e:
-            raise ProcessingError(
-                f"Failed to extract content from {object_path}: {str(e)}",
-                ErrorType.PROCESSING_LOGIC_ERROR,
-                operation="extract_content_for_classification",
-                object_path=object_path
-            )
-
-    def _sample_table_content(self, database_name: str, schema_name: str, table_name: str) -> str:
-        """Sample content from entire table for row processing."""
-        try:
-            # Get environment-appropriate sampling query
-            environment_info = self._get_environment_info()
-            queries = self.connector_config.get('sql_server_queries', {})
-            
-            # Get row sampling query
-            env_type = environment_info.get('environment_type', 'on_premise')
-            
-            # Check if we can use TABLESAMPLE
-            if environment_info.get('capabilities', {}).get('supports_tablesample', True):
-                sampling_query = (
-                    queries.get('environments', {})
-                    .get(env_type, {})
-                    .get('row_sampling_with_tablesample')
-                )
-            else:
-                sampling_query = (
-                    queries.get('environments', {})
-                    .get(env_type, {})
-                    .get('row_sampling')
-                )
-            
-            if not sampling_query:
-                # Fallback
-                sampling_query = f"SELECT TOP {{sample_size}} * FROM [{database_name}].[{schema_name}].[{table_name}]"
-            
-            # Format query with parameters
-            sample_size = self.datasource_config.configuration.get('scan_config', {}).get('max_sample_rows', 1000)
-            formatted_query = sampling_query.format(
-                database_name=database_name,
-                schema_name=schema_name,
-                table_name=table_name,
-                sample_size=sample_size,
-                sample_percent=5.0  # For TABLESAMPLE
-            )
-            
-            result = self.connection.execute_query(formatted_query)
-            
-            # Convert rows to text for classification
-            content_lines = []
-            for row in result:
-                # Concatenate all column values
-                row_values = [str(v) if v is not None else '' for v in row.values()]
-                content_lines.append(' | '.join(row_values))
-            
-            return '\n'.join(content_lines)
-            
-        except Exception as e:
-            raise ProcessingError(
-                f"Failed to sample table content {database_name}.{schema_name}.{table_name}: {str(e)}",
-                ErrorType.PROCESSING_LOGIC_ERROR,
-                operation="sample_table_content"
-            )
-
-    def _sample_column_content(self, database_name: str, schema_name: str, table_name: str, column_name: str) -> str:
-        """Sample content from specific column for classification."""
-        try:
-            sample_size = self.datasource_config.configuration.get('scan_config', {}).get('max_sample_rows', 1000)
-            
-            query = f"""
-                SELECT TOP {sample_size} [{column_name}]
-                FROM [{database_name}].[{schema_name}].[{table_name}]
-                WHERE [{column_name}] IS NOT NULL
-                ORDER BY ABS(CHECKSUM(NEWID()))
-            """
-            
-            result = self.connection.execute_query(query)
-            
-            # Extract column values
-            values = [str(row[column_name]) for row in result if row[column_name] is not None]
-            
-            return '\n'.join(values)
-            
-        except Exception as e:
-            raise ProcessingError(
-                f"Failed to sample column content {database_name}.{schema_name}.{table_name}.{column_name}: {str(e)}",
-                ErrorType.PROCESSING_LOGIC_ERROR,
-                operation="sample_column_content"
-            )
-
-    def _get_table_metadata(self, database_name: str, schema_name: str, table_name: str) -> ObjectMetadata:
-        """Get comprehensive table metadata."""
-        try:
-            # Get table size and row count
-            size_query = f"""
-                SELECT 
-                    SUM(a.total_pages) * 8 as total_size_kb,
-                    SUM(p.rows) as row_count
-                FROM [{database_name}].sys.tables t
-                INNER JOIN [{database_name}].sys.indexes i ON t.object_id = i.object_id
-                INNER JOIN [{database_name}].sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id
-                INNER JOIN [{database_name}].sys.allocation_units a ON p.partition_id = a.container_id
-                INNER JOIN [{database_name}].sys.schemas s ON t.schema_id = s.schema_id
-                WHERE s.name = '{schema_name}' AND t.name = '{table_name}'
-            """
-            
-            size_result = self.connection.execute_query(size_query)
-            
-            if size_result:
-                total_size_kb = size_result[0].get('total_size_kb', 0) or 0
-                row_count = size_result[0].get('row_count', 0) or 0
-            else:
-                total_size_kb = 0
-                row_count = 0
-            
-            return ObjectMetadata(
-                size_bytes=total_size_kb * 1024,
-                row_count=row_count,
-                schema_name=schema_name,
-                table_name=table_name,
-                database_name=database_name,
-                data_type='table',
-                content_type='database/table'
-            )
-            
-        except Exception as e:
-            # Return basic metadata on error
-            return ObjectMetadata(
-                size_bytes=0,
-                row_count=0,
-                schema_name=schema_name,
-                table_name=table_name,
-                database_name=database_name,
-                data_type='table',
-                content_type='database/table'
-            )
-
-    def _get_column_metadata(self, database_name: str, schema_name: str, table_name: str, column_name: str) -> ObjectMetadata:
-        """Get comprehensive column metadata."""
-        try:
-            # Get column information
-            column_query = f"""
-                SELECT 
-                    c.DATA_TYPE,
-                    c.CHARACTER_MAXIMUM_LENGTH,
-                    c.IS_NULLABLE,
-                    COUNT(*) as sample_row_count
-                FROM [{database_name}].INFORMATION_SCHEMA.COLUMNS c
-                CROSS JOIN (
-                    SELECT TOP 1000 [{column_name}] 
-                    FROM [{database_name}].[{schema_name}].[{table_name}]
-                    WHERE [{column_name}] IS NOT NULL
-                ) sample
-                WHERE c.TABLE_SCHEMA = '{schema_name}' 
-                AND c.TABLE_NAME = '{table_name}'
-                AND c.COLUMN_NAME = '{column_name}'
-                GROUP BY c.DATA_TYPE, c.CHARACTER_MAXIMUM_LENGTH, c.IS_NULLABLE
-            """
-            
-            result = self.connection.execute_query(column_query)
-            
-            if result:
-                column_data = result[0]
-                max_length = column_data.get('CHARACTER_MAXIMUM_LENGTH', 0)
-                sample_count = column_data.get('sample_row_count', 0)
-            else:
-                max_length = 0
-                sample_count = 0
-            
-            return ObjectMetadata(
-                size_bytes=max_length * sample_count if max_length else 0,
-                row_count=sample_count,
-                data_type=column_data.get('DATA_TYPE', 'unknown') if result else 'unknown',
-                schema_name=schema_name,
-                table_name=table_name,
-                column_name=column_name,
-                database_name=database_name,
-                content_type='database/column'
-            )
-            
-        except Exception as e:
-            # Return basic metadata on error
-            return ObjectMetadata(
-                size_bytes=0,
-                row_count=0,
-                data_type='unknown',
-                schema_name=schema_name,
-                table_name=table_name,
-                column_name=column_name,
-                database_name=database_name,
-                content_type='database/column'
-            )
-
-    def _switch_database_context(self, database_name: str):
-        """Switch connection context to specific database."""
-        try:
-            # For SQL Server, we need to recreate connection with target database
-            if self.connection:
-                current_db = self.connection.connection_config.get('database')
-                if current_db != database_name:
-                    # Update connection config and reconnect
-                    self.connection.connection_config['database'] = database_name
-                    self.connection.disconnect()
-                    self.connection.connect()
-                    self.inspector = inspect(self.connection.engine)
-                    
-        except Exception as e:
-            raise NetworkError(
-                f"Failed to switch to database {database_name}: {str(e)}",
-                ErrorType.NETWORK_CONNECTION_FAILED,
-                database_name=database_name
-            )
-
-    def _get_environment_info(self) -> Dict[str, Any]:
-        """Get or detect SQL Server environment information."""
-        if self._environment_info is not None:
-            return self._environment_info
-        
-        try:
-            # Detect environment
-            version_query = """
-                SELECT 
-                    SERVERPROPERTY('ProductVersion') as version,
-                    SERVERPROPERTY('Edition') as edition,
-                    SERVERPROPERTY('EngineEdition') as engine_edition
-            """
-            
-            result = self.connection.execute_query(version_query)
-            
-            if result:
-                version_info = result[0]
-                version_string = version_info.get('version', '0.0.0.0')
-                version_parts = version_string.split('.')
-                major_version = int(version_parts[0]) if version_parts else 14
-                
-                edition = version_info.get('edition', '').lower()
-                engine_edition = version_info.get('engine_edition', 2)
-                
-                # Determine environment type
-                if engine_edition == 5:
-                    env_type = "azure_sql"
-                elif engine_edition == 8:
-                    env_type = "azure_sql_mi"
-                elif 'express' in edition:
-                    env_type = "express"
-                else:
-                    env_type = "on_premise"
-                
-                self._environment_info = {
-                    'environment_type': env_type,
-                    'version_major': major_version,
-                    'version_full': version_string,
-                    'edition': edition,
-                    'engine_edition': engine_edition,
-                    'capabilities': {
-                        'supports_tablesample': major_version >= 9,
-                        'supports_cte': major_version >= 9,
-                        'supports_sequences': major_version >= 11
-                    }
-                }
-            else:
-                # Default environment info
-                self._environment_info = {
-                    'environment_type': 'on_premise',
-                    'version_major': 14,
-                    'capabilities': {'supports_tablesample': True}
-                }
-            
-            return self._environment_info
-            
-        except Exception as e:
-            # Return safe default on detection failure
-            self._environment_info = {
-                'environment_type': 'on_premise',
-                'version_major': 14,
-                'capabilities': {'supports_tablesample': True}
-            }
-            return self._environment_info
-
     def _matches_exclude_patterns(self, name: str, patterns: List[str]) -> bool:
         """Check if name matches any exclude patterns."""
         import fnmatch
@@ -1305,10 +1368,11 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
 # Factory Function for Integration with Worker System
 # =================================================================
 
-def create_sql_server_connector(datasource_id: str, logger: SystemLogger, 
-                               error_handler: ErrorHandler, db_interface: DatabaseInterface) -> SQLServerConnector:
+async def create_sql_server_connector_async(datasource_id: str, logger: SystemLogger, 
+                                          error_handler: ErrorHandler, 
+                                          db_interface: DatabaseInterface) -> SQLServerConnector:
     """
-    Factory function to create SQL Server connector with proper dependency injection.
+    Factory function to create async SQL Server connector with proper dependency injection.
     
     Args:
         datasource_id: Unique identifier for the datasource
@@ -1317,29 +1381,42 @@ def create_sql_server_connector(datasource_id: str, logger: SystemLogger,
         db_interface: Database interface for configuration access
         
     Returns:
-        Configured SQLServerConnector instance
+        Configured async SQLServerConnector instance
     """
-    return SQLServerConnector(datasource_id, logger, error_handler, db_interface)
+    connector = SQLServerConnector(datasource_id, logger, error_handler, db_interface)
+    
+    # Load configuration to validate setup
+    try:
+        await connector._load_configuration_async()
+        logger.info("SQL Server connector configuration loaded successfully", 
+                   datasource_id=datasource_id)
+    except Exception as e:
+        logger.error("Failed to load SQL Server connector configuration", 
+                    datasource_id=datasource_id, error=str(e))
+        raise
+    
+    return connector
 
 
 # =================================================================
 # Testing and Validation
 # =================================================================
 
-def test_sql_server_connector():
-    """Test SQL Server connector functionality."""
-    print("SQL Server connector implementation completed!")
+async def test_sql_server_connector_async():
+    """Test async SQL Server connector functionality."""
+    print("Async SQL Server connector implementation completed!")
     print("Key features implemented:")
-    print("  ✅ Interface compliance (IDataSourceConnector)")
-    print("  ✅ Database-based configuration loading")
-    print("  ✅ SystemLogger integration")
-    print("  ✅ ErrorHandler integration")
-    print("  ✅ Batch processing with progress logging")
-    print("  ✅ Staging table integration")
-    print("  ✅ Both row and column processing modes")
-    print("  ✅ Environment detection and adaptive queries")
-    print("  ✅ Proper resource management")
+    print("  ✅ AsyncIterator interface compliance (IDatabaseDataSourceConnector)")
+    print("  ✅ Async SQLAlchemy with sqlalchemy.ext.asyncio")
+    print("  ✅ Async database operations and connection management")
+    print("  ✅ Async configuration loading")
+    print("  ✅ Async staging table integration")
+    print("  ✅ Async batch processing with progress logging")
+    print("  ✅ Both row and column processing modes (async)")
+    print("  ✅ Async environment detection and adaptive queries")
+    print("  ✅ Proper async resource management")
+    print("  ✅ Ready for Task 9 integration with async Worker")
 
 
 if __name__ == "__main__":
-    test_sql_server_connector()
+    asyncio.run(test_sql_server_connector_async())

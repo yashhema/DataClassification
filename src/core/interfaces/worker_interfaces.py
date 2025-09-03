@@ -1,12 +1,14 @@
-# src/core/interfaces/connector_interface.py
+# src/core/interfaces/worker_interfaces.py
 """
 Defines the abstract interface that all data source connectors must implement.
 A Worker uses this interface to interact with different data sources in a
 consistent way, abstracting the protocol-specific logic.
+
+UPDATED: Converted to full async interface with AsyncIterator support.
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Iterator
+from typing import List, AsyncIterator # UPDATED: Changed Iterator to AsyncIterator
 
 # Import the strongly-typed Pydantic models
 from core.models.discovered_object_schema import DiscoveredObject, ObjectMetadata
@@ -20,12 +22,12 @@ class IDatabaseDataSourceConnector(ABC):
     """
 
     @abstractmethod
-    def enumerate_objects(self, work_packet: WorkPacket) -> Iterator[List[DiscoveredObject]]:
+    async def enumerate_objects(self, work_packet: WorkPacket) -> AsyncIterator[List[DiscoveredObject]]: # UPDATED: async def and AsyncIterator
         """
         Performs a fast, streaming enumeration of objects from the source.
 
         - Input: The full, strongly-typed WorkPacket for a DISCOVERY_ENUMERATE task.
-        - Intermediate Output: This method MUST be a generator. It yields batches
+        - Intermediate Output: This method MUST be an async generator. It yields batches
           (lists) of DiscoveredObject records. The Worker is responsible for writing
           these batches to the staging table and reporting progress.
         - Final Output: After the generator is exhausted, it should return a dictionary
@@ -39,7 +41,7 @@ class IDatabaseDataSourceConnector(ABC):
         pass
 
     @abstractmethod
-    def get_object_details(self, work_packet: WorkPacket) -> List[ObjectMetadata]:
+    async def get_object_details(self, work_packet: WorkPacket) -> List[ObjectMetadata]: # UPDATED: async def
         """
         Fetches rich, detailed metadata for a batch of objects.
 
@@ -56,12 +58,12 @@ class IDatabaseDataSourceConnector(ABC):
         pass
 
     @abstractmethod
-    def get_object_content(self, work_packet: WorkPacket) -> Iterator[dict]:
+    async def get_object_content(self, work_packet: WorkPacket) -> AsyncIterator[dict]: # UPDATED: async def and AsyncIterator
         """
         Retrieves the actual content of an object for classification.
 
         - Input: The full WorkPacket for a CLASSIFICATION task.
-        - Intermediate Output: This method MUST be a generator. It yields a dictionary
+        - Intermediate Output: This method MUST be an async generator. It yields a dictionary
           for each object containing its 'object_id' and its 'content' (as a string or bytes).
           This allows the Worker to stream content for classification without loading
           everything into memory at once. For database tables, it would yield batches of rows.
@@ -77,20 +79,20 @@ class IFileDataSourceConnector(ABC):
     """Interface for file-based datasource connectors (SMB, S3, Azure Blob, etc.)"""
     
     @abstractmethod
-    def enumerate_objects(self, work_packet: WorkPacket) -> Iterator[List[DiscoveredObject]]:
+    async def enumerate_objects(self, work_packet: WorkPacket) -> AsyncIterator[List[DiscoveredObject]]: # UPDATED: async def and AsyncIterator
         pass
     
     @abstractmethod  
-    def get_object_details(self, work_packet: WorkPacket) -> List[ObjectMetadata]:
+    async def get_object_details(self, work_packet: WorkPacket) -> List[ObjectMetadata]: # UPDATED: async def
         pass
     
     @abstractmethod
-    def get_object_content(self, work_packet: WorkPacket) -> Iterator[ContentComponent]:
+    async def get_object_content(self, work_packet: WorkPacket) -> AsyncIterator[ContentComponent]: # UPDATED: async def and AsyncIterator
         """
         Retrieves and extracts content components from files for classification.
 
         - Input: The full WorkPacket for a CLASSIFICATION task.
-        - Intermediate Output: This method MUST be a generator. It yields ContentComponent
+        - Intermediate Output: This method MUST be an async generator. It yields ContentComponent
           objects representing extracted components (text, tables, images, archive members).
           This allows memory-safe streaming of complex file content.
         - Final Output: None. The generator is simply exhausted.
@@ -98,36 +100,3 @@ class IFileDataSourceConnector(ABC):
         - Error Handling: Should yield error components for failed extractions but continue processing.
         """
         pass
-
-
-# src/core/interfaces/classification_engine_interface.py
-"""
-Defines the interface for the Classification Engine.
-"""
-
-from core.models.models import PIIFinding # Assuming your models.py is aliased
-
-class IClassificationEngine(ABC):
-    """
-    Interface for the classification engine. The Worker calls this to
-    perform the actual sensitive data analysis.
-    """
-
-    @abstractmethod
-    def classify_content(self, object_id: str, content: any, work_packet: WorkPacket) -> List[PIIFinding]:
-        """
-        Analyzes a block of content for sensitive data based on the provided rules.
-
-        - Input: The unique 'object_id' of the content being scanned, the 'content'
-          itself (e.g., a string of text, a list of database rows), and the full
-          WorkPacket, which contains the 'classifier_template_id' and other context.
-        - Intermediate Output: None.
-        - Final Output: Returns a list of strongly-typed PIIFinding objects.
-        - Logging Fields: Logs the object_id and the classifier_template_id being used.
-          For performance, it should NOT log the content itself.
-        - Error Handling: Should not raise exceptions for content it cannot parse. Instead,
-          it should log the error and return an empty list of findings.
-        """
-        pass
-
-
