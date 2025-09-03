@@ -1,0 +1,101 @@
+You can configure the test file directory path in several ways. Here are the most flexible approaches:Now you can configure the test file directory path in multiple ways:
+
+## Configuration Options:
+
+### Option 1: Environment Variable (Recommended)
+```bash
+# Set environment variable before running tests
+export CONTENT_EXTRACTOR_TEST_FILES="/path/to/your/test_files"
+pytest content_extractor_tests.py
+
+# Or inline
+CONTENT_EXTRACTOR_TEST_FILES="/custom/path" pytest content_extractor_tests.py
+```
+
+### Option 2: Modify the fixture directly
+Uncomment one of the alternative paths in the fixture:
+```python
+# For relative to test file location:
+test_dir = Path(__file__).parent / "test_files"
+
+# For absolute path:
+test_dir = "/absolute/path/to/test_files"
+```
+
+### Option 3: pytest configuration file
+Create `pytest.ini` or `conftest.py`:
+```ini
+# pytest.ini
+[tool:pytest]
+env = 
+    CONTENT_EXTRACTOR_TEST_FILES = ./my_test_files
+```
+
+### Option 4: Command line parameter
+Add this to your test class:
+```python
+def pytest_addoption(parser):
+    parser.addoption(
+        "--test-files-dir",
+        action="store",
+        default="test_files",
+        help="Directory containing test files"
+    )
+
+@pytest.fixture
+def test_files_dir(request):
+    return Path(request.config.getoption("--test-files-dir"))
+```
+
+Then run: `pytest --test-files-dir="/my/custom/path"`
+
+python -m pytest --test-files-dir="C:/PAM_Solutiom/Db_Scan_Job/DataClassification/src/generichelper/test_files"
+## Directory Structure Expected:
+```
+your_test_files_directory/
+├── basic_types/
+├── complex_content/
+├── archives/
+├── edge_cases/
+└── security_tests/
+```
+
+The fixture now includes a safety check - if the directory doesn't exist, tests will be skipped rather than failing. This prevents confusing error messages when the path is misconfigured.
+
+Which configuration method would you prefer to use?
+
+
+
+
+test_files/
+├── basic_types/
+│   ├── sample.pdf
+│   ├── sample.docx
+│   ├── sample.xlsx
+│   ├── sample.pptx
+│   ├── sample.html
+│   ├── sample.txt
+│   ├── sample.json
+│   ├── sample.xml
+│   ├── sample.eml
+│   └── sample.jpg
+├── complex_content/
+│   ├── pdf_with_tables.pdf
+│   ├── excel_multi_sheet.xlsx
+│   ├── powerpoint_with_images.pptx
+│   └── html_with_embedded_tables.html
+├── archives/
+│   ├── simple.zip
+│   ├── nested_archives.zip
+│   ├── malicious_paths.zip
+│   └── large_member_count.tar.gz
+├── edge_cases/
+│   ├── corrupted.pdf
+│   ├── empty.txt
+│   ├── oversized.xlsx
+│   ├── password_protected.docx
+│   └── wrong_extension.pdf
+└── security_tests/
+    ├── zip_bomb.zip
+    ├── path_traversal.zip
+    └── circular_reference.zip

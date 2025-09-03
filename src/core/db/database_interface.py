@@ -13,7 +13,11 @@ import asyncio
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import joinedload
-from sqlalchemy import select, update, text, inspect, Table, MetaData, func, delete
+
+from sqlalchemy import (
+    select, update, text, inspect, Table, MetaData, func, delete, Column,
+    Integer, String, DateTime, LargeBinary
+)
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -813,28 +817,40 @@ class DatabaseInterface:
     # =================================================================
 
     async def create_staging_table_for_job(self, job_id: int, table_type: str, context: Optional[Dict[str, Any]] = None) -> str:
-        context = context or {}
-        staging_table_name = f"staging_{table_type}_job_{job_id}"
-        self._validate_table_name(staging_table_name)
-        template_table_map = {"DiscoveredObjects": OrmDiscoveredObject.__table__}
-        
-        if table_type not in template_table_map:
-            raise ValueError(f"Unknown staging table type: {table_type}")
-
-        self.logger.log_database_operation("CREATE TABLE", staging_table_name, "STARTED", **context)
-        try:
-            template_table = template_table_map[table_type]
-            staging_table = Table(staging_table_name, Base.metadata, *(col.copy() for col in template_table.columns))
+            context = context or {}
+            staging_table_name = f"staging_{table_type}_job_{job_id}"
+            self._validate_table_name(staging_table_name)
             
-            async with self.async_engine.begin() as conn:
-                await conn.run_sync(lambda sync_conn: staging_table.create(sync_conn, checkfirst=True))
-            
-            self.logger.log_database_operation("CREATE TABLE", staging_table_name, "SUCCESS", **context)
-            return staging_table_name
-        except Exception as e:
-            self.error_handler.handle_error(e, context="create_staging_table_for_job", table_name=staging_table_name, **context)
-            raise
+            if table_type != "DiscoveredObjects":
+                raise ValueError(f"Unknown staging table type: {table_type}")
 
+            self.logger.log_database_operation("CREATE TABLE", staging_table_name, "STARTED", **context)
+            try:
+                # Explicitly define columns for the staging table to avoid initialization errors
+                staging_table = Table(
+                    staging_table_name,
+                    Base.metadata,
+                    Column('ID', Integer, primary_key=True, autoincrement=True),
+                    Column('ObjectKeyHash', LargeBinary(32), nullable=False),
+                    Column('DataSourceID', String(255), nullable=False),
+                    Column('ObjectType', String(50), nullable=False),
+                    Column('ObjectPath', String(4000), nullable=False),
+                    Column('SizeBytes', Integer, nullable=True),
+                    Column('CreatedDate', DateTime, nullable=True),
+                    Column('LastModified', DateTime, nullable=True),
+                    Column('LastAccessed', DateTime, nullable=True),
+                    Column('DiscoveryTimestamp', DateTime(timezone=True), nullable=False),
+                    extend_existing=True # Keep this for validation script robustness
+                )
+                
+                async with self.async_engine.begin() as conn:
+                    await conn.run_sync(lambda sync_conn: staging_table.create(sync_conn, checkfirst=True))
+                
+                self.logger.log_database_operation("CREATE TABLE", staging_table_name, "SUCCESS", **context)
+                return staging_table_name
+            except Exception as e:
+                self.error_handler.handle_error(e, context="create_staging_table_for_job", table_name=staging_table_name, **context)
+                raise
     async def cleanup_staging_tables_for_job(self, job_id: int, context: Optional[Dict[str, Any]] = None) -> None:
         context = context or {}
         pattern = f"staging_%_job_{job_id}"

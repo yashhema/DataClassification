@@ -25,6 +25,7 @@ class ScanFindingSummary(Base):
         Index('uq_finding_key_hash', 'FindingKeyHash', unique=True),
         Index('IX_ScanFindingSummaries_ScanJobID', 'ScanJobID'),
         Index('IX_ScanFindingSummaries_DataSourceID', 'DataSourceID'),
+        {'extend_existing': True}
     )
     __doc__ = """
     Stores an aggregated summary of findings. A SHA-256 hash of the core

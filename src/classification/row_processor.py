@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import asyncio
 
 from .field_mapper import FieldMapper, filter_fields_for_classification
-from core.models import PIIFinding
+from core.models.models import PIIFinding
 
 
 class RowProcessor:

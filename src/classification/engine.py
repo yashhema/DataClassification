@@ -16,8 +16,8 @@ except ImportError as e:
     raise ImportError("presidio-analyzer is required: pip install presidio-analyzer") from e
 
 # Import from project structure
-from ..core.models.models import PIIFinding
-from ..core.errors import ProcessingError, ErrorType, ErrorHandler
+from core.models.models import PIIFinding
+from core.errors import ProcessingError, ErrorType, ErrorHandler
 
 class ClassificationEngine:
     """

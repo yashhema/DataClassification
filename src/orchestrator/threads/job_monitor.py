@@ -17,7 +17,7 @@ ASYNC CONVERSION:
 
 import asyncio
 from core.db_models.job_schema import JobStatus
-
+from core.config.configuration_manager import ClassificationConfidenceConfig
 # Import for type hinting and JobState enum access
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:

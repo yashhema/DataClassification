@@ -33,7 +33,7 @@ from core.interfaces.worker_interfaces import (
 from classification.engineinterface import EngineInterface
 from core.db.database_interface import DatabaseInterface
 from core.config.configuration_manager import ConfigurationManager
-
+from core.config.configuration_manager import ClassificationConfidenceConfig
 class WorkerStatus(str, Enum):
     """Worker operational states."""
     STARTING = "STARTING"

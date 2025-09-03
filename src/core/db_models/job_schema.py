@@ -34,6 +34,7 @@ class TaskStatus(str, enum.Enum):
 
 class ScanTemplate(Base):
     __tablename__ = 'scan_templates'
+    __table_args__ = {'extend_existing': True}
     __doc__ = "Stores the definition of a job."
     
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -52,6 +53,7 @@ class ScanTemplate(Base):
 
 class Job(Base):
     __tablename__ = 'jobs'
+    __table_args__ = {'extend_existing': True}
     __doc__ = "Stores a record for a single execution (a run) of a ScanTemplate."
     
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)

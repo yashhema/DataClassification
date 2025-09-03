@@ -18,6 +18,7 @@ ASYNC CONVERSION: Converted all file I/O to async operations
 
 import os
 import uuid
+import aiofiles.os
 import hashlib
 import tempfile
 import aiofiles
@@ -26,9 +27,9 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 # Core system imports
-from core.models import ContentComponent, ContentExtractionConfig
+from core.models.models import ContentComponent, ContentExtractionConfig
 from core.logging.system_logger import SystemLogger
-from core.db.configuration_manager import SystemConfig
+from core.config.configuration_manager import SystemConfig
 from core.errors import ErrorHandler
 import aiofiles.os
 class ContentExtractor:
@@ -68,18 +69,21 @@ class ContentExtractor:
         extraction_id = f"extract_{uuid.uuid4().hex[:8]}"
         
         try:
+            # Pre-validation - check file size limits
+            if not await aiofiles.os.path.exists(file_path):
+                yield self._create_error_component(object_id, f"File not found: {file_path}")
+                return
+            
+            
             # Memory validation before processing
-            stats = await aiofiles.os.stat(file_path)
+            stats = (await aiofiles.os.stat(file_path)).st_size
             file_size_mb = stats / (1024 * 1024)
             if not self._validate_extraction_resources(file_size_mb):
                 yield self._create_error_component(object_id, 
                     f"Insufficient memory for file processing (size: {file_size_mb:.2f}MB)")
                 return
             
-            # Pre-validation - check file size limits
-            if not await aiofiles.os.path.exists(file_path):
-                yield self._create_error_component(object_id, f"File not found: {file_path}")
-                return
+            
             
             if file_size_mb > self.extraction_config.limits.max_file_size_mb:
                 yield self._create_oversized_component(object_id, {
@@ -141,7 +145,7 @@ class ContentExtractor:
         
         # Check depth limits
         if self.extraction_config.limits.max_archive_depth != -1:
-            if current_depth > self.extraction_config.limits.max_archive_depth:
+            if current_depth >= self.extraction_config.limits.max_archive_depth:
                 yield self._create_depth_exceeded_component(object_id, current_depth)
                 return
         
@@ -1444,7 +1448,7 @@ class ContentExtractor:
             component_id=f"{base_name}_unsupported_1",
             parent_path=file_path,
             content=f"File type '{file_type}' not supported for extraction",
-            original_size=(await aiofiles.os.stat(file_path)).st_size,
+            original_size=os.path.getsize(file_path),
             extracted_size=0,
             is_truncated=False,
             schema={},
@@ -1768,6 +1772,12 @@ class ContentExtractor:
 
     def _detect_type_by_extension(self, file_path: str) -> str:
         """Fallback file type detection by extension"""
+    # Check compound extensions first
+        file_path_lower = file_path.lower()
+        if file_path_lower.endswith('.tar.gz'):
+            return 'tar'
+        if file_path_lower.endswith('.tar.bz2'):
+            return 'tar'        
         ext = Path(file_path).suffix.lower()
         
         extension_map = {
@@ -1853,8 +1863,8 @@ class ContentExtractor:
         
         for temp_file in self.temp_files_created:
             try:
-                if await aiofiles.os.path.exists(temp_file):
-                    await aiofiles.os.remove(temp_file)
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
                     cleanup_success.append(temp_file)
                 
             except Exception as cleanup_error:
@@ -1932,38 +1942,38 @@ class ContentExtractor:
         
         return registry
 
-	def _validate_extraction_config(self):
-			"""Validate configuration and log issues"""
-			
-			validation_errors = []
-			
-			# OCR flag validation
-			ocr_system_enabled = getattr(self.system_config, 'connector', None) and \
-							   getattr(self.system_config.connector, 'easyocr_support_enabled', False)
-			
-			if (not ocr_system_enabled and 
-				self.extraction_config.features.ocr_enabled):
-				validation_errors.append({
-					"type": "config_conflict",
-					"message": "OCR enabled in datasource but disabled at system level",
-					"resolution": "Using system setting (OCR disabled)"
-				})
-			
-			# Resource limit validation
-			total_memory_limit = self.system_config.system.total_process_memory_limit_mb
-			safe_memory_limit = total_memory_limit * 0.7
-			if self.extraction_config.limits.max_file_size_mb > safe_memory_limit:
-				validation_errors.append({
-					"type": "resource_limit_exceeded",
-					"message": f"max_file_size_mb exceeds safe memory limit",
-					"resolution": "File size limit should be reduced"
-				})
-			
-			if validation_errors:
-				self.logger.warning("Configuration validation issues found",
-								   validation_errors=validation_errors)
-							 
-	# =============================================================================
+    def _validate_extraction_config(self):
+            """Validate configuration and log issues"""
+            
+            validation_errors = []
+            
+            # OCR flag validation
+            ocr_system_enabled = getattr(self.system_config, 'connector', None) and \
+                               getattr(self.system_config.connector, 'easyocr_support_enabled', False)
+            
+            if (not ocr_system_enabled and 
+                self.extraction_config.features.ocr_enabled):
+                validation_errors.append({
+                    "type": "config_conflict",
+                    "message": "OCR enabled in datasource but disabled at system level",
+                    "resolution": "Using system setting (OCR disabled)"
+                })
+            
+            # Resource limit validation
+            total_memory_limit = self.system_config.system.total_process_memory_limit_mb
+            safe_memory_limit = total_memory_limit * 0.7
+            if self.extraction_config.limits.max_file_size_mb > safe_memory_limit:
+                validation_errors.append({
+                    "type": "resource_limit_exceeded",
+                    "message": f"max_file_size_mb exceeds safe memory limit",
+                    "resolution": "File size limit should be reduced"
+                })
+            
+            if validation_errors:
+                self.logger.warning("Configuration validation issues found",
+                                   validation_errors=validation_errors)
+                             
+    # =============================================================================
     # Simple File Type Extractors - Signatures Updated for Context IDs
     # =============================================================================
 

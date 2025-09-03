@@ -20,7 +20,8 @@ classifier_template_link = Table(
     Column("template_id", String(255), ForeignKey("classifier_templates.template_id"), primary_key=True),
     Column("classifier_id", String(255), ForeignKey("classifiers.classifier_id"), primary_key=True),
     Column("weight", Float, nullable=False, default=1.0),
-    Column("is_required", Boolean, nullable=False, default=False)
+    Column("is_required", Boolean, nullable=False, default=False),
+    extend_existing=True  
 )
 
 # Links DataSource and Tag models
@@ -29,4 +30,5 @@ datasource_tag_link = Table(
     Base.metadata,
     Column("datasource_id", String(255), ForeignKey("datasources.datasource_id"), primary_key=True),
     Column("tag_id", Integer, ForeignKey("tags.id"), primary_key=True),
+    extend_existing=True 
 )

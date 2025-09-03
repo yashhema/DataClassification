@@ -78,6 +78,12 @@ class ErrorHandlingConfig(BaseModel):
     persistence_enabled: bool = Field(True)
     circuit_breaker_threshold: int = Field(5)
 
+class ClassificationConfidenceConfig(BaseModel):
+    """Defines thresholds for aggregated confidence scoring."""
+    low_threshold: int = Field(30, description="Upper bound for LOW confidence score (e.g., 0-30).")
+    medium_threshold: int = Field(60, description="Upper bound for MEDIUM confidence score (e.g., 31-60).")
+    # Anything above medium is considered HIGH
+
 class ClassificationConfig(BaseModel):
     """Expanded configuration for the classification subsystem."""
     max_content_size_mb: int = Field(100)
@@ -89,11 +95,6 @@ class TaskCostEstimationConfig(BaseModel):
     classification_mb_per_gb_file: int = Field(128)
     default_task_cost_mb: int = Field(256)
 
-class ClassificationConfidenceConfig(BaseModel):
-    """Defines thresholds for aggregated confidence scoring."""
-    low_threshold: int = Field(30, description="Upper bound for LOW confidence score (e.g., 0-30).")
-    medium_threshold: int = Field(60, description="Upper bound for MEDIUM confidence score (e.g., 31-60).")
-    # Anything above medium is considered HIGH
 
 class SystemConfig(BaseModel):
     """The root model for the entire system configuration."""

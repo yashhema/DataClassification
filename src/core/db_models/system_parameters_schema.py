@@ -13,9 +13,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-# Assume 'Base' is defined in a shared file (e.g., src/core/db_models/base.py)
-class Base(DeclarativeBase):
-    pass
+from .base import Base
 
 class ComponentType(enum.Enum):
     """Defines the system component a parameter can apply to."""
@@ -26,6 +24,7 @@ class ComponentType(enum.Enum):
 
 class SystemParameter(Base):
     __tablename__ = 'system_parameters'
+    __table_args__ = {'extend_existing': True}
     __doc__ = """
     Stores tunable system parameters. This table holds overrides to the
     default values defined in the system.yaml configuration file.

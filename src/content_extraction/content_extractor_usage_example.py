@@ -5,13 +5,13 @@ with the ContentExtractor module for content extraction and classification.
 """
 
 from typing import Iterator, List
-from core.models import WorkPacket, ContentComponent, ContentExtractionConfig
+from core.models.models import WorkPacket, ContentComponent, ContentExtractionConfig
 from core.interfaces.worker_interfaces import IFileDataSourceConnector
 from core.logging.system_logger import SystemLogger
-from core.db.configuration_manager import SystemConfig
+from core.config.configuration_manager import SystemConfig
 from core.errors import ErrorHandler
 from core.db.database_interface import DatabaseInterface
-from extraction.content_extractor import ContentExtractor
+from content_extraction.content_extractor import ContentExtractor
 
 class SMBConnector(IFileDataSourceConnector):
     """Example SMB connector using ContentExtractor for content processing"""

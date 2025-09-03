@@ -32,7 +32,7 @@ class Tag(Base):
     parent_id: Mapped[Optional[int]] = mapped_column(ForeignKey('tags.id'))
     parent: Mapped["Tag"] = relationship(back_populates="children", remote_side=[id])
     children: Mapped[List["Tag"]] = relationship(back_populates="parent")
-    metadata: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON)
+    metadata_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON)
     datasources: Mapped[List["DataSource"]] = relationship(secondary=datasource_tag_link, back_populates="tags")
 
 class DataSource(Base):

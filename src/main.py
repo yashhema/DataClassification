@@ -33,10 +33,10 @@ from core.logging.system_logger import SystemLogger
 from orchestrator.orchestrator import Orchestrator
 from worker.worker import Worker, ConnectorFactory
 from content_extraction.content_extractor import ContentExtractor
-from models import ContentExtractionConfig
+from core.models import ContentExtractionConfig
 from connectors.smb_connector import SMBConnector
 from connectors.sql_server_connector import SQLServerConnector
-
+from core.config.configuration_manager import ClassificationConfidenceConfig
 # Global shutdown event for graceful async shutdown
 shutdown_event = asyncio.Event()
 

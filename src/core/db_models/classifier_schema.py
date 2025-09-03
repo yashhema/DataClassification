@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 class Category(Base):
     __tablename__ = 'classifier_categories'
+    __table_args__ = {'extend_existing': True}
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     description: Mapped[Optional[str]] = mapped_column(String(512))
@@ -28,6 +29,7 @@ class Category(Base):
 
 class Classifier(Base):
     __tablename__ = 'classifiers'
+    __table_args__ = {'extend_existing': True}
     __doc__ = "The base table for all PII detectors."
     
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -49,6 +51,7 @@ class Classifier(Base):
 
 class ClassifierPattern(Base):
     __tablename__ = 'classifier_patterns'
+    __table_args__ = {'extend_existing': True}
     id: Mapped[int] = mapped_column(primary_key=True)
     classifier_id: Mapped[int] = mapped_column(ForeignKey('classifiers.id'), nullable=False)
     classifier: Mapped["Classifier"] = relationship(back_populates="patterns")

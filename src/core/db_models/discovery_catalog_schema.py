@@ -20,6 +20,7 @@ class DiscoveredObject(Base):
         Index('uq_object_key_hash', 'ObjectKeyHash', unique=True),
         Index('IX_DiscoveredObjects_DataSourceID', 'DataSourceID'),
         Index('IX_DiscoveredObjects_ObjectType', 'ObjectType'),
+        {'extend_existing': True}
     )
     __doc__ = """
     Stores the essential, enumerated information for every object discovered.

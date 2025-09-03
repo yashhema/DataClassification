@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from typing import List, AsyncIterator # UPDATED: Changed Iterator to AsyncIterator
 
 # Import the strongly-typed Pydantic models
-from core.models.discovered_object_schema import DiscoveredObject, ObjectMetadata
+from core.models.models import DiscoveredObject, ObjectMetadata
 from core.models.models import WorkPacket, PIIFinding, ContentComponent 
 
 class IDatabaseDataSourceConnector(ABC):

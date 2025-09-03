@@ -43,7 +43,7 @@ except ImportError as e:
 from core.interfaces.worker_interfaces import IFileDataSourceConnector
 from core.models.models import (
     WorkPacket, DiscoveredObject, ObjectMetadata, ObjectType, 
-    DataSourceConfig, ContentComponent
+     ContentComponent
 )
 from core.errors import (
     NetworkError, RightsError, ProcessingError, ConfigurationError,

@@ -39,6 +39,8 @@ from .threads.pipeliner import Pipeliner
 from .threads.job_monitor import JobCompletionMonitor
 from core.db_models.job_schema import Task, JobStatus, Job
 
+from core.config.configuration_manager import ClassificationConfidenceConfig
+
 class JobState(str, Enum):
     """Valid job states for state machine validation"""
     QUEUED = "QUEUED"

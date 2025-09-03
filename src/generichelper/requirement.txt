@@ -1,0 +1,49 @@
+# Core testing framework
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.0.0
+
+# Async file operations
+aiofiles>=23.0.0
+
+# PDF processing
+PyMuPDF>=1.23.0
+camelot-py[cv]>=0.11.0
+tabula-py>=2.7.0
+
+# Office document processing  
+python-docx>=0.8.11
+openpyxl>=3.1.0
+python-pptx>=0.6.21
+pandas>=2.0.0
+
+# Web and markup processing
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# OCR capabilities
+easyocr>=1.7.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Image processing (for OCR)
+Pillow>=10.0.0
+opencv-python>=4.8.0
+
+# Archive processing (built-in, no install needed)
+# zipfile - built-in
+# tarfile - built-in
+
+# File type detection
+python-magic>=0.4.27
+python-magic-bin>=0.4.14  # For Windows
+
+# Email processing (built-in)
+# email - built-in
+
+# JSON/XML processing (built-in)
+# json - built-in
+# xml - built-in
+
+# Utilities
+pathlib2>=2.3.7  # Enhanced Path support
