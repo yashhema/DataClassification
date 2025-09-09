@@ -42,6 +42,19 @@ class SystemIdentityConfig(BaseModel):
     node_group: str = Field("default")
     total_process_memory_limit_mb: int = Field(8192)
     local_timezone: str = Field("UTC", description="The local timezone for interpreting calendar schedules, e.g., 'America/New_York'.")
+    #  two fields for backend flexibility
+    search_backend: str = Field("sql", description="The backend to use for policy queries ('sql' or 'elasticsearch').")
+    primary_storage_backend: str = Field("sql", description="The backend for high-volume storage ('sql' or 'dynamodb').")
+    # NEW: Add these fields for the Elasticsearch connection
+    elasticsearch_host: Optional[str] = Field(None, description="Hostname for the Elasticsearch cluster.")
+    elasticsearch_port: int = Field(9200, description="Port for the Elasticsearch cluster.")
+    elasticsearch_user: Optional[str] = Field(None, description="Username for Elasticsearch.")
+    # The password would be retrieved from a secure vault, not stored here directly.
+    elasticsearch_credential_id: Optional[str] = Field(None, description="Credential ID for Elasticsearch password.")
+
+
+
+
 
 class WorkerConfig(BaseModel):
     in_process_thread_count: int = Field(8)

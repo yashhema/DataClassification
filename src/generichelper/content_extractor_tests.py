@@ -154,7 +154,21 @@ class TestBasicFileTypes(TestContentExtractor):
         assert component.extraction_method == "text_file_read"
         assert "Sample Text Document" in component.content
         assert component.metadata["encoding"] == "utf-8"
-    
+    @pytest.mark.asyncio
+    async def test_image_ocr_processing(self, content_extractor, test_files_dir):
+        """Test OCR text extraction from images"""
+        image_file = test_files_dir / "basic_types" / "sample.png"
+        
+        components = []
+        async for component in content_extractor.extract_from_file(
+            str(image_file), "test_ocr", 1, 1, "test_ds"
+        ):
+            components.append(component)
+        
+        assert len(components) == 1
+        assert components[0].component_type == "image_ocr"
+        assert len(components[0].content) > 0  # Should have extracted text
+
     @pytest.mark.asyncio
     async def test_json_file_extraction(self, content_extractor, test_files_dir):
         """Test JSON file extraction and parsing"""

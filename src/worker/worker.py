@@ -25,7 +25,7 @@ from enum import Enum
 from core.logging.system_logger import SystemLogger
 from core.config.configuration_manager import SystemConfig
 from core.errors import ErrorHandler, ClassificationError, NetworkError, ProcessingError
-from core.models.models import WorkPacket, TaskType, TaskOutputRecord, ProgressUpdate, ContentComponent, PIIFinding
+
 from core.interfaces.worker_interfaces import (
     IDatabaseDataSourceConnector, 
     IFileDataSourceConnector
@@ -34,6 +34,17 @@ from classification.engineinterface import EngineInterface
 from core.db.database_interface import DatabaseInterface
 from core.config.configuration_manager import ConfigurationManager
 from core.config.configuration_manager import ClassificationConfidenceConfig
+from core.models.models import (
+    TaskType, WorkPacket, ProgressUpdate, ContentComponent, PIIFinding,
+    TaskOutputRecord,
+    PolicySelectorPlanPayload,
+    PolicySelectorExecutePayload,
+    PolicyActionExecutePayload,
+    ObjectToProcess,PolicyCommitPlanPayload,PolicyEnrichmentPayload,PolicyReconcilePayload,
+    RemediationResult
+)
+
+
 class WorkerStatus(str, Enum):
     """Worker operational states."""
     STARTING = "STARTING"
@@ -79,7 +90,7 @@ class Worker:
         self.connector_factory = connector_factory
         self.logger = logger
         self.error_handler = error_handler
-        
+        self.search_provider = create_search_provider(settings, db_interface)
         # Deployment mode detection
         self.is_single_process_mode = self.settings.orchestrator.deployment_model.upper() == "SINGLE_PROCESS"
         
@@ -107,6 +118,279 @@ class Worker:
         self.total_processing_time = 0.0
 
         self.logger.log_component_lifecycle("Worker", "INITIALIZED", worker_id=self.worker_id)
+
+
+
+
+    # It's good practice to have a small helper for consistent logging context
+    def job_context(work_packet: WorkPacket) -> Dict[str, Any]:
+        """Extracts a consistent context dictionary for logging."""
+        return {
+            "job_id": work_packet.header.job_id,
+            "task_id": work_packet.header.task_id,
+            "trace_id": work_packet.header.trace_id
+        }
+
+
+
+    async def _process_policy_selector_plan_async(self, work_packet: WorkPacket):
+        """
+        Executes the first step of a Policy Job. It determines the total number of
+        objects that match the policy and creates a blueprint for the Pipeliner.
+        """
+        payload: PolicySelectorPlanPayload = work_packet.payload
+        context = job_context(work_packet)
+        self.logger.info(f"Starting POLICY_SELECTOR_PLAN for plan_id: {payload.plan_id}", **context)
+
+        try:
+            # Use the search provider to get the total count from the configured backend (SQL or Elasticsearch)
+            total_objects = await self.search_provider.get_object_count(payload.policy_config.selection_criteria.definition)
+            self.logger.info(f"Plan '{payload.plan_id}' matched {total_objects} objects.", **context)
+
+            # Create the blueprint for the Pipeliner to fan out the selection tasks.
+            blueprint = {
+                "plan_id": payload.plan_id,
+                "total_objects": total_objects,
+                "selection_batch_size": 10000,  # This should be read from config
+                "query_definition": payload.policy_config.selection_criteria.definition.dict(),
+                "action_definition": payload.policy_config.action_definition.dict()
+            }
+
+            await self._report_task_progress_async(
+                work_packet.header.task_id,
+                TaskOutputRecord(output_type="SELECTION_PLAN_CREATED", output_payload=blueprint)
+            )
+        except Exception as e:
+            self.error_handler.handle_error(e, "policy_selector_plan", **context)
+            raise
+
+    async def _process_policy_selector_execute_async(self, work_packet: WorkPacket):
+        """
+        Executes a paginated query against the search backend and writes the
+        results (a batch of objects) to the RemediationLedger.
+        """
+        payload: PolicySelectorExecutePayload = work_packet.payload
+        context = job_context(work_packet)
+        self.logger.info(f"Starting POLICY_SELECTOR_EXECUTE for plan_id: {payload.plan_id}, offset: {payload.pagination.offset}", **context)
+
+        try:
+            # Use the search provider to get a specific page of results.
+            object_results = await self.search_provider.get_object_page(payload.query, payload.pagination)
+
+            if object_results:
+                # Create a single "bin" for this batch of results.
+                bin_id = f"bin_{payload.pagination.offset}"
+                ledger_bin = {
+                    "plan_id": payload.plan_id,
+                    "bin_id": bin_id,
+                    "ObjectIDs": [res["ObjectID"] for res in object_results],
+                    "ObjectPaths": [res["ObjectPath"] for res in object_results],
+                    "Status": LedgerStatus.PLANNED
+                }
+                # Insert the bin into the ledger in a single bulk operation.
+                await self.db.insert_remediation_ledger_bins([ledger_bin], context=context)
+                self.logger.info(f"Wrote {len(object_results)} objects to ledger bin '{bin_id}'.", **context)
+            else:
+                self.logger.info("Selector task found no objects for its page.", **context)
+
+        except Exception as e:
+            self.error_handler.handle_error(e, "policy_selector_execute", **context)
+            raise
+
+    async def _process_policy_action_plan_async(self, work_packet: WorkPacket):
+        """
+        A lightweight task that runs after selection is complete. It verifies the
+        plan and creates the blueprint for the Pipeliner to fan out action tasks.
+        """
+        payload = work_packet.payload
+        plan_id = payload.get("plan_id")
+        context = job_context(work_packet)
+        self.logger.info(f"Starting POLICY_ACTION_PLAN for plan_id: {plan_id}", **context)
+
+        # This task signals the Pipeliner that the selection phase is 100% complete
+        # and provides the final, verified plan information.
+        action_blueprint = {
+            "plan_id": plan_id,
+            "action_definition": payload.get("action_definition")
+        }
+
+        await self._report_task_progress_async(
+            work_packet.header.task_id,
+            TaskOutputRecord(output_type="ACTION_PLAN_CREATED", output_payload=action_blueprint)
+        )
+
+
+    async def _process_policy_action_execute_async(self, work_packet: WorkPacket):
+        """
+        Executes a final remediation action (Move, Delete, Tag, etc.) for a single
+        "bin" of objects and then creates the output record for the streamlined
+        reconciliation step.
+        """
+        payload: PolicyActionExecutePayload = work_packet.payload
+        context = job_context(work_packet)
+        self.logger.info(f"Starting POLICY_ACTION_EXECUTE for bin: {payload.bin_id}", **context)
+
+        try:
+            # 1. Gracefully handle empty bins of work
+            if not payload.objects_to_process:
+                self.logger.warning(f"Action task for bin '{payload.bin_id}' received no objects to process.", **context)
+                await self.db.update_remediation_ledger_bin_status(
+                    plan_id=payload.plan_id,
+                    bin_id=payload.bin_id,
+                    status=LedgerStatus.ACTION_COMPLETED,
+                    result_details={"message": "Bin was empty, no action taken."}
+                )
+                return
+
+            action = payload.action
+            remediation_result: RemediationResult = None
+
+            # 2. Dispatch to the correct component based on action type (External vs. Internal)
+            if action.action_type in [ActionType.MOVE, ActionType.DELETE, ActionType.ENCRYPT, ActionType.MIP]:
+                # --- EXTERNAL (Connector-Bound) ACTION ---
+                first_object_id = payload.objects_to_process[0].ObjectID
+                datasource_id = first_object_id.split(':')[0]
+                connector = self.connector_factory.get_connector(datasource_id)
+                object_paths = [obj.ObjectPath for obj in payload.objects_to_process]
+                
+                if action.action_type == ActionType.MOVE:
+                    remediation_result = await connector.move_objects(object_paths, action.destination_directory, action.tombstone_config, context)
+                elif action.action_type == ActionType.DELETE:
+                    remediation_result = await connector.delete_objects(object_paths, action.tombstone_config, context)
+                else:
+                    raise NotImplementedError(f"External action '{action.action_type}' not implemented in worker.")
+
+            elif action.action_type == ActionType.TAG:
+                # --- INTERNAL (Database-Bound) ACTION ---
+                object_key_hashes = [hashlib.sha256(obj.ObjectID.encode()).digest() for obj in payload.objects_to_process]
+                tag_action_details = {
+                    "action_type": "TAG", "tags_added": action.tags_to_add,
+                    "timestamp": datetime.now(timezone.utc).isoformat(), "job_id": work_packet.header.job_id
+                }
+                await self.db.add_enrichment_action_to_catalog(object_key_hashes, tag_action_details, context)
+                
+                # Since the DB call is atomic, we assume full success if no exception was raised.
+                remediation_result = RemediationResult(
+                    succeeded_paths=[obj.ObjectPath for obj in payload.objects_to_process],
+                    failed_paths=[], success_count=len(payload.objects_to_process), failure_count=0
+                )
+            else:
+                raise NotImplementedError(f"Action type '{action.action_type}' not implemented.")
+
+            # 3. Update the RemediationLedger with the detailed outcome (the audit log)
+            final_status = LedgerStatus.ACTION_COMPLETED if remediation_result.failure_count == 0 else LedgerStatus.ACTION_FAILED
+            await self.db.update_remediation_ledger_bin_status(
+                plan_id=payload.plan_id, bin_id=payload.bin_id,
+                status=final_status, result_details=remediation_result.dict()
+            )
+            self.logger.info(f"Updated ledger for bin '{payload.bin_id}'. Success: {remediation_result.success_count}, Failed: {remediation_result.failure_count}", **context)
+
+            # 4. Create the TaskOutputRecord to trigger the streamlined reconciliation
+            updates_for_catalog = []
+            if remediation_result.succeeded_paths:
+                for path in remediation_result.succeeded_paths:
+                    # This helper would generate the consistent hash from the object's core identity
+                    object_key_hash = hashlib.sha256(f"{datasource_id}|{path}".encode()).digest()
+                    update = {"ObjectKeyHash": object_key_hash}
+                    if action.action_type == ActionType.MOVE:
+                        update["MovedPath"] = f"{action.destination_directory}/{path.split('/')[-1]}"
+                    elif action.action_type == ActionType.DELETE:
+                        update["IsAvailable"] = False
+                        update["RemovedDate"] = datetime.now(timezone.utc)
+                    # Note: TAG actions don't need reconciliation as they modify the master record directly.
+                    if action.action_type != ActionType.TAG:
+                        updates_for_catalog.append(update)
+            
+            if updates_for_catalog:
+                await self._report_task_progress_async(
+                    work_packet.header.task_id,
+                    TaskOutputRecord(
+                        output_type="METADATA_RECONCILE_UPDATES",
+                        output_payload={"updates": updates_for_catalog}
+                    )
+                )
+
+        except Exception as e:
+            # If the entire task fails unexpectedly, mark the whole bin as FAILED in the ledger.
+            error = self.error_handler.handle_error(e, "policy_action_execute", **context)
+            await self.db.update_remediation_ledger_bin_status(
+                plan_id=payload.plan_id, bin_id=payload.bin_id,
+                status=LedgerStatus.ACTION_FAILED,
+                result_details={"error": f"Task-level failure: {str(e)}", "error_id": error.error_id}
+            )
+            raise # Re-raise the exception to fail the task in the Orchestrator
+
+
+
+    async def _process_policy_commit_plan_async(self, work_packet: WorkPacket):
+        """
+        A lightweight task that runs after selection is complete. It verifies the
+        plan in the ledger and creates the blueprint for the Pipeliner to fan out
+        the action tasks.
+        """
+        payload: PolicyCommitPlanPayload = work_packet.payload
+        context = job_context(work_packet)
+        self.logger.info(f"Starting POLICY_COMMIT_PLAN for plan_id: {payload.plan_id}", **context)
+
+        try:
+            # This task acts as a gatekeeper. It performs a final validation on the ledger.
+            # For example, ensuring no bins failed during the selection write phase.
+            # Note: We query for FAILED status, which shouldn't happen, but is a safety check.
+            failed_bins = await self.db.get_ledger_bins_by_status(payload.plan_id, LedgerStatus.ACTION_FAILED)
+            if failed_bins:
+                raise RuntimeError(f"Cannot commit plan {payload.plan_id}; {len(failed_bins)} bins failed during creation.")
+
+            # The blueprint tells the Pipeliner to proceed with the action phase.
+            action_blueprint = {
+                "plan_id": payload.plan_id,
+                "action_definition": payload.action_definition.dict()
+            }
+
+            await self._report_task_progress_async(
+                work_packet.header.task_id,
+                TaskOutputRecord(output_type="ACTION_PLAN_CREATED", output_payload=action_blueprint)
+            )
+            self.logger.info(f"Successfully committed plan '{payload.plan_id}' for action phase.", **context)
+        except Exception as e:
+            self.error_handler.handle_error(e, "policy_commit_plan", **context)
+            raise
+
+# In file: src/worker/worker.py
+
+    async def _process_policy_reconcile_async(self, work_packet: WorkPacket):
+        """
+        The final step in a policy workflow. Takes a pre-packaged list of updates
+        from a completed action task and writes them to the master data catalog.
+        """
+        payload: PolicyReconcilePayload = work_packet.payload
+        context = job_context(work_packet)
+        self.logger.info(f"Starting POLICY_RECONCILE for plan_id: {payload.plan_id}", **context)
+
+        try:
+            # The worker receives the exact list of updates needed. It does not
+            # need to query the ledger or perform any complex logic.
+            updates_for_catalog = payload.updates
+
+            if not updates_for_catalog:
+                self.logger.warning(f"Reconciliation task received no updates to process for plan '{payload.plan_id}'.", **context)
+                return
+
+            # 1. Call the database interface method to perform the bulk update on the
+            #    primary data store (DynamoDB or SQL).
+            await self.db.reconcile_remediation_updates(
+                updates=updates_for_catalog,
+                context=context
+            )
+
+            self.logger.info(f"Reconciliation for plan '{payload.plan_id}' completed successfully. "
+                           f"Applied {len(updates_for_catalog)} updates to the master catalog.", **context)
+
+        except Exception as e:
+            # If the database update fails, the task will fail and can be retried.
+            self.error_handler.handle_error(e, "policy_reconcile", **context)
+            raise
+
+
 
     async def is_healthy(self) -> bool:
         """Check if worker is healthy and ready to process tasks."""
@@ -250,6 +534,17 @@ class Worker:
                 await self._process_classification_async(work_packet)
             elif work_packet.payload.task_type == TaskType.DELTA_CALCULATE:
                 await self._process_delta_calculate_async(work_packet)
+            elif task_type == TaskType.POLICY_SELECTOR_PLAN:
+                await self._process_policy_selector_plan_async(work_packet)
+            elif task_type == TaskType.POLICY_SELECTOR_EXECUTE:
+                await self._process_policy_selector_execute_async(work_packet)
+            elif task_type == TaskType.POLICY_ACTION_PLAN: # Assuming this new task type is added
+                await self._process_policy_action_plan_async(work_packet)
+            elif task_type == TaskType.POLICY_ACTION_EXECUTE:
+                await self._process_policy_action_execute_async(work_packet)
+
+
+
             else:
                 raise ValueError(f"Unknown task type: {work_packet.payload.task_type}")
                 

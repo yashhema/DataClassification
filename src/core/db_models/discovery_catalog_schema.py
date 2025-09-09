@@ -57,6 +57,56 @@ class DiscoveredObject(Base):
 
 class ObjectMetadata(Base):
     __tablename__ = 'ObjectMetadata'
+    __table_args__ = (
+        Index('ix_objectmetadata_datasource_id', 'DataSourceID'),
+        Index('ix_objectmetadata_filename', 'FileName'),
+        
+        # NEW: Added indexes for commonly queried date fields
+        Index('ix_objectmetadata_last_modified', 'LastModified'),
+        Index('ix_objectmetadata_last_accessed', 'LastAccessed'),
+        Index('ix_objectmetadata_last_scanned', 'LastScannedDate'),
+
+        {'extend_existing': True}
+    )
+    __doc__ = """
+    Stores the primary, long-term master record for a discovered object,
+    including its key queryable properties, detailed metadata, and action history.
+    """
+    
+    # The primary key remains the fixed-length hash of the object's identity.
+    ObjectKeyHash: Mapped[bytes] = mapped_column(LargeBinary(32), primary_key=True)
+
+    # --- Core Identity Fields (Promoted for Querying) ---
+    DataSourceID: Mapped[str] = mapped_column(String(255), nullable=False)
+    ObjectPath: Mapped[str] = mapped_column(Text, nullable=False)
+    
+    SchemaName: Mapped[Optional[str]] = mapped_column(String(255))
+    TableName: Mapped[Optional[str]] = mapped_column(String(255))
+    FieldName: Mapped[Optional[str]] = mapped_column(String(255))
+    FileName: Mapped[Optional[str]] = mapped_column(String(255))
+
+    # --- Basic Metadata (Promoted for Querying) ---
+    SizeBytes: Mapped[Optional[int]] = mapped_column(Integer)
+    CreatedDate: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    LastModified: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    LastAccessed: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # --- System State and Remediation Tracking Fields ---
+    LastScannedDate: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    RemovedDate: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    TombstoneFileName: Mapped[Optional[str]] = mapped_column(String(255))
+    MovedPath: Mapped[Optional[str]] = mapped_column(Text)
+    IsAvailable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    IsEncrypted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    
+    # --- Flexible/Detailed Data Fields ---
+    DetailedMetadata: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
+    ActionHistory: Mapped[List[Dict[str, Any]]] = mapped_column(
+        JSON,
+        nullable=False,
+        server_default="[]"
+    )
+    __tablename__ = 'ObjectMetadata'
     __doc__ = """
     Stores the detailed, rich metadata for a discovered object, fetched during
     the second phase of discovery. This table has a one-to-one relationship

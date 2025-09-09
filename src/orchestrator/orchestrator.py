@@ -495,40 +495,43 @@ class Orchestrator:
     # Public Methods for Job Control (API/CLI) - All Async
     # =================================================================
 
-    async def start_job_from_template(self, template_id: str, trigger_type: str = "manual") -> Optional[int]:
-        """Creates and starts a job from a scan template."""
+
+    async def start_job_from_template(self, template_id: str, job_type: JobType, trigger_type: str = "manual") -> Optional[int]:
+        """
+        Creates and starts a job from either a ScanTemplate or a PolicyTemplate.
+        """
         try:
-            self.logger.info(f"Attempting to start job from template '{template_id}'", template_id=template_id)
+            self.logger.info(f"Attempting to start job from template '{template_id}'", template_id=template_id, job_type=job_type.value)
             
-            template = await self.db.get_scan_template_by_id(template_id)
+            # UPDATED: Fetch the correct template type based on the job_type
+            template = None
+            if job_type == JobType.SCANNING:
+                template = await self.db.get_scan_template_by_id(template_id)
+            elif job_type == JobType.POLICY:
+                template = await self.db.get_policy_template_by_id(template_id)
+
             if not template:
-                self.logger.error(f"Scan template '{template_id}' not found", template_id=template_id)
+                self.logger.error(f"Template '{template_id}' of type '{job_type.value}' not found", template_id=template_id)
                 return None
 
-            # Create job execution
+            # Create job execution using the updated, polymorphic database method
             execution_id = f"run-{template_id}-{int(time.time())}"
-            job = await self.db.create_job_execution(template.id, execution_id, trigger_type)
+            job = await self.db.create_job_execution(template_id, job_type, execution_id, trigger_type)
             
-            # Validate and transition to RUNNING state (with async lock)
-            initial_state = JobState.QUEUED
-            target_state = JobState.RUNNING
-            
+            # Validate and transition to RUNNING state
             async with self._state_lock:
-                if not self._validate_state_transition(job.id, initial_state, target_state):
-                    self.logger.error(f"Cannot start job {job.id} - invalid state transition")
-                    return None
-                self.job_states[job.id] = target_state
+                self.job_states[job.id] = JobState.RUNNING
             
-            # Database update
-            if not await self._safe_update_job_status(job.id, target_state):
+            if not await self._safe_update_job_status(job.id, JobState.RUNNING):
                 async with self._state_lock:
-                    self.job_states[job.id] = initial_state  # Rollback
+                    self.job_states[job.id] = JobState.QUEUED  # Rollback state
                 return None
             
-            # Create initial tasks
+            # NEW LOGIC: Create different initial tasks based on the job type
             task_count = 0
-            for target in template.configuration.get("datasource_targets", []):
-                try:
+            if job_type == JobType.SCANNING:
+                # This is the original logic for scanning jobs
+                for target in template.configuration.get("datasource_targets", []):
                     await self.db.create_task(
                         job_id=job.id,
                         task_type="DISCOVERY_ENUMERATE",
@@ -536,15 +539,26 @@ class Orchestrator:
                         datasource_id=target.get("datasource_id")
                     )
                     task_count += 1
-                except Exception as task_error:
-                    self.logger.warning(
-                        f"Failed to create task for datasource {target.get('datasource_id')}",
-                        error=str(task_error),
-                        job_id=job.id
-                    )
             
+            elif job_type == JobType.POLICY:
+                # This is the new logic for the first step of a policy job
+                plan_id = f"plan_for_job_{job.id}"
+                policy_config = PolicyConfiguration(**template.configuration)
+
+                payload = PolicySelectorPlanPayload(
+                    plan_id=plan_id,
+                    policy_config=policy_config
+                )
+                
+                await self.db.create_task(
+                    job_id=job.id,
+                    task_type=TaskType.POLICY_SELECTOR_PLAN,
+                    work_packet={"payload": payload.dict()}
+                )
+                task_count = 1
+
             if task_count == 0:
-                self.logger.error(f"No tasks created for job {job.id} - marking as failed")
+                self.logger.error(f"No initial tasks were created for job {job.id}. Marking as failed.", job_id=job.id)
                 await self.finalize_job_state_async(job.id, JobState.FAILED)
                 return None
             
@@ -564,6 +578,8 @@ class Orchestrator:
             )
             self.logger.error("Failed to start job from template", error_id=error.error_id)
             return None
+
+
 
     async def finalize_job_state_async(self, job_id: int, final_state: JobState):
         """Finalizes a job's state and cleans up all associated resources."""

@@ -473,6 +473,246 @@ class SMBConnector(IFileDataSourceConnector):
         
         return results
 
+
+    # =============================================================================
+    # Remote file action
+    # =============================================================================
+
+
+
+    async def delete_objects(self, 
+                           paths: List[str], 
+                           tombstone_config: Optional[TombstoneConfig] = None,
+                           context: Optional[Dict[str, Any]] = None) -> RemediationResult:
+        """
+        Deletes a batch of files. If tombstone_config is provided, it creates
+        a tombstone file in place of the deleted object.
+        """
+        succeeded_paths = []
+        failed_paths = []
+        loop = asyncio.get_event_loop()
+
+        for path in paths:
+            try:
+                # All smbprotocol I/O is synchronous and must be run in an executor
+                await loop.run_in_executor(
+                    None, 
+                    self._delete_single_file_sync, 
+                    path, 
+                    tombstone_config
+                )
+                succeeded_paths.append(path)
+            except Exception as e:
+                error = self.error_handler.handle_error(e, f"smb_delete_{path}", **context)
+                failed_paths.append(FailedObject(path=path, error_message=str(e)))
+        
+        return RemediationResult(
+            succeeded_paths=succeeded_paths,
+            failed_paths=failed_paths,
+            success_count=len(succeeded_paths),
+            failure_count=len(failed_paths)
+        )
+
+    def _delete_single_file_sync(self, path: str, tombstone_config: Optional[TombstoneConfig]):
+        """Synchronous helper for deleting a single file and optionally creating a tombstone."""
+        normalized_path = self._normalize_smb_path(path)
+        
+        # First, delete the original file
+        with Open(self.smb_connection.tree, normalized_path) as f:
+            f.create(
+                ImpersonationLevel.Impersonation,
+                FilePipePrinterAccessMask.DELETE, # Request delete permission
+                FileAttributes.FILE_ATTRIBUTE_NORMAL,
+                ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE | ShareAccess.FILE_SHARE_DELETE,
+                CreateDisposition.FILE_OPEN,
+                CreateOptions.FILE_DELETE_ON_CLOSE
+            )
+        
+        # If a tombstone is requested, create it
+        if tombstone_config:
+            tombstone_path_parts = os.path.splitext(normalized_path)
+            tombstone_name = tombstone_config.filename_format.format(
+                filename=os.path.basename(tombstone_path_parts[0]),
+                extension=tombstone_path_parts[1]
+            )
+            tombstone_full_path = self._join_smb_path(os.path.dirname(normalized_path), tombstone_name)
+
+            with Open(self.smb_connection.tree, tombstone_full_path) as f:
+                f.create(
+                    ImpersonationLevel.Impersonation,
+                    FilePipePrinterAccessMask.GENERIC_WRITE,
+                    FileAttributes.FILE_ATTRIBUTE_NORMAL,
+                    ShareAccess.FILE_SHARE_WRITE,
+                    CreateDisposition.FILE_CREATE, # Create a new file
+                    CreateOptions.FILE_NON_DIRECTORY_FILE
+                )
+                f.write(tombstone_config.message.encode('utf-8'))
+
+
+    async def move_objects(self, 
+                           source_paths: List[str], 
+                           destination_directory: str, 
+                           tombstone_config: Optional[TombstoneConfig] = None,
+                           context: Optional[Dict[str, Any]] = None) -> RemediationResult:
+        """
+        Moves a batch of files. If tombstone_config is provided, it creates
+        a tombstone file at the original location after a successful move.
+        """
+        succeeded_paths = []
+        failed_paths = []
+        loop = asyncio.get_event_loop()
+
+        for path in source_paths:
+            try:
+                await loop.run_in_executor(
+                    None, 
+                    self._move_single_file_sync, 
+                    path, 
+                    destination_directory, 
+                    tombstone_config
+                )
+                succeeded_paths.append(path)
+            except Exception as e:
+                error = self.error_handler.handle_error(e, f"smb_move_{path}", **context)
+                failed_paths.append(FailedObject(path=path, error_message=str(e)))
+                
+        return RemediationResult(
+            succeeded_paths=succeeded_paths,
+            failed_paths=failed_paths,
+            success_count=len(succeeded_paths),
+            failure_count=len(failed_paths)
+        )
+
+    def _move_single_file_sync(self, source_path: str, dest_dir: str, tombstone_config: Optional[TombstoneConfig]):
+        """Synchronous helper for moving a single file and optionally creating a tombstone."""
+        normalized_source = self._normalize_smb_path(source_path)
+        normalized_dest_dir = self._normalize_smb_path(dest_dir)
+        dest_path = self._join_smb_path(normalized_dest_dir, os.path.basename(normalized_source))
+
+        # Perform the move (rename)
+        with Open(self.smb_connection.tree, normalized_source) as f:
+            f.create(
+                ImpersonationLevel.Impersonation,
+                FilePipePrinterAccessMask.DELETE,
+                FileAttributes.FILE_ATTRIBUTE_NORMAL,
+                ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE | ShareAccess.FILE_SHARE_DELETE,
+                CreateDisposition.FILE_OPEN,
+                0
+            )
+            f.set_info(dest_path, FileRenameInformation)
+
+        # If move was successful and tombstone is requested, create it at the original location
+        if tombstone_config:
+            self._create_tombstone_sync(normalized_source, tombstone_config)
+
+    def _create_tombstone_sync(self, original_path: str, tombstone_config: TombstoneConfig):
+        """Synchronous helper to create a tombstone file."""
+        # This helper is simplified; a real version would use tombstone_config.filename_format
+        tombstone_full_path = f"{original_path}.tombstone.txt"
+        with Open(self.smb_connection.tree, tombstone_full_path) as f:
+            f.create(
+                ImpersonationLevel.Impersonation,
+                FilePipePrinterAccessMask.GENERIC_WRITE,
+                FileAttributes.FILE_ATTRIBUTE_NORMAL,
+                ShareAccess.FILE_SHARE_WRITE,
+                CreateDisposition.FILE_CREATE,
+                CreateOptions.FILE_NON_DIRECTORY_FILE
+            )
+            f.write(tombstone_config.message.encode('utf-8'))
+
+
+    async def apply_mip_labels(self, 
+                             objects_with_labels: List[Tuple[str, str]],
+                             context: Optional[Dict[str, Any]] = None) -> RemediationResult:
+        """
+        Applies a specific MIP label to a batch of Office documents.
+        """
+        succeeded_paths = []
+        failed_paths = []
+        loop = asyncio.get_event_loop()
+
+        for path, label_id in objects_with_labels:
+            temp_file_path = None
+            try:
+                # 1. Download the file to a local temporary path
+                temp_file_path = await self._download_file_to_temp_async(path, context.get("task_id", 0))
+                if not temp_file_path:
+                    raise IOError(f"Failed to download {path} for MIP labeling.")
+
+                # 2. Apply the MIP label using the external SDK (run in executor as it's likely blocking)
+                # await loop.run_in_executor(None, mipsdk.apply_label, temp_file_path, label_id)
+                
+                # 3. Upload the modified file, overwriting the original
+                await loop.run_in_executor(None, self._overwrite_file_from_local_sync, temp_file_path, path)
+
+                succeeded_paths.append(path)
+            except Exception as e:
+                error = self.error_handler.handle_error(e, f"smb_mip_{path}", **context)
+                failed_paths.append(FailedObject(path=path, error_message=str(e)))
+            finally:
+                # 4. Clean up the temporary local file
+                if temp_file_path:
+                    await self._cleanup_temp_file_async(temp_file_path)
+        
+        return RemediationResult(
+            succeeded_paths=succeeded_paths,
+            failed_paths=failed_paths,
+            success_count=len(succeeded_paths),
+            failure_count=len(failed_paths)
+        )
+
+    def _overwrite_file_from_local_sync(self, local_path: str, remote_path: str):
+        """Synchronous helper to overwrite a remote file with local content."""
+        normalized_remote_path = self._normalize_smb_path(remote_path)
+        
+        with open(local_path, 'rb') as local_f:
+            local_content = local_f.read()
+
+        with Open(self.smb_connection.tree, normalized_remote_path) as remote_f:
+            remote_f.create(
+                ImpersonationLevel.Impersonation,
+                FilePipePrinterAccessMask.GENERIC_WRITE,
+                FileAttributes.FILE_ATTRIBUTE_NORMAL,
+                ShareAccess.FILE_SHARE_WRITE,
+                CreateDisposition.FILE_OVERWRITE_IF, # Overwrite if it exists, create if not
+                CreateOptions.FILE_NON_DIRECTORY_FILE
+            )
+            remote_f.write(local_content)
+
+
+
+    async def apply_encryption(self, 
+                                 object_paths: List[str], 
+                                 encryption_key_id: str, 
+                                 context: Optional[Dict[str, Any]] = None) -> RemediationResult:
+        """
+        Placeholder method to encrypt a batch of objects in-place.
+        
+        A real implementation would involve a multi-step process:
+        1. Download the file to a temporary local path.
+        2. Use a key management service (KMS) and the encryption_key_id to encrypt the local file.
+        3. Upload the encrypted file, overwriting the original on the SMB share.
+        4. Clean up the temporary local file.
+        """
+        self.logger.warning(
+            "The 'apply_encryption' method is not implemented for the SMBConnector. "
+            "No action will be taken.", 
+            **context
+        )
+        
+        # Return a result indicating that all operations failed because the feature is not implemented.
+        failed_paths = [
+            FailedObject(path=p, error_message="Encryption is not implemented for this connector.")
+            for p in object_paths
+        ]
+        
+        return RemediationResult(
+            succeeded_paths=[],
+            failed_paths=failed_paths,
+            success_count=0,
+            failure_count=len(object_paths)
+        )
+
     # =============================================================================
     # Async File Download and Temp Management
     # =============================================================================

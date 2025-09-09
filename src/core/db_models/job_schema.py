@@ -2,6 +2,9 @@
 """
 Defines the database schema for Scan Templates (Job Definitions) and Jobs
 (Job Executions) using the SQLAlchemy ORM.
+
+UPDATED: This version introduces a formal JobType enum to distinguish
+between different kinds of jobs, like standard scanning and policy execution.
 """
 
 import enum
@@ -14,6 +17,13 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base
+
+# NEW: Formal enum for the different types of jobs the system can run.
+class JobType(str, enum.Enum):
+    """Defines the overall goal or workflow of a job."""
+    SCANNING = "SCANNING"  # A standard discovery and classification job.
+    POLICY = "POLICY"      # A job that executes a data governance policy (selects and acts).
+
 
 class JobStatus(str, enum.Enum):
     QUEUED = "QUEUED"
@@ -31,6 +41,18 @@ class TaskStatus(str, enum.Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+class PolicyTemplate(Base):
+    __tablename__ = 'policy_templates'
+    __doc__ = "Defines a data governance policy, including selection criteria and the action to be performed."
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    template_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, comment="The unique string identifier for the policy.")
+    name: Mapped[str] = mapped_column(String(255), nullable=False, comment="A human-readable name for the policy.")
+    description: Mapped[Optional[str]] = mapped_column(String(1024))
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    
+    # This JSON blob will store the detailed, strongly-typed PolicyConfiguration model.
+    configuration: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
 
 class ScanTemplate(Base):
     __tablename__ = 'scan_templates'
@@ -38,37 +60,37 @@ class ScanTemplate(Base):
     __doc__ = "Stores the definition of a job."
     
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    template_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, comment="The unique string identifier for the scan template.")
-    name: Mapped[str] = mapped_column(String(255), nullable=False, comment="A human-readable name for the scan template.")
-    description: Mapped[Optional[str]] = mapped_column(String(1024), comment="A brief description of the job's purpose.")
-    job_type: Mapped[str] = mapped_column(String(50), nullable=False, comment="The type of job (e.g., 'scanning').")
+    template_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(String(1024))
     
-    # NEWLY ADDED: Defines the priority for jobs created from this template.
-    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100, comment="Default priority for jobs (lower number is higher priority).")
+    # UPDATED: The job_type is now a strongly-typed enum.
+    job_type: Mapped[JobType] = mapped_column(SQLAlchemyEnum(JobType), nullable=False, default=JobType.SCANNING)
     
-    classifier_template_id: Mapped[str] = mapped_column(String(255), nullable=False, comment="The ID of the classifier template to use.")
-    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, comment="Whether this job definition is active.")
-    configuration: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, comment="JSON object containing all detailed configurations like datasource_targets, schedule, etc.")
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    classifier_template_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    configuration: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
     jobs: Mapped[List["Job"]] = relationship(back_populates="scan_template")
 
 class Job(Base):
     __tablename__ = 'jobs'
     __table_args__ = {'extend_existing': True}
-    __doc__ = "Stores a record for a single execution (a run) of a ScanTemplate."
+    __doc__ = "Stores a record for a single execution (a run) of any type of template."
     
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    execution_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, comment="The unique identifier for this specific job run.")
-    scan_template_id: Mapped[int] = mapped_column(ForeignKey('scan_templates.id'), nullable=False, comment="The ID of the ScanTemplate this job is an instance of.")
+    execution_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     
-    # NEWLY ADDED: Stores the priority for this specific job execution.
-    Priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100, index=True, comment="Job priority for this run (lower number is higher priority).")
-
+    # UPDATED: The Job table now uses a polymorphic relationship to point to a template.
+    template_table_id: Mapped[int] = mapped_column(Integer, nullable=False, comment="The primary key ID of the template (from either scan_templates or policy_templates).")
+    template_type: Mapped[JobType] = mapped_column(SQLAlchemyEnum(JobType), nullable=False, comment="The type of template this job is an instance of, indicating which table to join with.")
+    
+    Priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100, index=True)
     status: Mapped[JobStatus] = mapped_column(SQLAlchemyEnum(JobStatus), nullable=False, default=JobStatus.QUEUED, index=True)
-    trigger_type: Mapped[str] = mapped_column(String(50), nullable=False, comment="How the job was started (e.g., 'manual', 'scheduled').")
+    trigger_type: Mapped[str] = mapped_column(String(50), nullable=False)
     created_timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
     completed_timestamp: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    scan_template: Mapped["ScanTemplate"] = relationship(back_populates="jobs")
-    tasks: Mapped[List["Task"]] = relationship(back_populates="job")
+    tasks: Mapped[List["Task"]] = relationship()
 
 class Task(Base):
     __tablename__ = 'Tasks'
@@ -77,6 +99,7 @@ class Task(Base):
         Index('IX_Tasks_LeaseExpiry', 'LeaseExpiry'),
         Index('IX_Tasks_WorkerID_Status', 'WorkerID', 'Status'),
         Index('IX_Tasks_DatasourceID_Status', 'DatasourceID', 'Status'),
+        {'extend_existing': True}
     )
     __doc__ = "The central work queue. Contains every atomic unit of work for all jobs."
 
@@ -96,6 +119,7 @@ class TaskOutputRecord(Base):
     __tablename__ = 'TaskOutputRecords'
     __table_args__ = (
         Index('IX_TaskOutputRecords_Status_TaskID', 'Status', 'TaskID'),
+        {'extend_existing': True}
     )
     __doc__ = "A lightweight communication table for job pipelining."
     

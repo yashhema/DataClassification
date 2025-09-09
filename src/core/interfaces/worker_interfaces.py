@@ -1,102 +1,116 @@
 # src/core/interfaces/worker_interfaces.py
 """
-Defines the abstract interface that all data source connectors must implement.
-A Worker uses this interface to interact with different data sources in a
-consistent way, abstracting the protocol-specific logic.
-
-UPDATED: Converted to full async interface with AsyncIterator support.
+Defines the abstract interfaces that all data source connectors must implement.
+This includes interfaces for discovery, classification, and post-scan remediation actions.
 """
 
 from abc import ABC, abstractmethod
-from typing import List, AsyncIterator # UPDATED: Changed Iterator to AsyncIterator
+from typing import List, AsyncIterator, Optional, Dict, Any
 
 # Import the strongly-typed Pydantic models
-from core.models.models import DiscoveredObject, ObjectMetadata
+from core.models.models import DiscoveredObject, ObjectMetadata, RemediationResult
 from core.models.models import WorkPacket, PIIFinding, ContentComponent 
-
+from core.models.models import RemediationResult, TombstoneConfig
 class IDatabaseDataSourceConnector(ABC):
     """
-    Interface for data source connectors. The Worker instantiates a concrete
-    implementation of this class (e.g., SQLServerConnector, S3Connector)
-    based on the datasource_id in the WorkPacket.
+    Interface for data source connectors that interact with structured databases.
     """
 
     @abstractmethod
-    async def enumerate_objects(self, work_packet: WorkPacket) -> AsyncIterator[List[DiscoveredObject]]: # UPDATED: async def and AsyncIterator
-        """
-        Performs a fast, streaming enumeration of objects from the source.
+    async def enumerate_objects(self, work_packet: WorkPacket) -> AsyncIterator[List[DiscoveredObject]]:
+        """Performs a fast, streaming enumeration of objects from the source."""
+        pass
 
-        - Input: The full, strongly-typed WorkPacket for a DISCOVERY_ENUMERATE task.
-        - Intermediate Output: This method MUST be an async generator. It yields batches
-          (lists) of DiscoveredObject records. The Worker is responsible for writing
-          these batches to the staging table and reporting progress.
-        - Final Output: After the generator is exhausted, it should return a dictionary
-          containing a list of any new sub-task definitions (e.g., for sub-directories).
-        - Logging Fields: The connector should log the paths/queries it is using, along
-          with the common context fields from the work_packet.header.
-        - Error Handling: Must raise specific, catchable exceptions from the errors.py
-          hierarchy (e.g., NetworkError for connection issues, RightsError for
-          permission denied).
+    @abstractmethod
+    async def get_object_details(self, work_packet: WorkPacket) -> List[ObjectMetadata]:
+        """Fetches rich, detailed metadata for a batch of objects."""
+        pass
+
+    @abstractmethod
+    async def get_object_content(self, work_packet: WorkPacket) -> AsyncIterator[dict]:
+        """Retrieves the actual content of an object for classification."""
+        pass
+
+class IRemediationConnector(ABC):
+    """
+    Interface for connectors that support post-scan remediation actions.
+    All methods are designed to operate on batches of objects for performance.
+    """
+
+    @abstractmethod
+    async def move_objects(self, 
+                           source_paths: List[str], 
+                           destination_directory: str, 
+                           tombstone_config: Optional[TombstoneConfig] = None,
+                           context: Dict[str, Any]) -> RemediationResult:
+        """
+        Moves a batch of objects. If tombstone_config is provided, it must create
+        a tombstone file at the original location after a successful move.
         """
         pass
 
     @abstractmethod
-    async def get_object_details(self, work_packet: WorkPacket) -> List[ObjectMetadata]: # UPDATED: async def
+    async def delete_objects(self, 
+                           paths: List[str], 
+                           tombstone_config: Optional[TombstoneConfig] = None,
+                           context: Dict[str, Any]) -> RemediationResult:
         """
-        Fetches rich, detailed metadata for a batch of objects.
-
-        - Input: The full WorkPacket for a DISCOVERY_GET_DETAILS task.
-        - Intermediate Output: None. This is treated as an atomic operation for the batch.
-        - Final Output: Returns a list of fully populated ObjectMetadata objects. The
-          Worker is responsible for writing these directly to the main ObjectMetadata table.
-        - Logging Fields: Logs the count of object_ids being processed and which types
-          of metadata are being fetched based on the config.
-        - Error Handling: Must handle errors on a per-object basis, logging failures
-          but continuing to process the rest of the batch if possible. Returns a partial
-          list of successes.
+        Deletes a batch of objects. If tombstone_config is provided, it must create
+        a tombstone file in place of the deleted object.
         """
         pass
 
     @abstractmethod
-    async def get_object_content(self, work_packet: WorkPacket) -> AsyncIterator[dict]: # UPDATED: async def and AsyncIterator
+    async def tag_objects(self, 
+                        objects_with_tags: List[Tuple[str, List[str]]],
+                        context: Dict[str, Any]) -> RemediationResult:
         """
-        Retrieves the actual content of an object for classification.
+        Applies metadata tags to a batch of objects.
+        Args:
+            objects_with_tags: A list of tuples, where each tuple contains an
+                               object_path and a list of tags to apply.
+        """
+        pass
 
-        - Input: The full WorkPacket for a CLASSIFICATION task.
-        - Intermediate Output: This method MUST be an async generator. It yields a dictionary
-          for each object containing its 'object_id' and its 'content' (as a string or bytes).
-          This allows the Worker to stream content for classification without loading
-          everything into memory at once. For database tables, it would yield batches of rows.
-        - Final Output: None. The generator is simply exhausted.
-        - Logging Fields: Logs the object_id being read and any sampling method being used.
-        - Error Handling: Must raise specific exceptions for corrupted or unreadable data.
+    @abstractmethod
+    async def apply_encryption(self, 
+                              object_paths: List[str], 
+                              encryption_key_id: str, 
+                              context: Dict[str, Any]) -> RemediationResult:
+        """
+        Placeholder method to encrypt a batch of objects in-place.
+        """
+        pass
+
+    @abstractmethod
+    async def apply_mip_labels(self, 
+                             objects_with_labels: List[Tuple[str, str]],
+                             context: Dict[str, Any]) -> RemediationResult:
+        """
+        Placeholder method to apply a specific MIP label to a batch of objects.
+        Args:
+            objects_with_labels: A list of tuples, where each tuple contains an
+                                 object_path and the specific MIP Label ID to apply.
         """
         pass
 
 
-# Add new interface for file-based connectors
-class IFileDataSourceConnector(ABC):
+# UPDATED: IFileDataSourceConnector now inherits from IRemediationConnector
+class IFileDataSourceConnector(ABC, IRemediationConnector):
     """Interface for file-based datasource connectors (SMB, S3, Azure Blob, etc.)"""
     
     @abstractmethod
-    async def enumerate_objects(self, work_packet: WorkPacket) -> AsyncIterator[List[DiscoveredObject]]: # UPDATED: async def and AsyncIterator
+    async def enumerate_objects(self, work_packet: WorkPacket) -> AsyncIterator[List[DiscoveredObject]]:
         pass
     
     @abstractmethod  
-    async def get_object_details(self, work_packet: WorkPacket) -> List[ObjectMetadata]: # UPDATED: async def
+    async def get_object_details(self, work_packet: WorkPacket) -> List[ObjectMetadata]:
         pass
     
     @abstractmethod
-    async def get_object_content(self, work_packet: WorkPacket) -> AsyncIterator[ContentComponent]: # UPDATED: async def and AsyncIterator
+    async def get_object_content(self, work_packet: WorkPacket) -> AsyncIterator[ContentComponent]:
         """
         Retrieves and extracts content components from files for classification.
-
-        - Input: The full WorkPacket for a CLASSIFICATION task.
-        - Intermediate Output: This method MUST be an async generator. It yields ContentComponent
-          objects representing extracted components (text, tables, images, archive members).
-          This allows memory-safe streaming of complex file content.
-        - Final Output: None. The generator is simply exhausted.
-        - Logging Fields: Logs the object_id being processed and extraction methods used.
-        - Error Handling: Should yield error components for failed extractions but continue processing.
         """
         pass
+

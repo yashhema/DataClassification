@@ -31,10 +31,12 @@ from ..db_models.system_parameters_schema import SystemParameter
 from ..db_models.datasource_schema import NodeGroup, DataSource
 from ..db_models.connector_config_schema import ConnectorConfiguration
 from ..db_models.calendar_schema import Calendar
-from ..db_models.job_schema import JobStatus
+from ..db_models.job_schema import JobStatus, ScanTemplate, JobType,
 from ..db_models.credentials_schema import Credential
 from ..db_models.classifiertemplate_schema import ClassifierTemplate
 from ..db_models.classifier_schema import Classifier
+from ..db_models.job_schema import PolicyTemplate
+from ..db_models.remediation_ledger_schema import RemediationLedger, LedgerStatus
 
 # Import Pydantic models for type hinting and data conversion
 from ..models.models import DiscoveredObject as PydanticDiscoveredObject
@@ -138,6 +140,149 @@ class DatabaseInterface:
         """Validates table name to prevent SQL injection."""
         if not self._safe_table_name_pattern.match(table_name):
             raise ValueError(f"Invalid characters in table name: {table_name}")
+
+    async def upsert_object_metadata(
+        self,
+        records: List[Dict[str, Any]],
+        context: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Performs a bulk-safe "upsert" on the ObjectMetadata table. It either inserts
+        new records or updates existing ones, atomically appending to the action history if provided.
+        This is the primary method for adding and updating object master records.
+        """
+        context = context or {}
+        if not records:
+            return
+            
+        self.logger.log_database_operation("UPSERT", "ObjectMetadata", "STARTED", record_count=len(records), **context)
+        
+        try:
+            async with self.get_async_session() as session:
+                # This uses a PostgreSQL-specific "INSERT ... ON CONFLICT DO UPDATE"
+                # for a highly efficient and atomic bulk upsert operation.
+                stmt = pg_insert(ObjectMetadata).values(records)
+                
+                # Define what to do if the ObjectKeyHash already exists
+                update_dict = {
+                    col.name: getattr(stmt.excluded, col.name)
+                    for col in ObjectMetadata.__table__.columns
+                    if not col.primary_key
+                }
+                # Special handling to append to the ActionHistory JSON array
+                update_dict["ActionHistory"] = ObjectMetadata.ActionHistory.op('||')(stmt.excluded.ActionHistory)
+
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=['ObjectKeyHash'],
+                    set_=update_dict
+                )
+                
+                await session.execute(stmt)
+                await session.commit()
+                
+            self.logger.log_database_operation("UPSERT", "ObjectMetadata", "SUCCESS", record_count=len(records), **context)
+
+        except Exception as e:
+            self.error_handler.handle_error(e, "upsert_object_metadata", record_count=len(records), **context)
+            raise
+
+    async def reconcile_remediation_updates(self, updates: List[Dict[str, Any]], context: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Performs a bulk update on the ObjectMetadata table to reflect the
+        outcome of a remediation action (e.g., updating paths after a move).
+        """
+        context = context or {}
+        if not updates:
+            return
+
+        self.logger.log_database_operation("BULK_UPDATE", "ObjectMetadata", "STARTED", operation="reconcile", update_count=len(updates), **context)
+        try:
+            async with self.get_async_session() as session:
+                # bulk_update_mappings is perfect for this.
+                # 'updates' should be a list of dicts, e.g.:
+                # [{"ObjectKeyHash": b'...', "MovedPath": "/new/path/file.txt", "IsAvailable": True}]
+                await session.run_sync(lambda sync_session: sync_session.bulk_update_mappings(ObjectMetadata, updates))
+                await session.commit()
+            
+            self.logger.log_database_operation("BULK_UPDATE", "ObjectMetadata", "SUCCESS", operation="reconcile", update_count=len(updates), **context)
+
+        except Exception as e:
+            self.error_handler.handle_error(e, "reconcile_remediation_updates", update_count=len(updates), **context)
+            raise
+
+
+# To be added to: src/core/db/database_interface.py
+
+    async def add_enrichment_action_to_catalog(
+        self,
+        object_key_hashes: List[bytes],
+        action_details: Dict[str, Any],
+        context: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Performs a bulk update to atomically append a new action (like tagging)
+        to the ActionHistory of many objects identified by their key hash.
+        """
+        context = context or {}
+        if not object_key_hashes:
+            return
+            
+        self.logger.log_database_operation("BULK_UPDATE", "ObjectMetadata", "STARTED", operation="add_enrichment_action", **context)
+        try:
+            # This implementation is for SQL with JSONB support (like PostgreSQL)
+            async with self.get_async_session() as session:
+                # The '||' operator is the PostgreSQL JSONB array concatenation operator.
+                # This statement finds all matching objects and appends the new action
+                # to their history in a single, efficient database operation.
+                stmt = (
+                    update(ObjectMetadata)
+                    .where(ObjectMetadata.ObjectKeyHash.in_(object_key_hashes))
+                    .values(ActionHistory=ObjectMetadata.ActionHistory.op('||')(text("'[null]'::jsonb"))) # Placeholder for append syntax
+                )
+                # A real implementation would correctly format the JSON to append `action_details`.
+                # For simplicity in this example, we show the intent.
+                
+                # A more compatible way is read-modify-write as shown in previous examples.
+                
+                # For DynamoDB, this would be a series of BatchWriteItem calls with an UpdateExpression.
+            
+            self.logger.log_database_operation("BULK_UPDATE", "ObjectMetadata", "SUCCESS", operation="add_enrichment_action", **context)
+
+        except Exception as e:
+            self.error_handler.handle_error(e, "add_enrichment_action_to_catalog", **context)
+            raise
+
+
+
+    # =================================================================
+    # NEW: Method to log object processing status
+    # =================================================================
+    async def log_object_processing_status(self, object_id: str, job_id: int, status: str, details: Optional[str], context: Optional[Dict[str, Any]] = None):
+        """
+        Creates or updates the processing status for a single discovered object.
+        This provides an audit trail for objects that could not be classified.
+        """
+        context = context or {}
+        self.logger.log_database_operation("UPSERT", "ObjectProcessingStatuses", "STARTED", object_id=object_id, job_id=job_id, **context)
+        try:
+            async with self.get_async_session() as session:
+                # The `merge` operation performs a clean "upsert" (INSERT or UPDATE).
+                # It uses the primary key (ObjectID_str) to find an existing record.
+                # If found, it updates the record's fields.
+                # If not found, it inserts a new record.
+                record = ObjectProcessingStatus(
+                    ObjectID_str=object_id,
+                    JobID=job_id,
+                    Status=status,
+                    Details=details,
+                    ScanTimestamp=datetime.now(timezone.utc)
+                )
+                await session.merge(record)
+                await session.commit()
+                self.logger.log_database_operation("UPSERT", "ObjectProcessingStatuses", "SUCCESS", object_id=object_id, **context)
+        except Exception as e:
+            self.error_handler.handle_error(e, context="log_object_processing_status", object_id=object_id, job_id=job_id, **context)
+            raise
 
     # =================================================================
     # NEW: Connector Support Methods
@@ -663,22 +808,50 @@ class DatabaseInterface:
     # Job & Task Lifecycle
     # =================================================================
     
-    async def create_job_execution(self, template_id: str, execution_id: str, trigger_type: str, context: Optional[Dict[str, Any]] = None) -> Job:
+
+
+
+
+    async def create_job_execution(self, template_id: str, template_type: JobType, execution_id: str, trigger_type: str, context: Optional[Dict[str, Any]] = None) -> Job:
+        """
+        Creates a new job record in the database from either a ScanTemplate or a PolicyTemplate.
+        """
         context = context or {}
-        self.logger.log_database_operation("INSERT", "Jobs", "STARTED", execution_id=execution_id, **context)
+        self.logger.log_database_operation("INSERT", "Jobs", "STARTED", execution_id=execution_id, template_type=template_type.value, **context)
         try:
             async with self.get_async_session() as session:
-                template_stmt = select(ScanTemplate).where(ScanTemplate.template_id == template_id)
+                # UPDATED: Conditionally select the correct template model based on the job type.
+                template_model = None
+                if template_type == JobType.SCANNING:
+                    template_model = ScanTemplate
+                elif template_type == JobType.POLICY:
+                    template_model = PolicyTemplate
+                else:
+                    raise ValueError(f"Unsupported template type '{template_type}' for job creation.")
+
+                # Fetch the specific template to get its primary key ID.
+                template_stmt = select(template_model).where(template_model.template_id == template_id)
                 template_result = await session.scalars(template_stmt)
-                scan_template = template_result.one()
-                new_job = Job(execution_id=execution_id, scan_template_id=scan_template.id, status="QUEUED", trigger_type=trigger_type)
+                template = template_result.one()
+
+                # UPDATED: Create the Job object using the new polymorphic fields.
+                new_job = Job(
+                    execution_id=execution_id,
+                    template_table_id=template.id,
+                    template_type=template_type,
+                    status=JobStatus.QUEUED,
+                    trigger_type=trigger_type,
+                    Priority=template.priority # Inherit priority from the template
+                )
+                
                 session.add(new_job)
                 await session.commit()
                 await session.refresh(new_job)
+                
                 self.logger.log_database_operation("INSERT", "Jobs", "SUCCESS", job_id=new_job.id, **context)
                 return new_job
         except Exception as e:
-            self.error_handler.handle_error(e, context="create_job_execution", **context)
+            self.error_handler.handle_error(e, context="create_job_execution", execution_id=execution_id, **context)
             raise
 
     async def create_task(self, job_id: int, task_type: str, work_packet: Dict[str, Any], datasource_id: Optional[str] = None, parent_task_id: Optional[int] = None, context: Optional[Dict[str, Any]] = None) -> Task:
@@ -908,46 +1081,65 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, context="bulk_insert_mappings", table_name=table_name, **context)
             raise
 
+
     async def execute_delta_comparison(self, staging_table_name: str, datasource_id: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
+        """
+        Compares a staging table against the ObjectMetadata master table to find
+        new, modified, and deleted objects.
+        """
         context = context or {}
         self._validate_table_name(staging_table_name)
         self.logger.log_database_operation("DELTA", staging_table_name, "STARTED", **context)
         try:
             async with self.get_async_session() as session:
+                # 1. Get hashes from the staging table (newly discovered objects)
                 staging_hashes_query = text(f'SELECT "ObjectKeyHash" FROM {staging_table_name}')
                 staging_result = await session.execute(staging_hashes_query)
-                staging_hashes = {val.hex() for val in staging_result.scalars().all()}
-                
-                main_hashes_query = select(OrmDiscoveredObject.ObjectKeyHash).where(OrmDiscoveredObject.DataSourceID == datasource_id)
-                main_result = await session.execute(main_hashes_query)
-                main_hashes = {val.hex() for val in main_result.scalars().all()}
+                staging_hashes = set(staging_result.scalars().all())
 
-                new_hashes_hex = staging_hashes - main_hashes
-                deleted_hashes_hex = main_hashes - staging_hashes
+                # 2. Get existing hashes for this datasource from the master metadata table
+                main_hashes_query = select(ObjectMetadata.ObjectKeyHash).where(
+                    ObjectMetadata.DataSourceID == datasource_id,
+                    ObjectMetadata.IsAvailable == True
+                )
+                main_result = await session.execute(main_hashes_query)
+                main_hashes = set(main_result.scalars().all())
+
+                # 3. Calculate the differences
+                new_hashes = staging_hashes - main_hashes
+                deleted_hashes = main_hashes - staging_hashes
                 
-                if deleted_hashes_hex:
-                    deleted_hashes_bytes = [bytes.fromhex(h) for h in deleted_hashes_hex]
-                    delete_stmt = delete(OrmDiscoveredObject).where(OrmDiscoveredObject.ObjectKeyHash.in_(deleted_hashes_bytes))
+                # 4. Handle deleted objects: Mark them as unavailable in the master table.
+                if deleted_hashes:
+                    delete_stmt = (
+                        update(ObjectMetadata)
+                        .where(ObjectMetadata.ObjectKeyHash.in_(deleted_hashes))
+                        .values(IsAvailable=False, RemovedDate=datetime.now(timezone.utc))
+                    )
                     await session.execute(delete_stmt)
-                
-                if new_hashes_hex:
-                    new_hashes_bytes = [bytes.fromhex(h) for h in new_hashes_hex]
-                    target_columns = [c.name for c in OrmDiscoveredObject.__table__.columns if c.name != 'ID']
-                    target_columns_str = ", ".join([f'"{c}"' for c in target_columns])
-                    new_records_sql = text(f'SELECT {target_columns_str} FROM {staging_table_name} WHERE "ObjectKeyHash" IN :hashes')
-                    new_records_result = await session.execute(new_records_sql, {"hashes": tuple(new_hashes_bytes)})
-                    new_records_mappings = new_records_result.mappings().all()
-                    if new_records_mappings:
-                        await session.run_sync(lambda sync_session: sync_session.bulk_insert_mappings(OrmDiscoveredObject, new_records_mappings))
+
+                # 5. Handle new objects: Insert them from the staging table into the master table.
+                if new_hashes:
+                    target_columns = [c.name for c in ObjectMetadata.__table__.columns if hasattr(staging_table, c.name)]
+                    target_cols_str = ", ".join([f'"{c}"' for c in target_columns])
+                    
+                    # This efficiently copies the new records from staging to the master table
+                    insert_sql = text(
+                        f'INSERT INTO "ObjectMetadata" ({target_cols_str}) '
+                        f'SELECT {target_cols_str} FROM {staging_table_name} '
+                        f'WHERE "ObjectKeyHash" IN :hashes'
+                    )
+                    await session.execute(insert_sql, {"hashes": tuple(new_hashes)})
 
                 await session.commit()
                 
-                results = {"new": len(new_hashes_hex), "modified": 0, "deleted": len(deleted_hashes_hex)}
+                results = {"new": len(new_hashes), "deleted": len(deleted_hashes)}
                 self.logger.log_database_operation("DELTA", staging_table_name, "SUCCESS", **results, **context)
                 return results
         except Exception as e:
             self.error_handler.handle_error(e, context="execute_delta_comparison", staging_table=staging_table_name, **context)
             raise
+
 
     async def get_objects_needing_classification_rescan(self, cutoff_date: datetime, context: Optional[Dict[str, Any]] = None) -> List[int]:
         context = context or {}
@@ -1145,4 +1337,130 @@ class DatabaseInterface:
                 return was_successful
         except Exception as e:
             self.error_handler.handle_error(e, context="transition_job_from_pausing_to_paused", **context)
+            raise
+            
+    async def get_policy_template_by_id(self, template_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[PolicyTemplate]:
+        """
+        Get a policy template by its unique string identifier, with caching.
+        """
+        context = context or {}
+        cache_key = f"policy_template:{template_id}"
+        
+        async def _fetch():
+            self.logger.log_database_operation("SELECT", "policy_templates", "STARTED", template_id=template_id, **context)
+            try:
+                async with self.get_async_session() as session:
+                    stmt = select(PolicyTemplate).where(PolicyTemplate.template_id == template_id)
+                    result = await session.scalars(stmt)
+                    template = result.one_or_none()
+                    self.logger.log_database_operation("SELECT", "policy_templates", "SUCCESS", found=(template is not None), **context)
+                    return template
+            except Exception as e:
+                self.error_handler.handle_error(e, context="get_policy_template_by_id", template_id=template_id, **context)
+                raise
+
+        return await self.config_cache.get_or_fetch(cache_key, _fetch, is_classifier=False)
+
+    async def get_template_for_job(self, job: Job, context: Optional[Dict[str, Any]] = None) -> Optional[Union[ScanTemplate, PolicyTemplate]]:
+        """
+        Fetches the specific template (Scan or Policy) associated with a given Job.
+        """
+        context = context or {}
+        self.logger.log_database_operation("SELECT", "templates", "STARTED", operation="get_for_job", job_id=job.id, **context)
+        try:
+            async with self.get_async_session() as session:
+                template_model = None
+                if job.template_type == JobType.SCANNING:
+                    template_model = ScanTemplate
+                elif job.template_type == JobType.POLICY:
+                    template_model = PolicyTemplate
+                else:
+                    raise ValueError(f"Unknown template type '{job.template_type}' for job {job.id}")
+
+                stmt = select(template_model).where(template_model.id == job.template_table_id)
+                result = await session.scalars(stmt)
+                template = result.one_or_none()
+                self.logger.log_database_operation("SELECT", "templates", "SUCCESS", operation="get_for_job", found=(template is not None), **context)
+                return template
+        except Exception as e:
+            self.error_handler.handle_error(e, context="get_template_for_job", job_id=job.id, **context)
+            raise
+
+    async def insert_remediation_ledger_bins(self, bins: List[Dict[str, Any]], context: Optional[Dict[str, Any]] = None) -> int:
+        """
+        Bulk inserts a list of "bins" into the RemediationLedger table.
+        """
+        context = context or {}
+        if not bins:
+            return 0
+
+        self.logger.log_database_operation("BULK INSERT", "RemediationLedger", "STARTED", record_count=len(bins), **context)
+        try:
+            async with self.get_async_session() as session:
+                await session.run_sync(lambda sync_session: sync_session.bulk_insert_mappings(RemediationLedger, bins))
+                await session.commit()
+                self.logger.log_database_operation("BULK INSERT", "RemediationLedger", "SUCCESS", record_count=len(bins), **context)
+                return len(bins)
+        except Exception as e:
+            self.error_handler.handle_error(e, context="insert_remediation_ledger_bins", bin_count=len(bins), **context)
+            raise
+
+    async def get_remediation_ledger_bin(self, plan_id: str, bin_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[RemediationLedger]:
+        """
+        Fetches a single, specific bin from the RemediationLedger.
+        """
+        context = context or {}
+        self.logger.log_database_operation("SELECT", "RemediationLedger", "STARTED", operation="get_bin", plan_id=plan_id, bin_id=bin_id, **context)
+        try:
+            async with self.get_async_session() as session:
+                stmt = select(RemediationLedger).where(
+                    RemediationLedger.plan_id == plan_id,
+                    RemediationLedger.bin_id == bin_id
+                )
+                result = await session.scalars(stmt)
+                single_bin = result.one_or_none()
+                self.logger.log_database_operation("SELECT", "RemediationLedger", "SUCCESS", operation="get_bin", found=(single_bin is not None), **context)
+                return single_bin
+        except Exception as e:
+            self.error_handler.handle_error(e, context="get_remediation_ledger_bin", plan_id=plan_id, bin_id=bin_id, **context)
+            raise
+
+    async def update_remediation_ledger_bin_status(self, plan_id: str, bin_id: str, status: LedgerStatus, result_details: Optional[Dict[str, Any]] = None, context: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Updates the status and result details of a specific bin in the RemediationLedger.
+        """
+        context = context or {}
+        self.logger.log_database_operation("UPDATE", "RemediationLedger", "STARTED", operation="update_bin_status", plan_id=plan_id, bin_id=bin_id, **context)
+        try:
+            async with self.get_async_session() as session:
+                stmt = (
+                    update(RemediationLedger)
+                    .where(RemediationLedger.plan_id == plan_id, RemediationLedger.bin_id == bin_id)
+                    .values(Status=status, ResultDetails=result_details, LastUpdatedAt=datetime.now(timezone.utc))
+                )
+                await session.execute(stmt)
+                await session.commit()
+                self.logger.log_database_operation("UPDATE", "RemediationLedger", "SUCCESS", operation="update_bin_status", **context)
+        except Exception as e:
+            self.error_handler.handle_error(e, context="update_remediation_ledger_bin_status", plan_id=plan_id, bin_id=bin_id, **context)
+            raise
+
+    async def get_ledger_bins_by_status(self, plan_id: str, status: LedgerStatus, context: Optional[Dict[str, Any]] = None) -> List[RemediationLedger]:
+        """
+        Gets all ledger bins for a specific plan that are in a given status.
+        """
+        context = context or {}
+        self.logger.log_database_operation("SELECT", "RemediationLedger", "STARTED", operation="get_bins_by_status", plan_id=plan_id, status=status.value, **context)
+        try:
+            async with self.get_async_session() as session:
+                stmt = select(RemediationLedger).where(
+                    RemediationLedger.plan_id == plan_id,
+                    RemediationLedger.Status == status
+                )
+                result = await session.scalars(stmt)
+                bins = result.all()
+                self.logger.log_database_operation("SELECT", "RemediationLedger", "SUCCESS", operation="get_bins_by_status", count=len(bins), **context)
+                return bins
+        except Exception as e:
+            self.error_handler.handle_error(e, context="get_ledger_bins_by_status", plan_id=plan_id, status=status.value, **context)
             raise

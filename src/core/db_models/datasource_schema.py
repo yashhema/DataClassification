@@ -17,6 +17,8 @@ from .association_tables import datasource_tag_link
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .calendar_schema import Calendar
+    # Import the Pydantic model for documentation purposes
+    from core.config.config_models import DataSourceConfiguration
 
 class NodeGroup(Base):
     __tablename__ = 'node_groups'
@@ -32,7 +34,7 @@ class Tag(Base):
     parent_id: Mapped[Optional[int]] = mapped_column(ForeignKey('tags.id'))
     parent: Mapped["Tag"] = relationship(back_populates="children", remote_side=[id])
     children: Mapped[List["Tag"]] = relationship(back_populates="parent")
-    metadata_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON)
+    metadata_json: Mapped[Optional[Dict[str, Any]]] = mapped_column("metadata", JSON)
     datasources: Mapped[List["DataSource"]] = relationship(secondary=datasource_tag_link, back_populates="tags")
 
 class DataSource(Base):
@@ -42,8 +44,16 @@ class DataSource(Base):
     datasource_id: Mapped[str] = mapped_column(String(255), primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     datasource_type: Mapped[str] = mapped_column(String(50), nullable=False)
-    configuration: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
+    
+    # UPDATED COMMENT: This now references the Pydantic model for its structure.
+    configuration: Mapped[Dict[str, Any]] = mapped_column(
+        JSON, 
+        nullable=False,
+        comment="JSON object containing all connection details and scan profiles. The structure is defined by the 'DataSourceConfiguration' Pydantic model in core/config/config_models.py."
+    )
+    
     node_group_id: Mapped[Optional[int]] = mapped_column(ForeignKey('node_groups.id'))
     calendar_id: Mapped[Optional[int]] = mapped_column(ForeignKey('calendars.id'))
     calendar: Mapped[Optional["Calendar"]] = relationship()
     tags: Mapped[List["Tag"]] = relationship(secondary=datasource_tag_link, back_populates="datasources")
+
