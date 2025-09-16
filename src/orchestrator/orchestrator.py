@@ -13,11 +13,12 @@ ASYNC CONVERSION (CORRECTED):
 
 import sys
 import asyncio
+import queue
 import time
 from collections import deque
 from typing import Dict, Any, Optional, List
 from enum import Enum
-
+import threading
 # Handle select import with fallback
 try:
     import select
@@ -41,18 +42,10 @@ from core.db_models.job_schema import Task, JobStatus, Job
 
 from core.config.configuration_manager import ClassificationConfidenceConfig
 
-class JobState(str, Enum):
-    """Valid job states for state machine validation"""
-    QUEUED = "QUEUED"
-    RUNNING = "RUNNING"
-    PAUSING = "PAUSING"
-    PAUSED = "PAUSED"
-    CANCELLING = "CANCELLING"
-    CANCELLED = "CANCELLED"
-    COMPLETED = "COMPLETED"
-    FAILED = "FAILED"
-
-
+from .orchestrator_state import JobState
+from core.db_models.job_schema import JobType
+from .threads.job_reaper import JobReaper
+from .threads.lease_manager import LeaseManager
 class Orchestrator:
     """Manages jobs, tasks, workers, and system state for all deployment models."""
 
@@ -73,6 +66,10 @@ class Orchestrator:
         self.db = db
         self.logger = logger
         self.error_handler = error_handler
+        # Use the new stable ID from the configuration
+        self.instance_id = self.settings.orchestrator.instance_id
+        
+        self.logger.info(f"Orchestrator instance starting with stable ID: {self.instance_id}")
         
         # ASYNC CONVERSION: Replace threading.Event with asyncio.Event
         self._shutdown_event = asyncio.Event()
@@ -108,8 +105,9 @@ class Orchestrator:
             self.reaper = Reaper(self)
             self.pipeliner = Pipeliner(self)
             self.job_monitor = JobCompletionMonitor(self)
-            self.cli_processor = self._CliCommandProcessor(self)
             
+            self.job_reaper = JobReaper(self)
+            self.lease_manager = LeaseManager(self)            
             self.logger.log_component_lifecycle("Orchestrator", "INITIALIZED")
         except Exception as e:
             error = self.error_handler.handle_error(
@@ -119,48 +117,133 @@ class Orchestrator:
             self.logger.error("Failed to initialize Orchestrator components", error_id=error.error_id)
             raise
 
-    async def start_async(self):
-        """Starts all background coroutines in async event loop."""
+
+    async def start_async(self, command_queue: queue.Queue):
+        """
+        Starts all background coroutines, including the new command processor.
+        """
         try:
             self.logger.log_component_lifecycle("Orchestrator", "STARTING_ASYNC_COROUTINES")
             
-            if self.is_single_process_mode:
-                await self._start_in_process_workers_async()
+            # --- This method is now responsible for starting the command processor ---
             
-            # Start all background coroutines
             coroutines_to_start = [
                 self.task_assigner.run_async(),
-                self.reaper.run_async(), 
+                self.reaper.run_async(),
+                self.job_reaper.run_async(),
+                self.lease_manager.run_async(),
                 self.pipeliner.run_async(),
-                self.job_monitor.run_async()
+                self.job_monitor.run_async(),
+                self._process_command_queue_async(command_queue) # Add the new coroutine
             ]
             
-            # Create tasks for all coroutines
             self._background_tasks = [
-                asyncio.create_task(coroutine, name=f"orchestrator_{i}")
-                for i, coroutine in enumerate(coroutines_to_start)
+                asyncio.create_task(coro) for coro in coroutines_to_start
             ]
             
-            for task in self._background_tasks:
-                self.logger.info(f"Started async coroutine: {task.get_name()}")
-            
-            if self.settings.orchestrator.cli_enabled:
-                # CLI processor remains as thread for now (keyboard input is inherently blocking)
-                asyncio.create_task(self._start_cli_processor())
-                self.logger.info("Started CLI processor")
-                
             self.logger.log_component_lifecycle("Orchestrator", "ALL_ASYNC_COROUTINES_STARTED")
             
-            # Wait for all background tasks to complete (or until shutdown)
+            # This will run until all background tasks are complete or cancelled
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
             
         except Exception as e:
-            error = self.error_handler.handle_error(
-                e, "orchestrator_async_startup",
-                operation="start_background_coroutines"
-            )
-            self.logger.error("Failed to start Orchestrator async coroutines", error_id=error.error_id)
+            self.error_handler.handle_error(e, "orchestrator_async_startup")
             raise
+
+    # --- ADD THIS ENTIRE NEW METHOD TO THE ORCHESTRATOR CLASS ---
+    async def _process_command_queue_async(self, command_queue: queue.Queue):
+        """
+        A background coroutine that processes commands sent from the CLI.
+        """
+        self.logger.log_component_lifecycle("CommandProcessor", "STARTED")
+        
+        while not self._shutdown_event.is_set():
+            try:
+                # Use get_nowait for a non-blocking check of the queue
+                command_data = command_queue.get_nowait()
+                command = command_data.get("command")
+                
+                self.logger.info(f"Received command from CLI: {command}", command=command)
+
+                # --- Command Dispatcher ---
+                if command == "start_job":
+                    job_id = await self.start_job_from_template(
+                        command_data["template_id"], 
+                        JobType[command_data["job_type"].upper()]
+                    )
+                    # In a real API, you'd return this ID to the caller
+                    self.logger.info(f"Job submission result: ID={job_id}", job_id=job_id)
+
+                elif command == "pause_job":
+                    await self.pause_job(command_data["job_id"])
+                
+                elif command == "resume_job":
+                    await self.resume_job(command_data["job_id"])
+
+                elif command == "cancel_job":
+                    await self.cancel_job(command_data["job_id"])
+
+                elif command == "get_job_status":
+                    status = await self.get_job_status_summary(command_data["job_id"])
+                    self.logger.info(f"Status for job {command_data['job_id']}: {status}")
+
+            except queue.Empty:
+                # If the queue is empty, wait briefly before checking again
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                self.error_handler.handle_error(e, "command_processor_loop")
+        
+        self.logger.log_component_lifecycle("CommandProcessor", "STOPPED")
+
+    async def _recover_owned_jobs_on_startup_async(self):
+        """
+        On startup, finds and reclaims any jobs this instance was previously
+        managing to ensure a fast recovery from restarts.
+        """
+        self.logger.info(f"Checking for recoverable jobs for orchestrator ID '{self.instance_id}'...")
+        try:
+            recoverable_jobs = await self.db.get_recoverable_jobs_for_orchestrator(self.instance_id)
+
+            if not recoverable_jobs:
+                self.logger.info("No recoverable jobs found.")
+                return
+
+            self.logger.warning(f"Found {len(recoverable_jobs)} recoverable jobs. Reclaiming ownership...", count=len(recoverable_jobs))
+
+            for job in recoverable_jobs:
+                # Renew the lease immediately to re-establish ownership.
+                # The lease duration should be a configured value.
+                lease_duration_sec = 300 # Example: 5 minutes
+                
+                was_renewed = await self.db.renew_job_lease(
+                    job_id=job.id,
+                    orchestrator_id=self.instance_id,
+                    current_version=job.Version,
+                    lease_duration_sec=lease_duration_sec
+                )
+
+                if was_renewed:
+                    # Load the job back into the in-memory state
+                    async with self._state_lock:
+                        self.job_states[job.id] = JobState.RUNNING
+                        # You may also want to pre-fill the task cache here
+                        self.job_task_cache[job.id] = deque()
+
+                    self.logger.info(f"Successfully reclaimed ownership of job {job.id}.", job_id=job.id)
+                else:
+                    self.logger.warning(
+                        f"Failed to reclaim job {job.id}. Another orchestrator may have taken over while this instance was down.",
+                        job_id=job.id
+                    )
+
+        except Exception as e:
+            self.error_handler.handle_error(
+                e, 
+                "recover_owned_jobs", 
+                orchestrator_id=self.instance_id
+            )
+            self.logger.error("A critical error occurred during the job recovery process. Manual intervention may be required.")
+
 
     async def shutdown_async(self):
         """Async shutdown method for proper async cleanup."""
@@ -246,7 +329,7 @@ class Orchestrator:
     async def _worker_coroutine(self, worker_id: str):
         """Async worker coroutine for single-process mode."""
         self.logger.log_component_lifecycle(worker_id, "STARTED")
-        
+        task = None
         try:
             while not self._shutdown_event.is_set():
                 try:
@@ -313,6 +396,25 @@ class Orchestrator:
     def update_thread_liveness(self, thread_name: str):
         """Allows coroutines to report that they are alive and functioning."""
         self.thread_liveness[thread_name] = time.monotonic()
+
+    async def is_healthy(self) -> bool:
+        """
+        Checks if the Orchestrator is healthy and ready to operate.
+        The primary check is its ability to communicate with the database.
+        """
+        try:
+            # The test_connection method is a lightweight query (e.g., SELECT 1)
+            # that confirms the connection pool is alive and credentials are valid.
+            if await self.db.test_connection():
+                self.logger.log_health_check("Orchestrator", True)
+                return True
+            else:
+                self.logger.log_health_check("Orchestrator", False, reason="Database connectivity test failed.")
+                return False
+        except Exception as e:
+            self.logger.log_health_check("Orchestrator", False, error=str(e))
+            return False
+
 
     def _validate_state_transition(self, job_id: int, from_state: JobState, to_state: JobState) -> bool:
         """Validates if a job state transition is allowed."""
@@ -669,15 +771,3 @@ class Orchestrator:
     def finalize_job_state(self, job_id: int, final_state: JobState):
         """Sync wrapper for finalize_job_state_async (for compatibility)."""
         asyncio.create_task(self.finalize_job_state_async(job_id, final_state))
-
-    async def _start_cli_processor(self):
-        """Start CLI processor as async task."""
-        # CLI would need to be converted to async as well for full integration
-        # For now, keeping minimal placeholder
-        pass
-
-    class _CliCommandProcessor:
-        """CLI command processor placeholder."""
-        
-        def __init__(self, parent: 'Orchestrator'):
-            self.parent = parent

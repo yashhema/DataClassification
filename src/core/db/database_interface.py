@@ -10,7 +10,7 @@ UPDATED: Converted to async/await pattern with configuration caching.
 
 import re
 import asyncio
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional,Union
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import joinedload
 
@@ -31,7 +31,7 @@ from ..db_models.system_parameters_schema import SystemParameter
 from ..db_models.datasource_schema import NodeGroup, DataSource
 from ..db_models.connector_config_schema import ConnectorConfiguration
 from ..db_models.calendar_schema import Calendar
-from ..db_models.job_schema import JobStatus, ScanTemplate, JobType,
+from ..db_models.job_schema import JobStatus, ScanTemplate, JobType
 from ..db_models.credentials_schema import Credential
 from ..db_models.classifiertemplate_schema import ClassifierTemplate
 from ..db_models.classifier_schema import Classifier
@@ -45,7 +45,7 @@ from ..models.models import PIIFinding as PydanticPIIFinding
 # Import core services for integration
 from ..logging.system_logger import SystemLogger
 from ..errors import ErrorHandler
-
+from ..db_models.job_schema import MasterJob
 
 class ConfigCache:
     """Configuration cache with LRU eviction and 24-hour expiry."""
@@ -140,6 +140,149 @@ class DatabaseInterface:
         """Validates table name to prevent SQL injection."""
         if not self._safe_table_name_pattern.match(table_name):
             raise ValueError(f"Invalid characters in table name: {table_name}")
+
+
+
+    async def create_master_job(self, master_job_id: str, name: str, configuration: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> MasterJob:
+        """Creates a new record in the MasterJobs table."""
+        context = context or {}
+        self.logger.log_database_operation("INSERT", "MasterJobs", "STARTED", master_job_id=master_job_id, **context)
+        try:
+            async with self.get_async_session() as session:
+                new_master_job = MasterJob(
+                    master_job_id=master_job_id,
+                    name=name,
+                    configuration=configuration
+                )
+                session.add(new_master_job)
+                await session.commit()
+                await session.refresh(new_master_job)
+                self.logger.log_database_operation("INSERT", "MasterJobs", "SUCCESS", master_job_id=new_master_job.master_job_id, **context)
+                return new_master_job
+        except Exception as e:
+            self.error_handler.handle_error(e, "create_master_job", master_job_id=master_job_id, **context)
+            raise
+
+    async def get_master_job_by_id(self, master_job_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[MasterJob]:
+        """Fetches a master job's configuration by its ID."""
+        context = context or {}
+        self.logger.log_database_operation("SELECT", "MasterJobs", "STARTED", master_job_id=master_job_id, **context)
+        try:
+            async with self.get_async_session() as session:
+                stmt = select(MasterJob).where(MasterJob.master_job_id == master_job_id)
+                result = await session.scalars(stmt)
+                master_job = result.one_or_none()
+                self.logger.log_database_operation("SELECT", "MasterJobs", "SUCCESS", found=(master_job is not None), **context)
+                return master_job
+        except Exception as e:
+            self.error_handler.handle_error(e, "get_master_job_by_id", master_job_id=master_job_id, **context)
+            raise
+
+    async def get_queued_jobs_for_nodegroup(self, nodegroup: str, limit: int, context: Optional[Dict[str, Any]] = None) -> List[Job]:
+        """Used by an Orchestrator to find available jobs in its region."""
+        context = context or {}
+        try:
+            async with self.get_async_session() as session:
+                stmt = select(Job).where(
+                    Job.status == JobStatus.QUEUED,
+                    Job.NodeGroup == nodegroup
+                ).order_by(Job.Priority, Job.id).limit(limit)
+                result = await session.scalars(stmt)
+                return list(result.all())
+        except Exception as e:
+            self.error_handler.handle_error(e, "get_queued_jobs_for_nodegroup", nodegroup=nodegroup, **context)
+            raise
+
+    async def claim_queued_job(self, job_id: int, orchestrator_id: str, lease_duration_sec: int, context: Optional[Dict[str, Any]] = None) -> bool:
+        """Atomically claims a QUEUED job for an orchestrator."""
+        context = context or {}
+        try:
+            async with self.get_async_session() as session:
+                lease_expiry = datetime.now(timezone.utc) + timedelta(seconds=lease_duration_sec)
+                stmt = update(Job).where(
+                    Job.id == job_id,
+                    Job.status == JobStatus.QUEUED
+                ).values(
+                    status=JobStatus.RUNNING,
+                    OrchestratorID=orchestrator_id,
+                    OrchestratorLeaseExpiry=lease_expiry
+                )
+                result = await session.execute(stmt)
+                await session.commit()
+                # If rowcount is 1, the update was successful. If 0, another orchestrator claimed it first.
+                return result.rowcount > 0
+        except Exception as e:
+            self.error_handler.handle_error(e, "claim_queued_job", job_id=job_id, **context)
+            raise
+
+
+
+    async def renew_job_lease(self, job_id: int, orchestrator_id: str, current_version: int, lease_duration_sec: int, context: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Atomically renews the lease for a job using optimistic locking.
+        It will only succeed if the orchestrator_id and version match.
+        """
+        context = context or {}
+        self.logger.log_database_operation("UPDATE", "Jobs", "STARTED", operation_name="renew_job_lease", job_id=job_id, **context)
+        try:
+            async with self.get_async_session() as session:
+                new_expiry = datetime.now(timezone.utc) + timedelta(seconds=lease_duration_sec)
+                
+                stmt = update(Job).where(
+                    Job.id == job_id,
+                    Job.OrchestratorID == orchestrator_id,
+                    Job.Version == current_version  # <-- The optimistic lock check
+                ).values(
+                    OrchestratorLeaseExpiry=new_expiry,
+                    LeaseWarningCount=0,
+                    LastLeaseWarningTimestamp=None,
+                    Version=Job.Version + 1  # Increment the version for the next update
+                )
+                
+                result = await session.execute(stmt)
+                await session.commit()
+
+                # If rowcount is 1, the update succeeded. If 0, we lost the race.
+                was_successful = result.rowcount > 0
+                self.logger.log_database_operation("UPDATE", "Jobs", "SUCCESS" if was_successful else "SKIPPED_STALE", operation_name="renew_job_lease", job_id=job_id, **context)
+                
+                return was_successful
+        except Exception as e:
+            self.error_handler.handle_error(e, "renew_job_lease", job_id=job_id, **context)
+            raise
+
+    async def get_abandoned_jobs_for_nodegroup(self, nodegroup: str, context: Optional[Dict[str, Any]] = None) -> List[Job]:
+        """Used by the Job Reaper to find jobs with expired leases."""
+        context = context or {}
+        try:
+            async with self.get_async_session() as session:
+                stmt = select(Job).where(
+                    Job.status == JobStatus.RUNNING,
+                    Job.NodeGroup == nodegroup,
+                    Job.OrchestratorLeaseExpiry < datetime.now(timezone.utc)
+                )
+                result = await session.scalars(stmt)
+                return list(result.all())
+        except Exception as e:
+            self.error_handler.handle_error(e, "get_abandoned_jobs_for_nodegroup", nodegroup=nodegroup, **context)
+            raise
+
+    async def get_recoverable_jobs_for_orchestrator(self, orchestrator_id: str, context: Optional[Dict[str, Any]] = None) -> List[Job]:
+        """Used by an orchestrator on startup to find and reclaim its own jobs."""
+        context = context or {}
+        try:
+            async with self.get_async_session() as session:
+                stmt = select(Job).where(
+                    Job.status == JobStatus.RUNNING,
+                    Job.OrchestratorID == orchestrator_id
+                )
+                result = await session.scalars(stmt)
+                return list(result.all())
+        except Exception as e:
+            self.error_handler.handle_error(e, "get_recoverable_jobs_for_orchestrator", orchestrator_id=orchestrator_id, **context)
+            raise
+
+
 
     async def upsert_object_metadata(
         self,
@@ -707,7 +850,7 @@ class DatabaseInterface:
     # Health and Debugging
     # =================================================================
 
-    async def test_database_connection(self, context: Optional[Dict[str, Any]] = None) -> bool:
+    async def test_connection(self, context: Optional[Dict[str, Any]] = None) -> bool:
         context = context or {}
         self.logger.log_database_operation("CONNECT", "database", "STARTED", **context)
         try:
@@ -810,38 +953,83 @@ class DatabaseInterface:
     
 
 
-
-
-    async def create_job_execution(self, template_id: str, template_type: JobType, execution_id: str, trigger_type: str, context: Optional[Dict[str, Any]] = None) -> Job:
+    async def update_job_command(self, job_id: int, command: str, context: Optional[Dict[str, Any]] = None) -> bool:
         """
-        Creates a new job record in the database from either a ScanTemplate or a PolicyTemplate.
+        Updates the 'master_pending_commands' field for a specific job.
+        This is used by the CLI to issue asynchronous commands.
         """
         context = context or {}
-        self.logger.log_database_operation("INSERT", "Jobs", "STARTED", execution_id=execution_id, template_type=template_type.value, **context)
+        self.logger.log_database_operation("UPDATE", "Jobs", "STARTED", operation_name="issue_job_command", job_id=job_id, command=command, **context)
         try:
             async with self.get_async_session() as session:
-                # UPDATED: Conditionally select the correct template model based on the job type.
-                template_model = None
-                if template_type == JobType.SCANNING:
-                    template_model = ScanTemplate
-                elif template_type == JobType.POLICY:
-                    template_model = PolicyTemplate
-                else:
-                    raise ValueError(f"Unsupported template type '{template_type}' for job creation.")
+                stmt = update(Job).where(
+                    Job.id == job_id
+                ).values(
+                    master_pending_commands=command,
+                    Version=Job.Version + 1 # Increment version to show a change has occurred
+                )
+                
+                result = await session.execute(stmt)
+                await session.commit()
 
-                # Fetch the specific template to get its primary key ID.
-                template_stmt = select(template_model).where(template_model.template_id == template_id)
-                template_result = await session.scalars(template_stmt)
-                template = template_result.one()
+                was_successful = result.rowcount > 0
+                self.logger.log_database_operation("UPDATE", "Jobs", "SUCCESS" if was_successful else "FAILURE", operation_name="issue_job_command", **context)
+                return was_successful
+        except Exception as e:
+            self.error_handler.handle_error(e, "update_job_command", job_id=job_id, command=command, **context)
+            raise
 
-                # UPDATED: Create the Job object using the new polymorphic fields.
+    async def get_child_jobs_by_master_id(self, master_job_id: str, context: Optional[Dict[str, Any]] = None) -> List[Job]:
+        """
+        Finds all child jobs associated with a single master_job_id.
+        """
+        context = context or {}
+        self.logger.log_database_operation("SELECT", "Jobs", "STARTED", operation_name="get_by_master_id", master_job_id=master_job_id, **context)
+        try:
+            async with self.get_async_session() as session:
+                stmt = select(Job).where(Job.master_job_id == master_job_id)
+                result = await session.scalars(stmt)
+                child_jobs = result.all()
+
+                self.logger.log_database_operation("SELECT", "Jobs", "SUCCESS", operation_name="get_by_master_id", count=len(child_jobs), **context)
+                return child_jobs
+        except Exception as e:
+            self.error_handler.handle_error(e, "get_child_jobs_by_master_id", master_job_id=master_job_id, **context)
+            raise
+
+
+
+    async def create_job_execution(
+        self,
+        template_table_id: int,
+        template_type: JobType,
+        execution_id: str,
+        trigger_type: str,
+        nodegroup: str,
+        configuration: Dict[str, Any],
+        priority: int,
+        master_job_id: str,
+        master_pending_commands: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None
+    ) -> Job:
+        """
+        Creates a new 'Child Job' record in the database with all required fields.
+        """
+        context = context or {}
+        self.logger.log_database_operation("INSERT", "Jobs", "STARTED", execution_id=execution_id, **context)
+        try:
+            async with self.get_async_session() as session:
                 new_job = Job(
                     execution_id=execution_id,
-                    template_table_id=template.id,
+                    template_table_id=template_table_id,
                     template_type=template_type,
-                    status=JobStatus.QUEUED,
+                    status=JobStatus.QUEUED, # Jobs are created in the QUEUED state
                     trigger_type=trigger_type,
-                    Priority=template.priority # Inherit priority from the template
+                    Priority=priority,
+                    NodeGroup=nodegroup,
+                    configuration=configuration,
+                    master_job_id=master_job_id,
+                    master_pending_commands=master_pending_commands
                 )
                 
                 session.add(new_job)
@@ -851,7 +1039,7 @@ class DatabaseInterface:
                 self.logger.log_database_operation("INSERT", "Jobs", "SUCCESS", job_id=new_job.id, **context)
                 return new_job
         except Exception as e:
-            self.error_handler.handle_error(e, context="create_job_execution", execution_id=execution_id, **context)
+            self.error_handler.handle_error(e, "create_job_execution", execution_id=execution_id, **context)
             raise
 
     async def create_task(self, job_id: int, task_type: str, work_packet: Dict[str, Any], datasource_id: Optional[str] = None, parent_task_id: Optional[int] = None, context: Optional[Dict[str, Any]] = None) -> Task:
@@ -1189,22 +1377,32 @@ class DatabaseInterface:
             raise
 
     async def get_active_jobs(self, statuses: List[JobStatus] = None, context: Optional[Dict[str, Any]] = None) -> List[Job]:
-        """Fetches jobs that are in an active state (defaulting to QUEUED or RUNNING)."""
-        context = context or {}
-        if statuses is None:
-            statuses = [JobStatus.QUEUED, JobStatus.RUNNING]
-        
-        self.logger.log_database_operation("SELECT", "Jobs", "STARTED", operation="get_active_jobs", statuses=statuses, **context)
-        try:
-            async with self.get_async_session() as session:
-                stmt = select(Job).where(Job.status.in_(statuses))
-                result = await session.scalars(stmt)
-                results = list(result.all())
-                self.logger.log_database_operation("SELECT", "Jobs", "SUCCESS", operation="get_active_jobs", row_count=len(results), **context)
-                return results
-        except Exception as e:
-            self.error_handler.handle_error(e, context="get_active_jobs", **context)
-            raise
+            """Fetches jobs that are in an active state (defaulting to QUEUED or RUNNING)."""
+            context = context or {}
+            if statuses is None:
+                # CORRECTED: This now correctly references the JobStatus enum
+                statuses = [JobStatus.QUEUED, JobStatus.RUNNING]
+            
+            # CORRECTED: Renamed the conflicting 'operation' key to 'operation_name'
+            # to avoid passing the same argument twice to the logger.
+            log_context = {
+                "operation_name": "get_active_jobs", 
+                "statuses": [s.value for s in statuses], 
+                **context
+            }
+            self.logger.log_database_operation("SELECT", "Jobs", "STARTED", **log_context)
+            
+            try:
+                async with self.get_async_session() as session:
+                    stmt = select(Job).where(Job.status.in_(statuses))
+                    result = await session.scalars(stmt)
+                    results = list(result.all())
+                    self.logger.log_database_operation("SELECT", "Jobs", "SUCCESS", row_count=len(results), **log_context)
+                    return results
+            except Exception as e:
+                self.error_handler.handle_error(e, context="get_active_jobs", **context)
+                raise
+
 
     async def get_task_by_id(self, task_id: int, context: Optional[Dict[str, Any]] = None) -> Optional[Task]:
         """Fetches a single task by its primary key."""

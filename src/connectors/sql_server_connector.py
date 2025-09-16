@@ -39,7 +39,7 @@ from core.models.models import ContentComponent
 class AsyncSQLServerConnection:
     """Manages async SQL Server connections with proper error handling and cleanup."""
     
-    def __init__(self, connection_config: Dict[str, Any], logger: SystemLogger, error_handler: ErrorHandler):
+    def __init__(self, connection_config: Dict[str, Any], logger: SystemLogger, error_handler: ErrorHandler,):
         self.connection_config = connection_config
         self.logger = logger
         self.error_handler = error_handler
@@ -204,13 +204,13 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
     Integrates with async database operations and logging systems.
     """
     
-    def __init__(self, datasource_id: str, logger: SystemLogger, error_handler: ErrorHandler, db_interface: DatabaseInterface):
+    def __init__(self, datasource_id: str, logger: SystemLogger, error_handler: ErrorHandler, db_interface: DatabaseInterface, credential_manager: Any):
         """Initialize connector with dependency injection pattern."""
         self.datasource_id = datasource_id
         self.logger = logger
         self.error_handler = error_handler
         self.db = db_interface
-        
+        self.credential_manager = credential_manager
         # Initialize connection manager
         self.connection: Optional[AsyncSQLServerConnection] = None
         self.inspector: Optional[sqlalchemy.Inspector] = None
@@ -552,25 +552,28 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
         """Ensure async database connection is established."""
         try:
             if not self.connection:
-                # Get connection configuration
                 connection_config = self.datasource_config.configuration.get('connection_config', {})
+                auth_config = connection_config.get('auth', {})
                 
-                # Load credentials if needed (async)
-                if not connection_config.get('trusted_connection', False):
-                    credential_info = await self.db.get_credential_for_datasource_async(self.datasource_id)
-                    if credential_info:
-                        connection_config['username'] = credential_info['username']
-                        # In production, you'd decrypt password from secure store
-                        # connection_config['password'] = decrypt_password(credential_info['store_details'])
-                
+                # Read the declarative auth_method from the config
+                auth_method = auth_config.get('auth_method')
+
+                # Only fetch credentials if the method is 'standard' or 'ad'
+                if auth_method in ["standard", "ad"]:
+                    credential_id = self.datasource_config.configuration.get("scan_profiles", [{}])[0].get("credential_id")
+                    if not credential_id:
+                        raise ValueError(f"credential_id is required for '{auth_method}' authentication.")
+                    
+                    credential_record = await self.db.get_credential_by_id_async(credential_id)
+                    password = await self.credential_manager.get_password_async(credential_record.store_details)
+                    
+                    # Inject the fetched password into the connection config
+                    auth_config['password'] = password
+
                 self.connection = AsyncSQLServerConnection(connection_config, self.logger, self.error_handler)
                 
             if not await self.connection.connect_async():
                 return False
-                
-            # Create async inspector for metadata operations
-            # Note: Inspector for async engines needs special handling
-            # For now, we'll handle metadata queries directly through connection
             return True
             
         except Exception as e:

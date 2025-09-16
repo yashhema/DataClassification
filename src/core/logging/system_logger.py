@@ -209,11 +209,10 @@ class SystemLogger:
         level = logging.DEBUG if is_approved else logging.INFO
         self._log(level, f"Resource decision for job {job_id}: {decision} -> {status}", {"job_id": job_id, **context})
 
-    def log_database_operation(self, operation: str, table: str, status: str, **context):
-        """Logs the status of a database operation."""
-        self._log(logging.DEBUG, f"Database operation '{operation}' on table '{table}' {status}.", context)
-
-    # --- Error Handling Integration ---
+    def log_database_operation(self, main_operation: str, table: str, main_status: str, **context):
+        # The log message would also need a small update to use the new name
+        self._log(logging.DEBUG, f"Database operation '{main_operation}' on table '{table}' {main_status}.", context)
+        # --- Error Handling Integration ---
 
     def log_classification_error(self, error: "ClassificationError", trace_id: Optional[str], **context):
         """Logs a structured error, correlating it with the current trace_id."""

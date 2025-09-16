@@ -2,14 +2,14 @@
 
 import asyncio
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional,Union
 
 # SQLAlchemy imports for the SQL Provider
 from sqlalchemy import select, func, text, and_, or_, not_
 from sqlalchemy.sql.elements import BinaryExpression
 
 # Pydantic models for the query structure
-from core.models.models import QueryDefinition, Pagination, FilterCondition, ComplexFilter, FilterOperator
+from core.models.querymodel import QueryDefinition, Pagination, FilterCondition, ComplexFilter, FilterOperator
 
 # Core system components
 from core.db.database_interface import DatabaseInterface

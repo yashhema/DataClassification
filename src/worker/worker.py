@@ -43,7 +43,7 @@ from core.models.models import (
     ObjectToProcess,PolicyCommitPlanPayload,PolicyEnrichmentPayload,PolicyReconcilePayload,
     RemediationResult
 )
-
+from .search_provider import create_search_provider
 
 class WorkerStatus(str, Enum):
     """Worker operational states."""
@@ -250,7 +250,7 @@ class Worker:
                 # --- EXTERNAL (Connector-Bound) ACTION ---
                 first_object_id = payload.objects_to_process[0].ObjectID
                 datasource_id = first_object_id.split(':')[0]
-                connector = self.connector_factory.get_connector(datasource_id)
+                connector = await self.connector_factory.create_connector(datasource_id)
                 object_paths = [obj.ObjectPath for obj in payload.objects_to_process]
                 
                 if action.action_type == ActionType.MOVE:
@@ -400,10 +400,11 @@ class Worker:
                 await self.db_interface.test_connection()
             
             # Test connector factory
+            '''
             if not self.connector_factory or len(self.connector_factory.connector_registry) == 0:
                 self.logger.warning("No connectors registered in factory", worker_id=self.worker_id)
                 return False
-            
+            '''
             self.logger.log_health_check("Worker", True, worker_id=self.worker_id)
             return True
             
@@ -534,13 +535,13 @@ class Worker:
                 await self._process_classification_async(work_packet)
             elif work_packet.payload.task_type == TaskType.DELTA_CALCULATE:
                 await self._process_delta_calculate_async(work_packet)
-            elif task_type == TaskType.POLICY_SELECTOR_PLAN:
+            elif work_packet.payload.task_type == TaskType.POLICY_SELECTOR_PLAN:
                 await self._process_policy_selector_plan_async(work_packet)
-            elif task_type == TaskType.POLICY_SELECTOR_EXECUTE:
+            elif work_packet.payload.task_type == TaskType.POLICY_SELECTOR_EXECUTE:
                 await self._process_policy_selector_execute_async(work_packet)
-            elif task_type == TaskType.POLICY_ACTION_PLAN: # Assuming this new task type is added
+            elif work_packet.payload.task_type == TaskType.POLICY_ACTION_PLAN: # Assuming this new task type is added
                 await self._process_policy_action_plan_async(work_packet)
-            elif task_type == TaskType.POLICY_ACTION_EXECUTE:
+            elif work_packet.payload.task_type == TaskType.POLICY_ACTION_EXECUTE:
                 await self._process_policy_action_execute_async(work_packet)
 
 
@@ -580,7 +581,7 @@ class Worker:
         payload = work_packet.payload
         
         # Get appropriate connector
-        connector = self.connector_factory.get_connector(payload.datasource_id)
+        connector = await self.connector_factory.create_connector(payload.datasource_id)
         
         # Process enumeration with progress reporting (async iteration)
         total_objects = 0
@@ -615,7 +616,7 @@ class Worker:
         payload = work_packet.payload
         
         # Get appropriate connector
-        connector = self.connector_factory.get_connector(payload.datasource_id)
+        connector = await self.connector_factory.create_connector(payload.datasource_id)
         
         # Process detailed metadata retrieval (note: get_object_details is still sync)
         metadata_results = connector.get_object_details(work_packet)
@@ -635,7 +636,7 @@ class Worker:
         payload = work_packet.payload
         
         # Get appropriate connector
-        connector = self.connector_factory.get_connector(payload.datasource_id)
+        connector = await self.connector_factory.create_connector(payload.datasource_id)
         
         # Create EngineInterface for this specific work packet
         job_context = {
@@ -722,7 +723,7 @@ class Worker:
                         total_findings=len(all_findings),
                         total_components=total_components)
         
-        db_records = await engine_interface.convert_findings_to_db_format_async(
+        db_records =  engine_interface.convert_findings_to_db_format(
             all_findings=all_findings,
             total_rows_scanned=total_components  # For files, this represents component count
         )
@@ -796,7 +797,7 @@ class Worker:
                         total_findings=len(all_findings),
                         total_objects=total_objects)
         
-        db_records = await engine_interface.convert_findings_to_db_format_async(
+        db_records =  engine_interface.convert_findings_to_db_format(
             all_findings=all_findings,
             total_rows_scanned=total_objects  # For database, this represents object count
         )
@@ -1144,26 +1145,61 @@ class Worker:
 class ConnectorFactory:
     """Factory for creating connector instances with interface detection."""
     
-    def __init__(self, logger: SystemLogger, error_handler: ErrorHandler):
+    def __init__(self, logger: SystemLogger, error_handler: ErrorHandler, 
+                 db_interface: DatabaseInterface, credential_manager: Any, system_config: Any):
         self.logger = logger
         self.error_handler = error_handler
-        self.connector_registry: Dict[str, Union[IFileDataSourceConnector, IDatabaseDataSourceConnector]] = {}
-        
-    def register_connector(self, datasource_id: str, 
-                          connector: Union[IFileDataSourceConnector, IDatabaseDataSourceConnector]):
-        """Register a connector instance for a specific datasource."""
-        self.connector_registry[datasource_id] = connector
-        
-        # Log interface type
-        interface_type = "File-based" if isinstance(connector, IFileDataSourceConnector) else "Database"
-        self.logger.info(f"Registered {interface_type} connector for datasource {datasource_id}")
-        
-    def get_connector(self, datasource_id: str) -> Union[IFileDataSourceConnector, IDatabaseDataSourceConnector]:
-        """Get connector instance for datasource."""
-        if datasource_id not in self.connector_registry:
-            raise ValueError(f"No connector registered for datasource: {datasource_id}")
-        return self.connector_registry[datasource_id]
+        self.db_interface = db_interface
+        self.credential_manager = credential_manager
+        self.system_config = system_config
 
+
+    async def create_connector(self, datasource_id: str) -> Union[IFileDataSourceConnector, IDatabaseDataSourceConnector]:
+            """
+            Fetches a datasource's configuration and creates the correct
+            connector instance on-demand.
+            """
+            # 1. Get the full configuration for the requested data source
+            datasource_config = await self.db_interface.get_datasource_configuration(datasource_id)
+            if not datasource_config:
+                raise ValueError(f"Configuration for datasource '{datasource_id}' not found.")
+            
+            ds_type = datasource_config.datasource_type.lower()
+            
+            self.logger.info(f"Creating connector for datasource '{datasource_id}' of type '{ds_type}'.")
+
+            # 2. Use the 'datasource_type' to decide which connector class to instantiate
+            if ds_type == 'smb':
+                from connectors.smb_connector import SMBConnector
+                return SMBConnector(
+                    datasource_id=datasource_id,
+                    smb_config=datasource_config.configuration,
+                    system_config=self.system_config,
+                    logger=self.logger,
+                    error_handler=self.error_handler,
+                    db_interface=self.db_interface,
+                    credential_manager=self.credential_manager
+                )
+            elif ds_type == 'local':
+                from connectors.local_connector import LocalConnector
+                return LocalConnector(
+                    datasource_id=datasource_id,
+                    local_config=datasource_config.configuration,
+                    system_config=self.system_config,
+                    logger=self.logger,
+                    error_handler=self.error_handler
+                )
+            elif ds_type == 'sqlserver':
+                from connectors.sql_server_connector import SQLServerConnector
+                return SQLServerConnector(
+                    datasource_id=datasource_id,
+                    logger=self.logger,
+                    error_handler=self.error_handler,
+                    db_interface=self.db_interface,
+                    credential_manager=self.credential_manager
+                )
+            else:
+                raise ValueError(f"Unknown or unsupported connector type: '{ds_type}'")
 
 # =============================================================================
 # Worker Factory and Management

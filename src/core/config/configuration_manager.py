@@ -53,7 +53,11 @@ class SystemIdentityConfig(BaseModel):
     elasticsearch_credential_id: Optional[str] = Field(None, description="Credential ID for Elasticsearch password.")
 
 
-
+class FileLoggingConfig(BaseModel):
+    enabled: bool = Field(False, description="Master switch to enable logging to a file.")
+    path: str = Field("logs/system.log", description="Path to the log file.")
+    level: str = Field("DEBUG", description="Log level for the file (e.g., DEBUG, INFO).")
+    format: str = Field("JSON", description="Format for the file log (JSON is best for analysis).")
 
 
 class WorkerConfig(BaseModel):
@@ -72,7 +76,8 @@ class OrchestratorConfig(BaseModel):
     job_monitor_interval_sec: int = Field(30)
     pipeliner_interval_sec: int = Field(10)
     task_assigner_interval_sec: int = Field(2)
-    cli_enabled: bool = Field(True, description="Enable the interactive CLI for job control during development.")
+    job_reaper_interval_seconds: int = Field(180, description="How often the Job Reaper checks for abandoned jobs.")
+    instance_id: str = Field("orchestrator-default-01", description="A stable, persistent ID for this orchestrator instance.")
 
 class JobConfig(BaseModel):
     failure_threshold_percent: int = Field(10)
@@ -81,12 +86,13 @@ class ConnectorConfig(BaseModel):
     discovery_batch_write_size: int = Field(1000)
     easyocr_support_enabled: bool = Field(True)
     get_table_or_images_enabled: bool = Field(True)
+    tika_fallback_enabled: bool = Field(True, description="A master switch to enable or disable the Tika fallback for all datasources.")
 
 class LoggingConfig(BaseModel):
     format: str = Field("TEXT")
     level: str = Field("INFO")
     progress_sampling_rate: float = Field(0.1)
-
+    file: Optional[FileLoggingConfig] = None
 class ErrorHandlingConfig(BaseModel):
     persistence_enabled: bool = Field(True)
     circuit_breaker_threshold: int = Field(5)
@@ -107,8 +113,28 @@ class ClassificationConfig(BaseModel):
 class TaskCostEstimationConfig(BaseModel):
     classification_mb_per_gb_file: int = Field(128)
     default_task_cost_mb: int = Field(256)
-
-
+class ContentExtractionLimitsConfig(BaseModel):
+    max_file_size_mb: int = 10
+    max_component_size_mb: int = 5
+    max_text_chars: int = 100000
+    max_document_table_rows: int = 1000
+    max_archive_members: int = 50
+    max_archive_depth: int = 3
+    sampling_strategy: str = "head"
+class ContentExtractionFeaturesConfig(BaseModel):
+    extract_tables: bool = True
+    extract_pictures: bool = False
+    extract_archives: bool = True
+    ocr_enabled: bool = False
+    preserve_structure: bool = True
+    include_metadata: bool = True
+    treat_xml_json_structured: bool = True
+    tika_fallback_enabled: bool = False
+    
+class ContentExtractionSystemConfig(BaseModel):
+    limits: ContentExtractionLimitsConfig = Field(default_factory=ContentExtractionLimitsConfig)
+    features: ContentExtractionFeaturesConfig = Field(default_factory=ContentExtractionFeaturesConfig)
+    
 class SystemConfig(BaseModel):
     """The root model for the entire system configuration."""
     database: DatabaseConfig
@@ -122,7 +148,7 @@ class SystemConfig(BaseModel):
     errors: ErrorHandlingConfig
     classification: ClassificationConfig = Field(default_factory=ClassificationConfig)
     task_cost_estimation: TaskCostEstimationConfig = Field(default_factory=TaskCostEstimationConfig)
-
+    content_extraction: ContentExtractionSystemConfig = Field(default_factory=ContentExtractionSystemConfig)
 # =================================================================
 # The Configuration Manager
 # =================================================================
@@ -167,21 +193,21 @@ class ConfigurationManager:
             "deployment_model": orchestrator_section.get("deployment_model", "EKS"),
         }
 
-    def load_database_overrides(self, db_interface: "DatabaseInterface", context: Optional[Dict[str, Any]] = None):
+    async def load_database_overrides_async(self, db_interface: "DatabaseInterface", context: Optional[Dict[str, Any]] = None):
         """Phase 3: Load overrides using the now-injected services."""
         self._ensure_services()
         context = context or {}
         self.logger.info("Fetching system parameters from database...", **context)
         try:
-            global_params = db_interface.get_system_parameters()
+            global_params = await db_interface.get_system_parameters()
             self._merge_params(global_params)
             
             node_group = self._raw_config.get("system", {}).get("node_group")
             if node_group:
-                node_params = db_interface.get_system_parameters(node_group=node_group)
+                node_params = await db_interface.get_system_parameters(node_group=node_group)
                 self._merge_params(node_params)
         except Exception as e:
-            self.error_handler.handle_error(e, context="load_database_overrides", **context)
+            self.error_handler.handle_error(e, "load_database_overrides", **context)
             raise
 
     def finalize(self, context: Optional[Dict[str, Any]] = None):

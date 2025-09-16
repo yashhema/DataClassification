@@ -1,0 +1,84 @@
+Of course. Based on our finalized design and the provided source code, here is a practical guide on how to run a scanning job for your existing data source, set the worker count to 1 for debugging, and find the logs.
+
+The process involves two steps: first, configuring your environment for a single-worker debug session, and second, running the application and using its interactive CLI to start the job.
+
+-----
+
+### \#\#\# 1. How to Set the Worker Count to 1
+
+For debugging, you will run the system in `single_process` mode. The number of workers in this mode is controlled by a parameter in your configuration file.
+
+  * **File to Edit**: `config/system_default.yaml`
+  * **Parameter to Change**: `worker.in_process_thread_count`
+
+**Action:**
+Open the `config/system_default.yaml` file and change the value of `in_process_thread_count` from its current setting to `1`.
+
+**Example:**
+
+```yaml
+# In config/system_default.yaml
+
+worker:
+  # Change this value from 8 (or its default) to 1 for debugging.
+  in_process_thread_count: 1
+  task_timeout_seconds: 600
+  heartbeat_interval_seconds: 60
+  max_retries: 3
+  # ... rest of the worker config
+```
+
+This ensures that when you run in `single_process` mode, the orchestrator will only start a single worker coroutine, making the log output much easier to follow.
+
+-----
+
+### \#\#\# 2. The Command to Run the Job
+
+The system is designed to be started via `main.py`, which then provides an interactive command-line interface (CLI) to manage jobs.
+
+#### **Step A: Start the Application**
+
+Navigate to your project's root directory in your terminal and run the following command to start the entire system in a single, debug-friendly process:
+
+```bash
+python src/main.py --mode single_process
+```
+
+The application will start, initialize all the components (Orchestrator, the single Worker, etc.), and you will see a command prompt like `(CLI) >`.
+
+#### **Step B: Start the Job from the CLI**
+
+Now, you need to tell the running Orchestrator to start a job from a specific template. The `script.sql` file you provided includes a sample scan template with the ID `test_sql_localhost`.
+
+At the application's CLI prompt, type the following command and press Enter:
+
+```
+start_job test_sql_localhost SCANNING
+```
+
+  * **`start_job`**: This is the command to the Orchestrator.
+  * **`test_sql_localhost`**: This is the `TemplateID` of the `ScanTemplate` you want to run.
+  * **`SCANNING`**: This specifies the `JobType`.
+
+The Orchestrator will then create the job and assign the first task to your single running worker.
+
+-----
+
+### \#\#\# 3. Where Logs are Saved
+
+Based on the current configuration in `main.py`, the `SystemLogger` is configured to write all log output directly to your **console (standard output)**.
+
+  * **Location**: The terminal window where you ran `python src/main.py`.
+  * **Controlling Verbosity**: To get more detailed logs for debugging, you can change the log level in your `config/system_default.yaml` file. Change `level: INFO` to `level: DEBUG` to see all messages.
+
+**Example `logging` config for debugging:**
+
+```yaml
+# In config/system_default.yaml
+
+logging:
+  format: TEXT
+  # Change this to DEBUG for more detailed output
+  level: DEBUG 
+  progress_sampling_rate: 0.1
+```

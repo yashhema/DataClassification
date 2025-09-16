@@ -17,7 +17,7 @@ import fnmatch
 import asyncio
 import tempfile
 import aiofiles
-from typing import AsyncIterator, Optional, Dict, Any, List
+from typing import AsyncIterator, Optional, Dict, Any, List,Tuple
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -43,7 +43,7 @@ except ImportError as e:
 from core.interfaces.worker_interfaces import IFileDataSourceConnector
 from core.models.models import (
     WorkPacket, DiscoveredObject, ObjectMetadata, ObjectType, 
-     ContentComponent
+     ContentComponent,TombstoneConfig,RemediationResult
 )
 from core.errors import (
     NetworkError, RightsError, ProcessingError, ConfigurationError,
@@ -196,14 +196,29 @@ class SMBConnector(IFileDataSourceConnector):
     """SMB file share datasource with async ContentExtractor integration"""
 
     def __init__(self, datasource_id: str, smb_config: Dict[str, Any], 
-                 content_extractor: ContentExtractor, logger: SystemLogger, 
-                 error_handler):
+                 system_config: Any, logger: Any, error_handler: Any,
+                 db_interface: Any, credential_manager: Any):
         self.datasource_id = datasource_id
         self.smb_config = smb_config
-        self.content_extractor = content_extractor
+        self.credential_manager = credential_manager
         self.logger = logger
         self.error_handler = error_handler
+        #1. Parse the content extraction settings from the data source config.
+        #    This allows each data source to have unique extraction settings.
+        extraction_dict = smb_config.get('content_extraction', {})
+        self.extraction_config = ContentExtractionConfig.from_dict(extraction_dict)
         
+        # 2. For an SMB connector, we know it downloads temporary files
+        #    that must be cleaned up, so we enforce it here.
+        self.extraction_config.features.cleanup_temp_files = True
+        
+        # 3. Initialize a NEW ContentExtractor with the specific config for THIS connector.
+        self.content_extractor = ContentExtractor(
+            extraction_config=self.extraction_config,
+            system_config=system_config,
+            logger=self.logger,
+            error_handler=self.error_handler
+        )        
         # SMB connection
         self.smb_connection: Optional[SMBConnection] = None
         
@@ -424,7 +439,8 @@ class SMBConnector(IFileDataSourceConnector):
                         
                 finally:
                     # Clean up temp file (async)
-                    await self._cleanup_temp_file_async(temp_file_path)
+                    if self.extraction_config.features.cleanup_temp_files:
+                        await self._cleanup_temp_file_async(temp_file_path)
                     
             except Exception as e:
                 error = self.error_handler.handle_error(
@@ -823,18 +839,39 @@ class SMBConnector(IFileDataSourceConnector):
     # =============================================================================
 
     async def _ensure_connection_async(self):
-        """Ensure SMB connection is established (async)"""
-        if not self.smb_connection:
-            self.smb_connection = SMBConnection(self.smb_config, self.logger)
-        
-        if not self.smb_connection.is_connected():
-            success = await self.smb_connection.connect_async()
-            if not success:
-                raise NetworkError(
-                    "Failed to establish SMB connection",
-                    ErrorType.NETWORK_CONNECTION_FAILED,
-                    host=self.smb_config.get('host')
-                )
+        """
+        Ensures a connection is established by fetching credentials
+        and connecting on the first call.
+        """
+        if self._is_connected and self.smb_connection:
+            return
+
+        # 1. Get the credential_id from the data source configuration
+        credential_id = self.smb_config.get("scan_profiles", [{}])[0].get("credential_id")
+        if not credential_id:
+            raise ValueError("credential_id is missing from SMB data source config")
+
+        # 2. Fetch the credential record from the database (async)
+        credential_record = await self.db_interface.get_credential_by_id_async(credential_id)
+        if not credential_record:
+            raise ValueError(f"Credential '{credential_id}' not found in database.")
+
+        # 3. Use the CredentialManager to get the actual password (async)
+        password = await self.credential_manager.get_password_async(credential_record.store_details)
+
+        # 4. Prepare the connection details
+        connection_details = {
+            "host": self.smb_config.get("connection", {}).get("host"),
+            "share_name": self.smb_config.get("connection", {}).get("share_or_bucket"),
+            "username": credential_record.username,
+            "password": password,
+            "domain": credential_record.domain
+        }
+
+        # 5. Establish the actual connection
+        self.smb_connection = SMBConnection(connection_details, self.logger)
+        await self.smb_connection.connect_async()
+        self._is_connected = True
 
     async def connect_async(self) -> bool:
         """Establish SMB connection (async)"""

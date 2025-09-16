@@ -21,10 +21,9 @@ from core.config.configuration_manager import ClassificationConfidenceConfig
 # Import for type hinting and JobState enum access
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from orchestrator.orchestrator import Orchestrator, JobState
-else:
-    # Import JobState for runtime use
-    from orchestrator.orchestrator import JobState
+    from orchestrator.orchestrator import Orchestrator
+# UPDATED: Import JobState from the new, neutral file
+from orchestrator.orchestrator_state import JobState
 
 class JobCompletionMonitor:
     """
@@ -70,8 +69,11 @@ class JobCompletionMonitor:
                 await asyncio.sleep(self.interval)
                 
             except Exception as e:
-                self.logger.error("An unexpected error occurred in the JobMonitor loop.", exc_info=True)
-                # Avoid tight loop on repeated database failures
+                self.orchestrator.error_handler.handle_error(
+                    e, 
+                    context="job_monitor_main_loop",
+                    operation="main_loop_iteration"
+                )                # Avoid tight loop on repeated database failures
                 await asyncio.sleep(self.interval)
         
         self.logger.log_component_lifecycle("JobMonitor", "STOPPED")

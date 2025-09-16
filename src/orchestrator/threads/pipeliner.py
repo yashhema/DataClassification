@@ -12,7 +12,7 @@ import asyncio
 from math import ceil
 
 # Core system and model imports
-from core.db_models.job_schema import TaskStatus, TaskType
+from core.db_models.job_schema import TaskStatus
 from core.db_models.remediation_ledger_schema import LedgerStatus
 from core.models.models import (
     PolicySelectorExecutePayload,
@@ -20,7 +20,9 @@ from core.models.models import (
     PolicyReconcilePayload,
     QueryDefinition,
     Pagination,
-    ActionDefinition
+    ActionDefinition,
+    TaskType
+    
 )
 
 # Import for type hinting

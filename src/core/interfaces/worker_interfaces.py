@@ -5,12 +5,13 @@ This includes interfaces for discovery, classification, and post-scan remediatio
 """
 
 from abc import ABC, abstractmethod
-from typing import List, AsyncIterator, Optional, Dict, Any
+from typing import List, AsyncIterator, Optional, Dict, Any, Tuple
 
 # Import the strongly-typed Pydantic models
 from core.models.models import DiscoveredObject, ObjectMetadata, RemediationResult
-from core.models.models import WorkPacket, PIIFinding, ContentComponent 
-from core.models.models import RemediationResult, TombstoneConfig
+from core.models.models import WorkPacket, PIIFinding, ContentComponent, TombstoneConfig
+
+
 class IDatabaseDataSourceConnector(ABC):
     """
     Interface for data source connectors that interact with structured databases.
@@ -31,18 +32,20 @@ class IDatabaseDataSourceConnector(ABC):
         """Retrieves the actual content of an object for classification."""
         pass
 
+# NEW: Interface for post-scan remediation actions
 class IRemediationConnector(ABC):
     """
     Interface for connectors that support post-scan remediation actions.
-    All methods are designed to operate on batches of objects for performance.
+    These methods provide the "write" capabilities needed for a full
+    data governance workflow.
     """
 
     @abstractmethod
     async def move_objects(self, 
                            source_paths: List[str], 
-                           destination_directory: str, 
-                           tombstone_config: Optional[TombstoneConfig] = None,
-                           context: Dict[str, Any]) -> RemediationResult:
+                           destination_directory: str,context: Dict[str, Any], 
+                           tombstone_config: Optional[TombstoneConfig] = None
+                           ) -> RemediationResult:
         """
         Moves a batch of objects. If tombstone_config is provided, it must create
         a tombstone file at the original location after a successful move.
@@ -51,9 +54,9 @@ class IRemediationConnector(ABC):
 
     @abstractmethod
     async def delete_objects(self, 
-                           paths: List[str], 
+                           paths: List[str], context: Dict[str, Any],
                            tombstone_config: Optional[TombstoneConfig] = None,
-                           context: Dict[str, Any]) -> RemediationResult:
+                           ) -> RemediationResult:
         """
         Deletes a batch of objects. If tombstone_config is provided, it must create
         a tombstone file in place of the deleted object.
@@ -94,9 +97,8 @@ class IRemediationConnector(ABC):
         """
         pass
 
-
 # UPDATED: IFileDataSourceConnector now inherits from IRemediationConnector
-class IFileDataSourceConnector(ABC, IRemediationConnector):
+class IFileDataSourceConnector(IRemediationConnector):
     """Interface for file-based datasource connectors (SMB, S3, Azure Blob, etc.)"""
     
     @abstractmethod

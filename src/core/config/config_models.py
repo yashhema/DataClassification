@@ -13,6 +13,30 @@ from pydantic import BaseModel, Field
 # =================================================================
 
 # --- 1.1: Database Connection Models ---
+# --- Define a model for each specific authentication method ---
+
+class WindowsAuthConfig(BaseModel):
+    auth_method: Literal["windows"]
+
+class StandardAuthConfig(BaseModel):
+    auth_method: Literal["standard"]
+    username: str = Field(..., description="Username for standard password authentication.")
+
+class ADAuthConfig(BaseModel):
+    auth_method: Literal["ad"]
+    username: str = Field(..., description="The AD username.")
+    domain: Optional[str] = Field(None, description="The AD domain.")
+
+class CertificateAuthConfig(BaseModel):
+    auth_method: Literal["certificate"]
+    client_cert_path: str = Field(..., description="Path to the client's SSL certificate.")
+    client_key_path: str = Field(..., description="Path to the client's SSL private key.")
+
+# --- Create a Discriminated Union of all auth types ---
+DbAuthConfig = Annotated[
+    Union[WindowsAuthConfig, StandardAuthConfig, ADAuthConfig, CertificateAuthConfig],
+    Field(discriminator="auth_method")
+]
 
 class DbAuthConfig(BaseModel):
     username: Optional[str] = Field(None, description="Username for standard password authentication.")
@@ -40,6 +64,7 @@ class DatabaseConnectionConfig(BaseModel):
     tls: TlsConfig = Field(default_factory=TlsConfig)
     connection_timeout_seconds: int = 30
     command_timeout_seconds: int = 300
+    auth: DbAuthConfig
 
 # --- 1.2: File & Object Store Connection Models (NEW) ---
 

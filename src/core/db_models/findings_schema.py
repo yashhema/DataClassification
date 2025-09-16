@@ -12,12 +12,15 @@ This schema uses a two-table, decoupled approach for performance:
 
 from typing import Optional, Dict, Any
 
+
 from sqlalchemy import (
     String, Integer, Float, LargeBinary, Text, Index
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
+
 
 class ScanFindingSummary(Base):
     __tablename__ = 'ScanFindingSummaries'
@@ -58,7 +61,7 @@ class ScanFindingSummary(Base):
     AverageConfidence: Mapped[float] = mapped_column(Float, nullable=False)
     MaxConfidence: Mapped[float] = mapped_column(Float, nullable=False)
     # Stores a JSON string of sample findings
-    SampleFindings: Mapped[Optional[str]] = mapped_column(Text)
+    SampleFindings: Mapped[Optional[str]] = mapped_column(Text())
 
     # === Data Quality and Source Statistics ===
     TotalRowsInSource: Mapped[Optional[int]] = mapped_column(Integer)
@@ -81,10 +84,9 @@ class ScanFindingOccurrence(Base):
     SummaryID: Mapped[int] = mapped_column(Integer, nullable=False)
 
     # === Finding Details ===
-    Text: Mapped[str] = mapped_column(Text, nullable=False)
+    Text: Mapped[str] = mapped_column(Text(), nullable=False)
     ConfidenceScore: Mapped[float] = mapped_column(Float, nullable=False)
     StartPosition: Mapped[int] = mapped_column(Integer, nullable=False)
     EndPosition: Mapped[int] = mapped_column(Integer, nullable=False)
     # Stores a JSON string of extra context
-    ContextData: Mapped[Optional[str]] = mapped_column(Text)
-
+    ContextData: Mapped[Optional[str]] = mapped_column()

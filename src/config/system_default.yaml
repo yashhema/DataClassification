@@ -1,0 +1,101 @@
+# ===================================================================
+# Default System Configuration
+#
+# This file provides the base settings for all components of the
+# Data Classification Platform. Values here can be overridden by
+# records in the 'SystemParameters' database table.
+# ===================================================================
+
+# --- Database & Cache Configuration ---
+database:
+  connection_string: "mssql+aioodbc://localhost/DataClassification?driver=ODBC+Driver+17+for+SQL+Server&trusted_connection=yes"
+
+redis:
+  host: "localhost"
+  port: 6379
+  password: null
+  db: 0
+
+# --- System Identity & Global Settings ---
+system:
+  component_name: "Orchestrator-Primary"
+  machine_name: "dev-machine-01" # This is often overridden by environment variables in production
+  node_group: "default"
+  total_process_memory_limit_mb: 8192
+  local_timezone: "America/New_York"
+  
+  # Backend strategy switches
+  search_backend: "sql"                 # Options: 'sql', 'elasticsearch'
+  primary_storage_backend: "sql"    # Options: 'sql', 'dynamodb'
+  
+  # Elasticsearch connection details (used if search_backend is 'elasticsearch')
+  elasticsearch_host: "localhost"
+  elasticsearch_port: 9200
+  elasticsearch_user: null
+  elasticsearch_credential_id: null # Reference to a credential in the DB
+
+# --- Worker Configuration ---
+worker:
+  in_process_thread_count: 1 # Set to 1 for single-threaded debugging
+  task_timeout_seconds: 600
+  heartbeat_interval_seconds: 60
+  max_retries: 3
+  process_memory_limit_mb: 4096
+  global_cpu_threshold_percent: 90
+  mount_strategy: "application" # This is the safe, recommended default
+# --- Orchestrator Configuration ---
+orchestrator:
+  deployment_model: "SINGLE_PROCESS" # Options: 'SINGLE_PROCESS', 'EKS'
+  task_cache_size: 100
+  long_poll_timeout_seconds: 30
+  reaper_interval_seconds: 120
+  job_monitor_interval_sec: 30
+  pipeliner_interval_sec: 10
+  task_assigner_interval_sec: 2
+  cli_enabled: true
+  instance_id: "orchestrator-main-01"
+
+# --- Job & Task Defaults ---
+job:
+  failure_threshold_percent: 10
+
+task_cost_estimation:
+  classification_mb_per_gb_file: 128
+  default_task_cost_mb: 256
+
+# --- Connector & Extraction Configuration ---
+connector:
+  discovery_batch_write_size: 1000
+  
+  # Master switch for OCR. If false, OCR is disabled system-wide.
+  easyocr_support_enabled: true
+  
+  # Master switch for Tika. If false, Tika fallback is disabled system-wide.
+  tika_fallback_enabled: false
+
+# --- Cross-Cutting Concerns ---
+logging:
+  # This level is for the CONSOLE
+  format: TEXT
+  level: WARNING
+  progress_sampling_rate: 0.1
+  
+  #  for file logging
+  file:
+    enabled: true
+    path: "logs/application.log"
+    # This level is for the FILE, allowing you to capture more detail
+    level: "DEBUG"
+    format: "JSON"
+errors:
+  persistence_enabled: true
+  circuit_breaker_threshold: 5
+
+# --- Classification Engine Configuration ---
+classification:
+  max_content_size_mb: 100
+  default_row_limit: 1000
+  max_samples_per_finding: 100
+  confidence_scoring:
+    low_threshold: 30
+    medium_threshold: 60

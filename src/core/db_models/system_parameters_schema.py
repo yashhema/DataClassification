@@ -23,7 +23,7 @@ class ComponentType(enum.Enum):
     CONNECTOR = "connector"
 
 class SystemParameter(Base):
-    __tablename__ = 'system_parameters'
+    __tablename__ = 'SystemParameters'
     __table_args__ = {'extend_existing': True}
     __doc__ = """
     Stores tunable system parameters. This table holds overrides to the

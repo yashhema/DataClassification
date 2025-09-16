@@ -32,6 +32,18 @@ from core.logging.system_logger import SystemLogger
 from core.config.configuration_manager import SystemConfig
 from core.errors import ErrorHandler
 import aiofiles.os
+import asyncio
+import threading
+# Add these imports to the top of content_extraction/content_extractor.py
+import asyncio
+try:
+    import tikka
+except ImportError:
+    pass # Handled in __init__
+
+# A lock to ensure the JVM is only started once per process
+_tika_init_lock = threading.Lock()
+_tika_initialized = False
 class ContentExtractor:
     """Universal content extraction module for file-based connectors"""
     
@@ -56,7 +68,22 @@ class ContentExtractor:
         
         # Validate configuration
         self._validate_extraction_config()
-
+        # UPDATED: Initialize the in-process Tika JVM based on the SYSTEM-LEVEL flag.
+        global _tika_initialized
+        
+        # This is the master switch for the entire worker process.
+        if self.system_config.connector.tika_fallback_enabled:
+            with _tika_init_lock:
+                if not _tika_initialized:
+                    try:
+                        import tikka
+                        # This starts the JVM in-process via JPype.
+                        tikka.init_tika() 
+                        _tika_initialized = True
+                        self.logger.info("Tika (JPype) has been initialized for the worker process.")
+                    except Exception as e:
+                        self.logger.error(f"System-level Tika fallback is enabled but failed to initialize. Fallback will be disabled for all datasources. Error: {e}")
+                        _tika_initialized = False # Ensure we don't try again
     # =============================================================================
     # Main Extraction Interface
     # =============================================================================
@@ -112,9 +139,21 @@ class ContentExtractor:
                 extractor = self.extractor_registry[file_type]
                 async for component in extractor(file_path, object_id, job_id, task_id, datasource_id):
                     yield component
-            else:
-                yield self._create_unsupported_component(object_id, file_path, file_type)
-            
+            else: # This block handles unsupported file types
+                # UPDATED: Perform the two-level check
+                global _tika_initialized
+                use_tika = (
+                    _tika_initialized and # Check if the system-level init was successful
+                    self.extraction_config.features.tika_fallback_enabled # Check the data source-level flag
+                )
+
+                if use_tika:
+                    self.logger.info(f"File type '{file_type}' not natively supported. Attempting Tika fallback.", object_id=object_id)
+                    async for component in self._process_with_tika_fallback(file_path, object_id):
+                        yield component
+                else:
+                    # Original logic if Tika is not enabled for this datasource or failed to initialize
+                    yield self._create_unsupported_component(object_id, file_path, file_type)            
             self.logger.info("Content extraction completed",
                            extraction_id=extraction_id,
                            object_id=object_id)
@@ -131,6 +170,64 @@ class ContentExtractor:
         
         finally:
             await self._cleanup_temp_files_async(extraction_id)
+
+
+
+
+
+
+    async def _process_with_tika_fallback(self, file_path: str, object_id: str) -> AsyncIterator[ContentComponent]:
+        """
+        Uses the in-process Tika (JPype) to extract content from unsupported file types.
+        """
+        try:
+            # Get the current asyncio event loop to run the synchronous call in a thread.
+            loop = asyncio.get_running_loop()
+            
+            # The tikka.parse() call is synchronous and can block for several seconds.
+            # It MUST be run in an executor to avoid freezing the async worker.
+            parsed = await loop.run_in_executor(
+                None,       # Use the default thread pool executor
+                tikka.parse, # The function to run
+                file_path    # The argument to the function
+            )
+            
+            # Safely get the content and metadata from Tika's response.
+            content = parsed.get("content", "").strip() if parsed and "content" in parsed else ""
+            
+            if content:
+                # If Tika successfully extracted text, create a standard text component.
+                base_name = self._get_base_name(file_path)
+                tika_metadata = parsed.get("metadata", {})
+                
+                # Add some of Tika's metadata for better context.
+                extra_metadata = {
+                    "tika_content_type": tika_metadata.get("Content-Type"),
+                    "tika_producer": tika_metadata.get("producer")
+                }
+                
+                # Use the existing helper to ensure component size limits are respected.
+                component = self._create_text_component(
+                    object_id=object_id,
+                    component_id=f"{base_name}_tika_text_1",
+                    file_path=file_path,
+                    content=content,
+                    extra_metadata=extra_metadata,
+                    extraction_method="tika_fallback"
+                )
+                yield component
+            else:
+                # Log if Tika runs but finds no text content.
+                self.logger.warning("Tika fallback ran but extracted no content.", object_id=object_id, file_path=file_path)
+
+        except Exception as e:
+            # If the Tika/JPype process fails, log the error and yield a
+            # standard error component to ensure the failure is recorded.
+            self.logger.error(f"Tika fallback processing failed for {file_path}", exc_info=True)
+            yield self._create_error_component(object_id, f"Tika fallback failed: {str(e)}")
+
+
+
 
     # =============================================================================
     # Archive Processing - Fixed Recursion and Depth Control
@@ -1792,7 +1889,7 @@ class ContentExtractor:
             '.xml': 'xml',
             '.zip': 'zip',
             '.tar': 'tar',
-            '.tar.gz': 'tar',
+            
             '.tgz': 'tar',
             '.png': 'image',
             '.jpg': 'image',

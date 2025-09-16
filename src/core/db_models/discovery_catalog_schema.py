@@ -5,15 +5,14 @@ records of discovered objects and their detailed metadata.
 """
 
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from sqlalchemy import (
-    String, Integer, LargeBinary, DateTime, JSON, Index, ForeignKey
+    String, Integer, LargeBinary, DateTime, JSON, Index, ForeignKey, Text, Boolean
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from .base import Base
-
 class DiscoveredObject(Base):
     __tablename__ = 'DiscoveredObjects'
     __table_args__ = (
