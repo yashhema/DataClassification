@@ -14,7 +14,7 @@ from sqlalchemy import (
 from .base import Base
 
 # Links ClassifierTemplate and Classifier models
-classifier_template_link = Table(
+ClassifierTemplateLink = Table(
     "classifier_template_link",
     Base.metadata,
     Column("template_id", String(255), ForeignKey("classifier_templates.template_id"), primary_key=True),
@@ -25,7 +25,7 @@ classifier_template_link = Table(
 )
 
 # Links DataSource and Tag models
-datasource_tag_link = Table(
+DataSourceTagLink = Table(
     "datasource_tag_link",
     Base.metadata,
     Column("datasource_id", String(255), ForeignKey("datasources.datasource_id"), primary_key=True),

@@ -44,7 +44,7 @@ class DataSource(Base):
     datasource_id: Mapped[str] = mapped_column(String(255), primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     datasource_type: Mapped[str] = mapped_column(String(50), nullable=False)
-    
+    node_group: Mapped[Optional["NodeGroup"]] = relationship()
     # UPDATED COMMENT: This now references the Pydantic model for its structure.
     configuration: Mapped[Dict[str, Any]] = mapped_column(
         JSON, 

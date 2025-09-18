@@ -24,10 +24,10 @@ class LedgerStatus(str, enum.Enum):
     RECONCILED = "RECONCILED" # Final state after metadata is updated
 
 class RemediationLedger(Base):
-    __tablename__ = 'RemediationLedger'
+    __tablename__ = 'remediation_ledger'
     __table_args__ = (
         UniqueConstraint('plan_id', 'bin_id', name='uq_plan_bin'),
-        Index('ix_remediationledger_status', 'Status'),
+        Index('ix_remediation_ledger_status', 'status'),
         {'extend_existing': True}
     )
     __doc__ = """
@@ -41,16 +41,16 @@ class RemediationLedger(Base):
     
     bin_id: Mapped[str] = mapped_column(String(255), nullable=False, comment="The unique ID for this specific bin of work within the plan.")
 
-    Status: Mapped[LedgerStatus] = mapped_column(SQLAlchemyEnum(LedgerStatus), nullable=False, default=LedgerStatus.PLANNED)
+    status: Mapped[LedgerStatus] = mapped_column(SQLAlchemyEnum(LedgerStatus), nullable=False, default=LedgerStatus.PLANNED)
 
     # The JSON columns are used to store the list of objects for the worker.
-    ObjectIDs: Mapped[List[str]] = mapped_column(JSON, nullable=False, comment="The list of unique ObjectIDs for the worker to process in this bin.")
+    object_ids: Mapped[List[str]] = mapped_column(JSON, nullable=False, comment="The list of unique object_ids for the worker to process in this bin.")
     
-    ObjectPaths: Mapped[List[str]] = mapped_column(JSON, nullable=False, comment="The corresponding list of object paths needed by the connector.")
+    object_paths: Mapped[List[str]] = mapped_column(JSON, nullable=False, comment="The corresponding list of object paths needed by the connector.")
 
     # Optional fields for auditing and debugging.
-    ResultDetails: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, comment="Stores a summary of the action's outcome, especially error details on failure.")
+    result_details: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, comment="Stores a summary of the action's outcome, especially error details on failure.")
     
-    WorkerID: Mapped[Optional[str]] = mapped_column(String(255), comment="The ID of the worker that last processed this bin.")
+    worker_id: Mapped[Optional[str]] = mapped_column(String(255), comment="The ID of the worker that last processed this bin.")
     
-    LastUpdatedAt: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), onupdate=datetime.now)
+    last_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), onupdate=datetime.now)

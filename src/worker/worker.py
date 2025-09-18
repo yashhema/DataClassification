@@ -67,7 +67,7 @@ class Worker:
                  settings: SystemConfig, 
                  db_interface: DatabaseInterface,
                  connector_factory: 'ConnectorFactory',
-                 logger: SystemLogger, 
+                 logger: SystemLogger, config_manager: ConfigurationManager,
                  error_handler: ErrorHandler,
                  orchestrator_url: Optional[str] = None,
                  orchestrator_instance: Optional[Any] = None):
@@ -87,6 +87,7 @@ class Worker:
         self.worker_id = worker_id
         self.settings = settings
         self.db_interface = db_interface
+        self.config_manager = config_manager
         self.connector_factory = connector_factory
         self.logger = logger
         self.error_handler = error_handler
@@ -251,7 +252,7 @@ class Worker:
                 first_object_id = payload.objects_to_process[0].ObjectID
                 datasource_id = first_object_id.split(':')[0]
                 connector = await self.connector_factory.create_connector(datasource_id)
-                object_paths = [obj.ObjectPath for obj in payload.objects_to_process]
+                object_paths = [obj.object_path for obj in payload.objects_to_process]
                 
                 if action.action_type == ActionType.MOVE:
                     remediation_result = await connector.move_objects(object_paths, action.destination_directory, action.tombstone_config, context)
@@ -271,7 +272,7 @@ class Worker:
                 
                 # Since the DB call is atomic, we assume full success if no exception was raised.
                 remediation_result = RemediationResult(
-                    succeeded_paths=[obj.ObjectPath for obj in payload.objects_to_process],
+                    succeeded_paths=[obj.object_path for obj in payload.objects_to_process],
                     failed_paths=[], success_count=len(payload.objects_to_process), failure_count=0
                 )
             else:
@@ -482,12 +483,13 @@ class Worker:
         """Get next task from orchestrator (mode-dependent, async)."""
         try:
             if self.is_single_process_mode:
-                # Direct method call to orchestrator (assume orchestrator has async method)
+                # Direct method call to orchestrator to get a task from the queue
                 work_packet_dict = await self.orchestrator.get_task_async(self.worker_id)
                 if work_packet_dict:
+                    # Reconstruct the Pydantic WorkPacket model from the dictionary
                     return WorkPacket(**work_packet_dict)
             else:
-                # HTTP API call to orchestrator (use aiohttp for proper async)
+                # This logic is for a distributed (EKS) deployment and remains unchanged
                 import aiohttp
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
@@ -510,6 +512,7 @@ class Worker:
             )
             self.logger.warning("Failed to get task from orchestrator", error_id=error.error_id)
             return None
+
 
     async def _process_task_async(self, work_packet: WorkPacket):
         """Process a single work packet (fully async)."""
@@ -650,10 +653,11 @@ class Worker:
         # Create fresh EngineInterface for this task
         engine_interface = EngineInterface(
             db_interface=self.db_interface,
-            config_manager=None,  # Will need to be injected properly
+            config_manager=self.config_manager,  
             system_logger=self.logger,
             error_handler=self.error_handler,
             job_context=job_context
+            
         )
         
         # Initialize engine interface for this template
@@ -739,72 +743,52 @@ class Worker:
                         db_records_created=len(db_records))
 
     async def _process_database_classification_async(self, connector: IDatabaseDataSourceConnector,
-                                                   engine_interface: EngineInterface, work_packet: WorkPacket):
-        """Handle database connectors with existing dict interface (async)."""
-        all_findings = []  # Accumulate ALL findings from all objects
+                                                 engine_interface: EngineInterface, work_packet: WorkPacket):
+        """Correctly handles database connectors by processing row-by-row."""
+        all_findings = []
         objects_processed = 0
-        total_objects = 0
+        total_rows_scanned = 0
         
-        self.logger.info("Starting database classification",
-                        task_id=work_packet.header.task_id)
-        
-        # Process dict objects and accumulate findings (ASYNC ITERATION)
-        async for content_batch in connector.get_object_content(work_packet):
-            total_objects += 1
-            object_id = content_batch.get("object_id")
-            content = content_batch.get("content")
-            
-            if object_id and content:
-                try:
-                    # For database content, treat as document content
-                    file_metadata = {
-                        "file_path": f"database_object_{object_id}",
-                        "file_name": object_id,
-                        "field_name": object_id,
-                        "extraction_source": "database"
-                    }
-                    
-                    # Get findings for this database object
-                    object_findings = await engine_interface.classify_document_content_async(
-                        content=content,
-                        file_metadata=file_metadata
-                    )
-                    
-                    all_findings.extend(object_findings)  # Accumulate findings
-                    objects_processed += 1
-                    
-                    self.logger.debug("Database object classified",
-                                    object_id=object_id,
-                                    findings_count=len(object_findings))
-                    
-                except Exception as e:
-                    error = self.error_handler.handle_error(
-                        e, f"classify_database_object_{object_id}",
-                        operation="database_object_classification",
-                        object_id=object_id,
-                        trace_id=work_packet.header.trace_id
-                    )
-                    self.logger.warning("Database object classification failed", error_id=error.error_id)
-                    # Continue processing other objects
-                
-                # Send heartbeat periodically
-                if objects_processed % 10 == 0:
-                    await self._send_heartbeat_async(work_packet.header.task_id)
+        self.logger.info("Starting database classification (row-by-row)", task_id=work_packet.header.task_id)
 
-        # Convert ALL accumulated findings to database format
-        self.logger.info("Converting findings to database format",
-                        task_id=work_packet.header.task_id,
-                        total_findings=len(all_findings),
-                        total_objects=total_objects)
+        # The connector will yield batches of rows for each table/column it processes
+        async for content_batch in connector.get_object_content(work_packet):
+            objects_processed += 1
+            
+            # Extract metadata and row data from the batch
+            metadata = content_batch.get("metadata", {})
+            rows = content_batch.get("content", []) # Expects a list of row dicts
+            
+            if not isinstance(rows, list):
+                self.logger.warning("Database content for classification was not a list of rows.", object_id=metadata.get("object_id"))
+                continue
+            
+            total_rows_scanned += len(rows)
+
+            # Process each row within the batch
+            for row_index, row_data in enumerate(rows):
+                try:
+                    row_pk = {"row_index": row_index, "object_path": metadata.get("object_path")}
+                    
+                    row_findings = await engine_interface.classify_database_row(
+                        row_data=row_data,
+                        row_pk=row_pk,
+                        table_metadata=metadata  # Pass the rich metadata from the connector
+                    )
+                    all_findings.extend(row_findings)
+                except Exception as e:
+                    self.error_handler.handle_error(e, "classify_database_row", row_index=row_index, object_path=metadata.get("object_path"))
+                    continue # Skip problematic rows
+
+        self.logger.info("Converting findings to database format", task_id=work_packet.header.task_id, total_findings=len(all_findings))
         
-        db_records =  engine_interface.convert_findings_to_db_format(
+        # Convert all accumulated findings using the correct total row count
+        db_records = engine_interface.convert_findings_to_db_format(
             all_findings=all_findings,
-            total_rows_scanned=total_objects  # For database, this represents object count
+            total_rows_scanned=total_rows_scanned
         )
         
-        # Store results in database (ASYNC)
         await self._store_classification_results_async(db_records, work_packet)
-
         self.logger.info("Database classification completed",
                         task_id=work_packet.header.task_id,
                         objects_processed=objects_processed,

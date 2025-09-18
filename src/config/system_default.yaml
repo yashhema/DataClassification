@@ -8,7 +8,7 @@
 
 # --- Database & Cache Configuration ---
 database:
-  connection_string: "mssql+aioodbc://localhost/DataClassification?driver=ODBC+Driver+17+for+SQL+Server&trusted_connection=yes"
+  connection_string: "mssql+aioodbc://localhost/NewDataClassification?driver=ODBC+Driver+17+for+SQL+Server&trusted_connection=yes"
 
 redis:
   host: "localhost"
@@ -20,7 +20,7 @@ redis:
 system:
   component_name: "Orchestrator-Primary"
   machine_name: "dev-machine-01" # This is often overridden by environment variables in production
-  node_group: "default"
+  node_group: "on_premise_workers"
   total_process_memory_limit_mb: 8192
   local_timezone: "America/New_York"
   

@@ -6,8 +6,9 @@ active jobs. It is responsible for transitioning jobs to their final state
 threshold is met. It also handles the graceful transition for paused jobs.
 
 FIXES APPLIED:
-- Added JobState enum import for finalize_job_state calls
-- Updated finalize_job_state method calls to use JobState enums instead of strings
+- Added JobState enum import for state management
+- Updated to use centralized _update_job_in_memory_state method
+- Fixed schema compliance: uses job.configuration instead of job.scan_template
 - Maintained correct JobStatus enum usage for database queries
 ASYNC CONVERSION:
 - Converted from threading.Thread to async coroutine
@@ -22,7 +23,7 @@ from core.config.configuration_manager import ClassificationConfidenceConfig
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from orchestrator.orchestrator import Orchestrator
-# UPDATED: Import JobState from the new, neutral file
+# Import JobState from the neutral state file
 from orchestrator.orchestrator_state import JobState
 
 class JobCompletionMonitor:
@@ -47,7 +48,7 @@ class JobCompletionMonitor:
                 # Fetch all jobs that are in a non-terminal state
                 # Using JobStatus enums (correct - matches database interface expectation)
                 jobs_to_check = await self.db.get_active_jobs(
-                    statuses=[JobStatus.RUNNING, JobStatus.PAUSING]
+                    statuses=[JobStatus.RUNNING, JobStatus.PAUSING, JobStatus.CANCELLING]
                 )
                 
                 for job in jobs_to_check:
@@ -79,56 +80,61 @@ class JobCompletionMonitor:
         self.logger.log_component_lifecycle("JobMonitor", "STOPPED")
 
     async def _process_job(self, job):
-        """Process a single job for state transitions."""
-        stats = await self.db.get_job_progress_summary(job.id)
-        total_tasks = sum(stats.values())
-        assigned_tasks = stats.get("ASSIGNED", 0)
-        
-        # --- Handle PAUSING -> PAUSED transition ---
-        # This state is entered when a user requests a pause. The job becomes
-        # fully PAUSED only after all its assigned tasks have finished.
-        if job.status == JobStatus.PAUSING:
-            if assigned_tasks == 0:
-                # Atomically transition the state in the DB
-                if await self.db.transition_job_from_pausing_to_paused(job.id):
-                    # FIXED: Use JobState enum instead of string
-                    self.orchestrator.finalize_job_state(job.id, JobState.PAUSED)
-            return  # Don't check other transitions for pausing jobs
+            """
+            Processes a single job for state transitions, including completion, failure,
+            and pause states, and sets the in-memory tombstone for cleanup.
+            """
+            stats = await self.db.get_job_progress_summary(job.id) 
+            total_tasks = sum(stats.values())
+            assigned_tasks = stats.get("ASSIGNED", 0)
 
-        # --- Handle RUNNING -> COMPLETED transition ---
-        if job.status == JobStatus.RUNNING:
-            pending_tasks = stats.get("PENDING", 0)
-            
-            # Job is complete when there are tasks and none are pending or assigned
-            if total_tasks > 0 and pending_tasks == 0 and assigned_tasks == 0:
-                # FIXED: Use JobState enum instead of string
-                self.orchestrator.finalize_job_state(job.id, JobState.COMPLETED)
-                return
+            # --- Handle PAUSING -> PAUSED transition ---
+            # This state is entered when a user requests a pause. The job becomes
+            # fully PAUSED only after all its assigned tasks have finished. [cite: 1847, 1848]
+            if job.status == JobStatus.PAUSING:
+                if assigned_tasks == 0:
+                    # Atomically transition the state in the DB
+                    if await self.db.transition_job_from_pausing_to_paused(job.id):
+                        # Update the in-memory state to PAUSED
+                        await self.orchestrator._update_job_in_memory_state(job.id, JobState.PAUSED) 
+                return  # Don't check other transitions for pausing jobs
 
-            # --- Handle RUNNING -> FAILED transition ---
-            failed_tasks = stats.get("FAILED", 0)
-            
-            # Check failure threshold if we have scan template configuration
-            if job.scan_template and total_tasks > 0:  # Added total_tasks > 0 check for safety
-                failure_threshold = job.scan_template.configuration.get("failure_threshold_percent", 10)
-                
-                # Check threshold only after a meaningful number of tasks have run
-                # The total_tasks > 10 check also prevents division by zero
-                if total_tasks > 10 and (failed_tasks / total_tasks * 100) >= failure_threshold:
-                    self.logger.warning(
-                        f"Job {job.id} breached failure threshold: {failed_tasks}/{total_tasks} tasks failed ({failed_tasks/total_tasks*100:.1f}% >= {failure_threshold}%)",
-                        job_id=job.id,
-                        failed_tasks=failed_tasks,
-                        total_tasks=total_tasks,
-                        failure_threshold=failure_threshold
-                    )
-                    # FIXED: Use JobState enum instead of string
-                    self.orchestrator.finalize_job_state(job.id, JobState.FAILED)
+            # --- Handle RUNNING -> COMPLETED transition ---
+            if job.status == JobStatus.RUNNING:
+                pending_tasks = stats.get("PENDING", 0)
+
+                # [cite_start]Job is complete when there are tasks, and none are pending or assigned 
+                if total_tasks > 0 and pending_tasks == 0 and assigned_tasks == 0:
+                    await self.db.update_job_status(job.id, JobStatus.COMPLETED) 
+                    # Set the in-memory state to TERMINATED for garbage collection
+                    await self.orchestrator._update_job_in_memory_state(job.id, JobState.TERMINATED)
+                    self.logger.info(f"Job {job.id} completed successfully and is marked for cleanup.", job_id=job.id)
                     return
 
-        # --- Handle CANCELLING -> CANCELLED transition ---
-        if job.status == JobStatus.CANCELLING:
-            # Job is fully cancelled when no tasks are assigned (pending tasks already cancelled)
-            if assigned_tasks == 0:
-                # FIXED: Use JobState enum instead of string  
-                self.orchestrator.finalize_job_state(job.id, JobState.CANCELLED)
+                # --- Handle RUNNING -> FAILED transition ---
+                failed_tasks = stats.get("FAILED", 0)
+
+                if total_tasks > 10:  # Check only after a meaningful number of tasks have run 
+                    # [cite_start]Use job.configuration to get the failure threshold 
+                    failure_threshold = job.configuration.get("failure_threshold_percent", 10)
+                    
+                    if (failed_tasks / total_tasks * 100) >= failure_threshold:
+                        self.logger.warning(
+                            f"Job {job.id} breached failure threshold: {failed_tasks}/{total_tasks} tasks failed.",
+                            job_id=job.id,
+                            failed_tasks=failed_tasks,
+                            total_tasks=total_tasks,
+                            failure_threshold=failure_threshold)
+                        
+                        await self.db.update_job_status(job.id, JobStatus.FAILED) 
+                        # Set the in-memory state to TERMINATED for garbage collection
+                        await self.orchestrator._update_job_in_memory_state(job.id, JobState.TERMINATED)
+                        return
+
+            # --- Handle CANCELLING -> CANCELLED transition ---
+            if job.status == JobStatus.CANCELLING:
+                # [cite_start]Job is fully cancelled when no tasks are assigned 
+                if assigned_tasks == 0:
+                    await self.db.update_job_status(job.id, JobStatus.CANCELLED) 
+                    # Set the in-memory state to TERMINATED for garbage collection
+                    await self.orchestrator._update_job_in_memory_state(job.id, JobState.TERMINATED) 

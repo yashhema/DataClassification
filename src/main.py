@@ -1,8 +1,7 @@
 # src/main.py
 """
-The main entry point for the application. This script acts as a flexible
-launcher for starting the system in different modes and integrates the
-decoupled CLI for single_process deployments.
+The main entry point for the application service. This script acts as a flexible
+launcher for starting the system in different modes.
 """
 
 import argparse
@@ -13,11 +12,10 @@ import sys
 import os
 import socket
 import queue
-import threading
-import time
-from uuid import uuid4
-from typing import Optional, List,Dict
 import traceback
+from uuid import uuid4
+from typing import Optional, List, Dict
+
 # Core infrastructure imports
 from core.config.configuration_manager import ConfigurationManager  
 from core.db.database_interface import DatabaseInterface
@@ -30,22 +28,18 @@ from orchestrator.orchestrator import Orchestrator
 from worker.worker import Worker, ConnectorFactory
 from content_extraction.content_extractor import ContentExtractor
 from core.models.models import ContentExtractionConfig
-
-# Decoupled CLI imports
-from orchestrator.orchestrator_api_shim import OrchestratorApiShim
 from cli import run_cli
+from core.db.database_interface_sync_wrapper import DatabaseInterfaceSyncWrapper
 
-# Global shutdown event for graceful async shutdown
+# Global shutdown event
 shutdown_event = asyncio.Event()
 
 def graceful_shutdown_handler(signum, frame):
     """Signal handler to initiate a graceful async shutdown."""
     print(f"\nShutdown signal {signum} received. Initiating graceful shutdown...")
-    # Set the event in a thread-safe way
-    if asyncio.get_running_loop().is_running():
-        asyncio.create_task(shutdown_event.set())
-    else:
-        shutdown_event.set()
+    # CORRECTED: Simply call the set() method directly.
+    # It is thread-safe and does not need to be wrapped in a task.
+    shutdown_event.set()
 
 async def create_system_components(settings, logger, error_handler):
     """
@@ -53,6 +47,7 @@ async def create_system_components(settings, logger, error_handler):
     """
     startup_trace_id = f"component_init_{uuid4().hex}"
     base_log_context = {"trace_id": startup_trace_id}
+    db_interface = None
     
     try:
         # 1. Initialize async database interface
@@ -100,6 +95,7 @@ async def create_system_components(settings, logger, error_handler):
                     settings=settings,
                     db_interface=db_interface,
                     connector_factory=connector_factory,
+                    config_manager=config_manager,
                     logger=logger,
                     error_handler=error_handler,
                     orchestrator_instance=orchestrator if settings.orchestrator.deployment_model.lower() == "single_process" else None
@@ -110,28 +106,40 @@ async def create_system_components(settings, logger, error_handler):
                 logger.info(f"Worker {i} initialized successfully", **base_log_context)
         
         logger.log_component_lifecycle("System", "COMPONENT_INITIALIZATION_SUCCESS", **base_log_context)
-        return orchestrator, workers, db_interface, content_extractor, connector_factory
+        return orchestrator, workers, db_interface
         
     except Exception as e:
+        if isinstance(e, SystemExit):
+            raise
+        # Ensure error_handler is available to log the error
+        if 'error_handler' not in locals():
+            error_handler = ErrorHandler()
+        if 'logger' not in locals():
+            logger = SystemLogger(logging.getLogger(__name__), "TEXT", {})
+            
         error_handler.handle_error(e, logger, **base_log_context, operation_phase="component_initialization")
+        if db_interface:
+            await db_interface.close_async()
         raise
 
-# These run mode functions remain unchanged
-async def run_single_process_mode(orchestrator: Orchestrator, workers: List[Worker], logger, base_log_context, command_queue: queue.Queue):
+async def run_single_process_mode(orchestrator: Orchestrator, workers: List[Worker], logger, base_log_context):
     logger.info("Starting single-process mode...", **base_log_context)
     tasks = []
-    tasks.append(asyncio.create_task(orchestrator.start_async(command_queue), name="orchestrator"))
+    tasks.append(asyncio.create_task(orchestrator.start_async(queue.Queue()), name="orchestrator"))
     for i, worker in enumerate(workers):
         tasks.append(asyncio.create_task(worker.start_async(), name=f"worker_{i}"))
+    
     logger.info(f"Single-process mode started with {len(tasks)} async tasks", **base_log_context)
     await shutdown_event.wait()
     logger.info("Shutting down single-process mode...", **base_log_context)
+    
     for task in tasks:
         task.cancel()
     try:
         await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=30.0)
     except asyncio.TimeoutError:
         logger.warning("Some tasks did not shutdown gracefully within timeout", **base_log_context)
+    
     await orchestrator.shutdown_async()
     for worker in workers:
         await worker.shutdown_async()
@@ -139,7 +147,6 @@ async def run_single_process_mode(orchestrator: Orchestrator, workers: List[Work
 
 async def run_orchestrator_mode(orchestrator: Orchestrator, logger, base_log_context):
     logger.info("Starting orchestrator-only mode...", **base_log_context)
-    # The command queue is not used in this mode, so we pass an empty one
     orchestrator_task = asyncio.create_task(orchestrator.start_async(queue.Queue()), name="orchestrator")
     logger.info("Orchestrator-only mode started", **base_log_context)
     await shutdown_event.wait()
@@ -169,144 +176,113 @@ async def run_worker_mode(workers: List[Worker], logger, base_log_context):
     logger.info("Worker-only mode shutdown complete", **base_log_context)
 
 
-# This is the new startup block that handles the decoupled CLI
-if __name__ == "__main__":
-    
-    # This context is shared between the main app thread and the CLI thread.
-    # It allows the main thread to signal when the orchestrator is ready.
-    shared_context = {
-        "orchestrator_instance": None,
-        "command_queue": queue.Queue(),
-        "db_interface": None
-    }
-
-    # This function will run in a separate thread and contains the main app logic.
-    def run_main_app():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        shared_context["event_loop"] = loop        
-        async def main_wrapper():
-            # --- This is your original main() function, refactored ---
-            
-            # 1. Argument Parsing & Initial Mode Selection
-            parser = argparse.ArgumentParser(description="Main launcher for the classification system.")
-            parser.add_argument("--mode", type=str, choices=["orchestrator", "worker", "single_process"], 
-                               help="The mode to run the application in.")
-            args = parser.parse_args()
-
-            # 2. Configuration Loading & Validation
-            try:
-                config_manager = ConfigurationManager("config/system_default.yaml")
-                partial_context = config_manager.get_partial_ambient_context() 
-                partial_context["component_name"] = f"Main-{os.getpid()}"
-                system_logger = SystemLogger(logging.getLogger(__name__), "TEXT", partial_context)
-                error_handler = ErrorHandler()
-                config_manager.set_core_services(system_logger, error_handler)
-                db_interface = DatabaseInterface(config_manager.get_db_connection_string(), system_logger, error_handler)
-                await config_manager.load_database_overrides_async(db_interface)
-                config_manager.finalize()
-                settings = config_manager.settings
-                shared_context["db_interface"] = db_interface
-            except Exception as e:
-                print(f"FATAL: Failed to load configuration. Error: {e}", file=sys.stderr)
-                sys.exit(1)
-
-            # 3. Determine Final Run Mode & Gather Ambient Context
-            run_mode = args.mode or getattr(settings.orchestrator, 'deployment_model', 'single_process').lower()
-            ambient_context = {
-                "component_name": run_mode.capitalize(),
-                "machine_name": os.environ.get("POD_NAME") or socket.gethostname(),
-                "node_group": getattr(settings.system, 'node_group', 'default'),
-                "deployment_model": run_mode
-            }
-
-            # 4. Initialize Core Services with Ambient Context & File Logging
-            logging.basicConfig(level=settings.logging.level.upper(), format='%(asctime)s - %(levelname)s - %(message)s')
-            if settings.logging.file and settings.logging.file.enabled:
-                log_dir = os.path.dirname(settings.logging.file.path)
-                if log_dir: os.makedirs(log_dir, exist_ok=True)
-                file_handler = logging.FileHandler(settings.logging.file.path)
-                file_handler.setLevel(settings.logging.file.level.upper())
-                if settings.logging.file.format.upper() == "JSON":
-                    file_handler.setFormatter(JsonFormatter())
-                else:
-                    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-                logging.getLogger().addHandler(file_handler)
-
-            logger = SystemLogger(logging.getLogger(__name__), log_format=settings.logging.format, ambient_context=ambient_context)
-            error_handler = ErrorHandler()
-            startup_trace_id = f"startup_{uuid4().hex}"
-            base_log_context = {"trace_id": startup_trace_id}
-            logger.info(f"System starting up in {run_mode.upper()} mode.", **base_log_context)
-
-            # 5. Component Initialization & Health Checks
-            try:
-                orchestrator, workers, _, _, _ = await create_system_components(settings, logger, error_handler)
-                logger.log_component_lifecycle("System", "INITIALIZATION_SUCCESS", **base_log_context)
-                # CRITICAL: Signal to the main thread that the orchestrator is ready
-                shared_context["orchestrator_instance"] = orchestrator
-            except Exception as e:
-                error_handler.handle_error(e, logger, **base_log_context, operation_phase="startup")
-                sys.exit(1)
-
-
-
-            # 7. Mode-Specific Async Startup
-            try:
-                if run_mode == "single_process":
-                    await run_single_process_mode(orchestrator, workers, logger, base_log_context, shared_context["command_queue"])
-                elif run_mode == "orchestrator":
-                    await run_orchestrator_mode(orchestrator, logger, base_log_context)
-                elif run_mode == "worker":
-                    await run_worker_mode(workers, logger, base_log_context)
-            except Exception as e:
-                error_handler.handle_error(e, logger, **base_log_context, operation_phase="runtime")
-                sys.exit(1)
-            finally:
-                if shared_context["db_interface"]:
-                    await shared_context["db_interface"].close_async()
-                logger.info("System shutdown complete.", trace_id=f"shutdown_{uuid4().hex}")
-
-        # --- Main app thread execution starts here ---
-        try:
-            loop.run_until_complete(main_wrapper())
-        except Exception as e:
-            print(f"FATAL: Main application thread crashed: {e}", file=sys.stderr)
-            traceback.print_exc()
-
-    # --- Main execution thread starts here ---
+async def main():
+    """ The main asynchronous entry point for the application service. """
+    db_interface = None
+    logger = None
     try:
-        # 1. Start the main application in a background thread
-        app_thread = threading.Thread(target=run_main_app, name="AppThread", daemon=True)
-        app_thread.start()
+        # 1. Argument Parsing & Initial Mode Selection
+        parser = argparse.ArgumentParser(description="Main launcher for the classification system.")
+        parser.add_argument("--mode", type=str, choices=["orchestrator", "worker", "single_process"], 
+                           default="single_process", help="The mode to run the application in.")
+        args = parser.parse_args()
 
-        # 2. Wait for the application to finish starting up and create the orchestrator
-        print("Starting application, please wait...")
-        start_wait_time = time.time()
-        while shared_context["orchestrator_instance"] is None or shared_context["event_loop"] is None:
-            if not app_thread.is_alive():
-                raise RuntimeError("Application failed to start. Check logs for details.")
-            if time.time() - start_wait_time > 60:
-                raise RuntimeError("Application startup timed out.")
-            time.sleep(0.2)
-        print("Application started successfully.")
+        # 2. Configuration Loading (Phase 1: File Only)
+        config_manager = ConfigurationManager("config/system_default.yaml")
+        partial_context = config_manager.get_partial_ambient_context() 
+        partial_context["component_name"] = f"Main-{os.getpid()}"
+        # Initialize a temporary logger for startup
+        temp_logger = SystemLogger(logging.getLogger("startup"), "TEXT", partial_context)
+        error_handler = ErrorHandler()
+        config_manager.set_core_services(temp_logger, error_handler)
 
-        # --- FIX: Set signal handlers in the main thread AFTER the app thread starts ---
-        # This is safe because the main thread is not blocked.
+        # 3. Initialize Database and Load Overrides (Phase 2: Inside async)
+        db_interface = DatabaseInterface(config_manager.get_db_connection_string(), temp_logger, error_handler)
+        await config_manager.load_database_overrides_async(db_interface)
+        config_manager.finalize()
+        settings = config_manager.settings
+
+        # 4. Determine Final Run Mode & Gather Ambient Context
+        run_mode = args.mode or getattr(settings.orchestrator, 'deployment_model', 'single_process').lower()
+        ambient_context = {
+            "component_name": run_mode.capitalize(),
+            "machine_name": os.environ.get("POD_NAME") or socket.gethostname(),
+            "node_group": getattr(settings.system, 'node_group', 'default'),
+            "deployment_model": run_mode
+        }
+
+        # 5. Initialize Final Logger & File Logging
+        logging.basicConfig(level=settings.logging.level.upper(), format='%(asctime)s - %(levelname)s - %(message)s', force=True)
+        if settings.logging.file and settings.logging.file.enabled:
+            log_dir = os.path.dirname(settings.logging.file.path)
+            if log_dir: os.makedirs(log_dir, exist_ok=True)
+            file_handler = logging.FileHandler(settings.logging.file.path)
+            file_handler.setLevel(settings.logging.file.level.upper())
+            if settings.logging.file.format.upper() == "JSON":
+                file_handler.setFormatter(JsonFormatter())
+            else:
+                file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            logging.getLogger().addHandler(file_handler)
+        
+        logger = SystemLogger(logging.getLogger(__name__), log_format=settings.logging.format, ambient_context=ambient_context)
+        # Re-assign the final logger to the db_interface
+        db_interface.logger = logger
+        
+        startup_trace_id = f"startup_{uuid4().hex}"
+        base_log_context = {"trace_id": startup_trace_id}
+        logger.info(f"System starting up in {run_mode.upper()} mode.", **base_log_context)
+
+        # 6. Component Initialization & Health Checks
+        orchestrator, workers, db_interface_ref = await create_system_components(settings, logger, error_handler)
+        db_interface = db_interface_ref # Keep reference for the final close
+        logger.log_component_lifecycle("System", "INITIALIZATION_SUCCESS", **base_log_context)
+
+        # 7. Start CLI in background thread (ADD THIS NEW SECTION)
+        logger.info("Starting CLI in background thread...", **base_log_context)
+        import threading
+        from cli import DatabaseInterfaceSyncWrapper, run_cli
+
+        # Get main event loop reference BEFORE creating thread
+        main_loop = asyncio.get_running_loop()
+        settings = config_manager.settings
+        def cli_wrapper():
+            try:
+                db_sync = DatabaseInterfaceSyncWrapper(db_interface, main_loop)
+                run_cli(db_sync, settings)
+            except Exception as e:
+                logger.error(f"CLI thread error: {e}", **base_log_context)
+
+        cli_thread = threading.Thread(target=cli_wrapper, daemon=True)
+        cli_thread.start()
+        logger.info("CLI thread started", **base_log_context)
+
+        # 8. Setup Signal Handlers
         signal.signal(signal.SIGINT, graceful_shutdown_handler)
         signal.signal(signal.SIGTERM, graceful_shutdown_handler)
 
-        # 3. Create the API shim, passing it the correct event loop from the app thread
-        api_shim = OrchestratorApiShim(
-            shared_context["orchestrator_instance"], 
-            shared_context["command_queue"],
-            shared_context["event_loop"]  # Pass the loop from the correct thread
-        )
-        run_cli(api_shim)
-
-    except KeyboardInterrupt:
-        print("\nCLI exited. Application shutting down.")
+        # 9. Mode-Specific Async Startup
+        if run_mode == "single_process":
+            await run_single_process_mode(orchestrator, workers, logger, base_log_context)
+        elif run_mode == "orchestrator":
+            await run_orchestrator_mode(orchestrator, logger, base_log_context)
+        elif run_mode == "worker":
+            await run_worker_mode(workers, logger, base_log_context)
+        
     except Exception as e:
-        print(f"FATAL: Unhandled exception in main: {e}", file=sys.stderr)
-        traceback.print_exc()
+        final_logger = logger if logger else SystemLogger(logging.getLogger(__name__), "TEXT", {})
+        if isinstance(e, SystemExit):
+            final_logger.warning("System exiting due to initialization failure.")
+        else:
+            final_logger.error(f"FATAL: Unhandled exception in main: {e}", exc_info=True)
         sys.exit(1)
+    finally:
+        if db_interface:
+            await db_interface.close_async()
+        if logger:
+            logger.info("System shutdown complete.", trace_id=f"shutdown_{uuid4().hex}")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nApplication shutdown.")

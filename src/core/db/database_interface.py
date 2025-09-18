@@ -178,6 +178,95 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, "get_master_job_by_id", master_job_id=master_job_id, **context)
             raise
 
+
+
+    async def get_jobs_by_ids(self, job_ids: List[int], context: Optional[Dict[str, Any]] = None) -> List[Job]:
+        """
+        Fetches a list of Job objects from a list of job IDs.
+        """
+        context = context or {}
+        if not job_ids:
+            return []
+            
+        self.logger.log_database_operation("SELECT", "Jobs", "STARTED", operation_name="get_by_ids", count=len(job_ids), **context)
+        try:
+            async with self.get_async_session() as session:
+                stmt = select(Job).where(Job.id.in_(job_ids))
+                result = await session.scalars(stmt)
+                jobs = result.all()
+
+                self.logger.log_database_operation("SELECT", "Jobs", "SUCCESS", operation_name="get_by_ids", found_count=len(jobs), **context)
+                return jobs
+        except Exception as e:
+            self.error_handler.handle_error(e, "get_jobs_by_ids", job_count=len(job_ids), **context)
+            raise
+
+
+    async def update_job_warning_count(self, job_id: int, new_count: int, context: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Updates the warning count and timestamp for a job with an expired lease.
+        """
+        context = context or {}
+        self.logger.log_database_operation("UPDATE", "Jobs", "STARTED", operation_name="update_warning_count", job_id=job_id, **context)
+        try:
+            async with self.get_async_session() as session:
+                stmt = update(Job).where(
+                    Job.id == job_id
+                ).values(
+                    lease_warning_count=new_count,
+                    last_lease_warning_timestamp=datetime.now(timezone.utc)
+                )
+                await session.execute(stmt)
+                await session.commit()
+        except Exception as e:
+            self.error_handler.handle_error(e, "update_job_warning_count", job_id=job_id, **context)
+            raise
+
+    async def takeover_abandoned_job(self, job_id: int, job_version: int, new_orchestrator_id: str, context: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Atomically takes ownership of an abandoned job using optimistic locking.
+        """
+        context = context or {}
+        self.logger.log_database_operation("UPDATE", "Jobs", "STARTED", operation_name="takeover_job", job_id=job_id, **context)
+        try:
+            async with self.get_async_session() as session:
+                stmt = update(Job).where(
+                    Job.id == job_id,
+                    Job.version == job_version # Optimistic lock
+                ).values(
+                    orchestrator_id=new_orchestrator_id,
+                    version=Job.version + 1 # Increment version to lock out others
+                )
+                result = await session.execute(stmt)
+                await session.commit()
+                return result.rowcount > 0
+        except Exception as e:
+            self.error_handler.handle_error(e, "takeover_abandoned_job", job_id=job_id, **context)
+            raise
+
+    async def fail_job(self, job_id: int, reason: str, context: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Moves a job to the FAILED state and records its completion time.
+        """
+        context = context or {}
+        self.logger.log_database_operation("UPDATE", "Jobs", "STARTED", operation_name="fail_job", job_id=job_id, **context)
+        try:
+            async with self.get_async_session() as session:
+                # In a real system, the 'reason' might be stored in a new 'Notes' column
+                stmt = update(Job).where(
+                    Job.id == job_id
+                ).values(
+                    status=JobStatus.FAILED,
+                    completed_timestamp=datetime.now(timezone.utc),
+                    version=Job.version + 1 # Increment version to prevent stale writes
+                )
+                await session.execute(stmt)
+                await session.commit()
+        except Exception as e:
+            self.error_handler.handle_error(e, "fail_job", job_id=job_id, **context)
+            raise
+
+
     async def get_queued_jobs_for_nodegroup(self, nodegroup: str, limit: int, context: Optional[Dict[str, Any]] = None) -> List[Job]:
         """Used by an Orchestrator to find available jobs in its region."""
         context = context or {}
@@ -185,8 +274,8 @@ class DatabaseInterface:
             async with self.get_async_session() as session:
                 stmt = select(Job).where(
                     Job.status == JobStatus.QUEUED,
-                    Job.NodeGroup == nodegroup
-                ).order_by(Job.Priority, Job.id).limit(limit)
+                    Job.node_group == nodegroup
+                ).order_by(Job.priority, Job.id).limit(limit)
                 result = await session.scalars(stmt)
                 return list(result.all())
         except Exception as e:
@@ -204,8 +293,8 @@ class DatabaseInterface:
                     Job.status == JobStatus.QUEUED
                 ).values(
                     status=JobStatus.RUNNING,
-                    OrchestratorID=orchestrator_id,
-                    OrchestratorLeaseExpiry=lease_expiry
+                    orchestrator_id=orchestrator_id,
+                    orchestrator_lease_expiry=lease_expiry
                 )
                 result = await session.execute(stmt)
                 await session.commit()
@@ -214,8 +303,6 @@ class DatabaseInterface:
         except Exception as e:
             self.error_handler.handle_error(e, "claim_queued_job", job_id=job_id, **context)
             raise
-
-
 
     async def renew_job_lease(self, job_id: int, orchestrator_id: str, current_version: int, lease_duration_sec: int, context: Optional[Dict[str, Any]] = None) -> bool:
         """
@@ -230,13 +317,13 @@ class DatabaseInterface:
                 
                 stmt = update(Job).where(
                     Job.id == job_id,
-                    Job.OrchestratorID == orchestrator_id,
-                    Job.Version == current_version  # <-- The optimistic lock check
+                    Job.orchestrator_id == orchestrator_id,
+                    Job.version == current_version  # <-- The optimistic lock check
                 ).values(
-                    OrchestratorLeaseExpiry=new_expiry,
-                    LeaseWarningCount=0,
-                    LastLeaseWarningTimestamp=None,
-                    Version=Job.Version + 1  # Increment the version for the next update
+                    orchestrator_lease_expiry=new_expiry,
+                    lease_warning_count=0,
+                    last_lease_warning_timestamp=None,
+                    version=Job.version + 1  # Increment the version for the next update
                 )
                 
                 result = await session.execute(stmt)
@@ -251,6 +338,7 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, "renew_job_lease", job_id=job_id, **context)
             raise
 
+
     async def get_abandoned_jobs_for_nodegroup(self, nodegroup: str, context: Optional[Dict[str, Any]] = None) -> List[Job]:
         """Used by the Job Reaper to find jobs with expired leases."""
         context = context or {}
@@ -258,8 +346,8 @@ class DatabaseInterface:
             async with self.get_async_session() as session:
                 stmt = select(Job).where(
                     Job.status == JobStatus.RUNNING,
-                    Job.NodeGroup == nodegroup,
-                    Job.OrchestratorLeaseExpiry < datetime.now(timezone.utc)
+                    Job.node_group == nodegroup,
+                    Job.orchestrator_lease_expiry < datetime.now(timezone.utc)
                 )
                 result = await session.scalars(stmt)
                 return list(result.all())
@@ -274,7 +362,7 @@ class DatabaseInterface:
             async with self.get_async_session() as session:
                 stmt = select(Job).where(
                     Job.status == JobStatus.RUNNING,
-                    Job.OrchestratorID == orchestrator_id
+                    Job.orchestrator_id == orchestrator_id
                 )
                 result = await session.scalars(stmt)
                 return list(result.all())
@@ -313,7 +401,7 @@ class DatabaseInterface:
                     if not col.primary_key
                 }
                 # Special handling to append to the ActionHistory JSON array
-                update_dict["ActionHistory"] = ObjectMetadata.ActionHistory.op('||')(stmt.excluded.ActionHistory)
+                update_dict["ActionHistory"] = ObjectMetadata.action_history.op('||')(stmt.excluded.action_history)
 
                 stmt = stmt.on_conflict_do_update(
                     index_elements=['ObjectKeyHash'],
@@ -379,8 +467,8 @@ class DatabaseInterface:
                 # to their history in a single, efficient database operation.
                 stmt = (
                     update(ObjectMetadata)
-                    .where(ObjectMetadata.ObjectKeyHash.in_(object_key_hashes))
-                    .values(ActionHistory=ObjectMetadata.ActionHistory.op('||')(text("'[null]'::jsonb"))) # Placeholder for append syntax
+                    .where(ObjectMetadata.object_key_hash.in_(object_key_hashes))
+                    .values(ActionHistory=ObjectMetadata.action_history.op('||')(text("'[null]'::jsonb"))) # Placeholder for append syntax
                 )
                 # A real implementation would correctly format the JSON to append `action_details`.
                 # For simplicity in this example, we show the intent.
@@ -400,6 +488,8 @@ class DatabaseInterface:
     # =================================================================
     # NEW: Method to log object processing status
     # =================================================================
+
+
     async def log_object_processing_status(self, object_id: str, job_id: int, status: str, details: Optional[str], context: Optional[Dict[str, Any]] = None):
         """
         Creates or updates the processing status for a single discovered object.
@@ -410,15 +500,15 @@ class DatabaseInterface:
         try:
             async with self.get_async_session() as session:
                 # The `merge` operation performs a clean "upsert" (INSERT or UPDATE).
-                # It uses the primary key (ObjectID_str) to find an existing record.
+                # It uses the primary key (object_id_str) to find an existing record.
                 # If found, it updates the record's fields.
                 # If not found, it inserts a new record.
                 record = ObjectProcessingStatus(
-                    ObjectID_str=object_id,
-                    JobID=job_id,
-                    Status=status,
-                    Details=details,
-                    ScanTimestamp=datetime.now(timezone.utc)
+                    object_id_str=object_id,
+                    job_id=job_id,
+                    status=status,
+                    details=details,
+                    scan_timestamp=datetime.now(timezone.utc)
                 )
                 await session.merge(record)
                 await session.commit()
@@ -426,6 +516,7 @@ class DatabaseInterface:
         except Exception as e:
             self.error_handler.handle_error(e, context="log_object_processing_status", object_id=object_id, job_id=job_id, **context)
             raise
+
 
     # =================================================================
     # NEW: Connector Support Methods
@@ -439,6 +530,34 @@ class DatabaseInterface:
             lambda: self._fetch_datasource_configuration(datasource_id, context),
             is_classifier=False
         )
+    # In: src/core/db/database_interface.py
+
+    # Update this method to eagerly load the relationship
+    async def get_datasources_by_ids(self, datasource_ids: List[str], context: Optional[Dict[str, Any]] = None) -> List[DataSource]:
+        """
+        Fetches a list of DataSource objects from a list of datasource IDs, eagerly loading the NodeGroup.
+        """
+        context = context or {}
+        if not datasource_ids:
+            return []
+            
+        self.logger.log_database_operation("SELECT", "DataSources", "STARTED", operation_name="get_by_ids", count=len(datasource_ids), **context)
+        try:
+            async with self.get_async_session() as session:
+                # UPDATED: Added joinedload() to efficiently fetch the related NodeGroup object.
+                stmt = select(DataSource).where(
+                    DataSource.datasource_id.in_(datasource_ids)
+                ).options(
+                    joinedload(DataSource.node_group)
+                )
+                result = await session.scalars(stmt)
+                datasources = result.all()
+
+                self.logger.log_database_operation("SELECT", "DataSources", "SUCCESS", operation_name="get_by_ids", found_count=len(datasources), **context)
+                return datasources
+        except Exception as e:
+            self.error_handler.handle_error(e, "get_datasources_by_ids", datasource_count=len(datasource_ids), **context)
+            raise
 
     async def _fetch_datasource_configuration(self, datasource_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[DataSource]:
         """Internal method to fetch datasource configuration from database."""
@@ -581,8 +700,8 @@ class DatabaseInterface:
         try:
             async with self.get_async_session() as session:
                 stmt = select(ConnectorConfiguration).where(
-                    ConnectorConfiguration.ConnectorType == connector_type,
-                    ConnectorConfiguration.ConfigName == config_name
+                    ConnectorConfiguration.connector_type == connector_type,
+                    ConnectorConfiguration.config_name == config_name
                 )
                 result = await session.scalars(stmt)
                 result = result.one_or_none()
@@ -590,7 +709,7 @@ class DatabaseInterface:
                 if result:
                     self.logger.log_database_operation("SELECT", "ConnectorConfigurations", "SUCCESS", 
                                                      operation="get_by_type", **context)
-                    return result.Configuration
+                    return result.configuration
                 else:
                     self.logger.log_database_operation("SELECT", "ConnectorConfigurations", "NOT_FOUND", 
                                                      operation="get_by_type", **context)
@@ -600,6 +719,7 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, context="get_connector_configuration", 
                                           connector_type=connector_type, **context)
             raise
+
 
     async def insert_scan_findings(self, findings: List[Dict[str, Any]], context: Optional[Dict[str, Any]] = None) -> int:
         """Insert scan findings into the findings tables."""
@@ -627,23 +747,23 @@ class DatabaseInterface:
                     finding_key_hash = hashlib.sha256(key_string.encode()).digest()
                     
                     summary = {
-                        'FindingKeyHash': finding_key_hash,
-                        'ScanJobID': finding.get('scan_job_id'),
-                        'DataSourceID': finding.get('datasource_id'),
-                        'ClassifierID': finding.get('classifier_id'),
-                        'EntityType': finding.get('entity_type'),
-                        'SchemaName': finding.get('schema_name'),
-                        'TableName': finding.get('table_name'),
-                        'FieldName': finding.get('field_name'),
-                        'FilePath': finding.get('file_path'),
-                        'FileName': finding.get('file_name'),
-                        'FileExtension': finding.get('file_extension'),
-                        'FindingCount': finding.get('finding_count', 1),
-                        'AverageConfidence': finding.get('average_confidence', 0.0),
-                        'MaxConfidence': finding.get('max_confidence', 0.0),
-                        'SampleFindings': finding.get('sample_findings'),
-                        'TotalRowsInSource': finding.get('total_rows_in_source'),
-                        'NonNullRowsScanned': finding.get('non_null_rows_scanned')
+                        'finding_key_hash': finding_key_hash,
+                        'scan_job_id': finding.get('scan_job_id'),
+                        'data_source_id': finding.get('datasource_id'),
+                        'classifier_id': finding.get('classifier_id'),
+                        'entity_type': finding.get('entity_type'),
+                        'schema_name': finding.get('schema_name'),
+                        'table_name': finding.get('table_name'),
+                        'field_name': finding.get('field_name'),
+                        'file_path': finding.get('file_path'),
+                        'file_name': finding.get('file_name'),
+                        'file_extension': finding.get('file_extension'),
+                        'finding_count': finding.get('finding_count', 1),
+                        'average_confidence': finding.get('average_confidence', 0.0),
+                        'max_confidence': finding.get('max_confidence', 0.0),
+                        'sample_findings': finding.get('sample_findings'),
+                        'total_rows_in_source': finding.get('total_rows_in_source'),
+                        'non_null_rows_scanned': finding.get('non_null_rows_scanned')
                     }
                     summaries.append(summary)
                 
@@ -654,7 +774,7 @@ class DatabaseInterface:
                 self.logger.log_database_operation("BULK INSERT", "ScanFindingSummaries", "SUCCESS", 
                                                  record_count=len(summaries), **context)
                 return len(summaries)
-                
+            
         except Exception as e:
             self.error_handler.handle_error(e, context="insert_scan_findings", 
                                           finding_count=len(findings), **context)
@@ -671,7 +791,7 @@ class DatabaseInterface:
                                          object_count=len(object_ids), **context)
         try:
             async with self.get_async_session() as session:
-                stmt = select(OrmDiscoveredObject).where(OrmDiscoveredObject.ID.in_(object_ids))
+                stmt = select(OrmDiscoveredObject).where(OrmDiscoveredObject.id.in_(object_ids))
                 result = await session.scalars(stmt)
                 results = list(result.all())
                 
@@ -699,16 +819,16 @@ class DatabaseInterface:
                 
                 # Update existing records
                 stmt = update(DiscoveredObjectClassificationDateInfo).where(
-                    DiscoveredObjectClassificationDateInfo.ObjectID.in_(object_ids)
-                ).values(LastClassificationDate=current_time)
+                    DiscoveredObjectClassificationDateInfo.object_id.in_(object_ids)
+                ).values(last_classification_date=current_time)
                 
                 result = await session.execute(stmt)
                 updated_count = result.rowcount
                 
                 # Insert records for objects that don't have classification info yet
                 existing_result = await session.scalars(
-                    select(DiscoveredObjectClassificationDateInfo.ObjectID)
-                    .where(DiscoveredObjectClassificationDateInfo.ObjectID.in_(object_ids))
+                    select(DiscoveredObjectClassificationDateInfo.object_id)
+                    .where(DiscoveredObjectClassificationDateInfo.object_id.in_(object_ids))
                 )
                 existing_ids = list(existing_result.all())
                 
@@ -716,8 +836,8 @@ class DatabaseInterface:
                 if new_ids:
                     new_records = [
                         {
-                            'ObjectID': obj_id,
-                            'LastClassificationDate': current_time
+                            'object_id': obj_id,
+                            'last_classification_date': current_time
                         }
                         for obj_id in new_ids
                     ]
@@ -735,6 +855,7 @@ class DatabaseInterface:
                                           object_count=len(object_ids), **context)
             raise
 
+
     async def get_objects_by_datasource(self, datasource_id: str, limit: int = 1000, 
                                 context: Optional[Dict[str, Any]] = None) -> List[OrmDiscoveredObject]:
         """Get discovered objects for a specific datasource."""
@@ -747,7 +868,7 @@ class DatabaseInterface:
             async with self.get_async_session() as session:
                 stmt = (
                     select(OrmDiscoveredObject)
-                    .where(OrmDiscoveredObject.DataSourceID == datasource_id)
+                    .where(OrmDiscoveredObject.data_source_id == datasource_id)
                     .limit(limit)
                 )
                 result = await session.scalars(stmt)
@@ -782,23 +903,23 @@ class DatabaseInterface:
                     # Calculate object key hash
                     import hashlib
                     key_components = [
-                        obj.get('DataSourceID', ''),
-                        obj.get('ObjectPath', ''),
-                        obj.get('ObjectType', '')
+                        obj.get('data_source_id', ''),
+                        obj.get('object_path', ''),
+                        obj.get('object_type', '')
                     ]
                     key_string = '|'.join(str(comp) for comp in key_components)
                     object_key_hash = hashlib.sha256(key_string.encode()).digest()
                     
                     processed_obj = {
-                        'ObjectKeyHash': object_key_hash,
-                        'DataSourceID': obj.get('DataSourceID'),
-                        'ObjectType': obj.get('ObjectType'),
-                        'ObjectPath': obj.get('ObjectPath'),
-                        'SizeBytes': obj.get('SizeBytes'),
-                        'CreatedDate': obj.get('CreatedDate'),
-                        'LastModified': obj.get('LastModified'),
-                        'LastAccessed': obj.get('LastAccessed'),
-                        'DiscoveryTimestamp': datetime.now(timezone.utc)
+                        'object_key_hash': object_key_hash,
+                        'data_source_id': obj.get('data_source_id'),
+                        'object_type': obj.get('object_type'),
+                        'object_path': obj.get('object_path'),
+                        'size_bytes': obj.get('size_bytes'),
+                        'created_date': obj.get('created_date'),
+                        'last_modified': obj.get('last_modified'),
+                        'last_accessed': obj.get('last_accessed'),
+                        'discovery_timestamp': datetime.now(timezone.utc)
                     }
                     processed_objects.append(processed_obj)
                 
@@ -813,7 +934,7 @@ class DatabaseInterface:
                 self.logger.log_database_operation("BULK INSERT", staging_table_name, "SUCCESS", 
                                                  record_count=len(processed_objects), **context)
                 return len(processed_objects)
-                
+            
         except Exception as e:
             self.error_handler.handle_error(e, context="insert_discovered_object_batch", 
                                           staging_table=staging_table_name,
@@ -877,19 +998,20 @@ class DatabaseInterface:
             raise
     
     async def get_job_progress_summary(self, job_id: int, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        context = context or {}
-        self.logger.log_database_operation("QUERY", "Tasks", "STARTED", operation="get_job_summary", job_id=job_id, **context)
-        try:
-            async with self.get_async_session() as session:
-                stmt = select(Task.Status, func.count(Task.Status)).where(Task.JobID == job_id).group_by(Task.Status)
-                result = await session.execute(stmt)
-                results = result.all()
-                summary = {status.value: count for status, count in results}
-                self.logger.log_database_operation("QUERY", "Tasks", "SUCCESS", operation="get_job_summary", **context)
-                return summary
-        except Exception as e:
-            self.error_handler.handle_error(e, context="get_job_progress_summary", job_id=job_id, **context)
-            raise
+            context = context or {}
+            self.logger.log_database_operation("QUERY", "Tasks", "STARTED", operation="get_job_summary", job_id=job_id, **context)
+            try:
+                async with self.get_async_session() as session:
+                    # UPDATED: Changed Task.JobID to the correct attribute Task.job_id
+                    stmt = select(Task.status, func.count(Task.status)).where(Task.job_id == job_id).group_by(Task.status)
+                    result = await session.execute(stmt)
+                    results = result.all()
+                    summary = {status.value: count for status, count in results}
+                    self.logger.log_database_operation("QUERY", "Tasks", "SUCCESS", operation="get_job_summary", **context)
+                    return summary
+            except Exception as e:
+                self.error_handler.handle_error(e, context="get_job_progress_summary", job_id=job_id, **context)
+                raise
 
     # =================================================================
     # Configuration and Initialization
@@ -952,7 +1074,6 @@ class DatabaseInterface:
     # =================================================================
     
 
-
     async def update_job_command(self, job_id: int, command: str, context: Optional[Dict[str, Any]] = None) -> bool:
         """
         Updates the 'master_pending_commands' field for a specific job.
@@ -966,7 +1087,7 @@ class DatabaseInterface:
                     Job.id == job_id
                 ).values(
                     master_pending_commands=command,
-                    Version=Job.Version + 1 # Increment version to show a change has occurred
+                    version=Job.version + 1 # Increment version to show a change has occurred
                 )
                 
                 result = await session.execute(stmt)
@@ -978,6 +1099,7 @@ class DatabaseInterface:
         except Exception as e:
             self.error_handler.handle_error(e, "update_job_command", job_id=job_id, command=command, **context)
             raise
+
 
     async def get_child_jobs_by_master_id(self, master_job_id: str, context: Optional[Dict[str, Any]] = None) -> List[Job]:
         """
@@ -996,7 +1118,6 @@ class DatabaseInterface:
         except Exception as e:
             self.error_handler.handle_error(e, "get_child_jobs_by_master_id", master_job_id=master_job_id, **context)
             raise
-
 
 
     async def create_job_execution(
@@ -1025,8 +1146,8 @@ class DatabaseInterface:
                     template_type=template_type,
                     status=JobStatus.QUEUED, # Jobs are created in the QUEUED state
                     trigger_type=trigger_type,
-                    Priority=priority,
-                    NodeGroup=nodegroup,
+                    priority=priority,
+                    node_group=nodegroup,
                     configuration=configuration,
                     master_job_id=master_job_id,
                     master_pending_commands=master_pending_commands
@@ -1042,31 +1163,40 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, "create_job_execution", execution_id=execution_id, **context)
             raise
 
+
     async def create_task(self, job_id: int, task_type: str, work_packet: Dict[str, Any], datasource_id: Optional[str] = None, parent_task_id: Optional[int] = None, context: Optional[Dict[str, Any]] = None) -> Task:
         context = context or {}
         self.logger.log_database_operation("INSERT", "Tasks", "STARTED", job_id=job_id, task_type=task_type, **context)
         try:
             async with self.get_async_session() as session:
-                new_task = Task(JobID=job_id, TaskType=task_type, WorkPacket=work_packet, DatasourceID=datasource_id, ParentTaskID=parent_task_id, Status=TaskStatus.PENDING)
+                new_task = Task(
+                    job_id=job_id, 
+                    task_type=task_type, 
+                    work_packet=work_packet, 
+                    datasource_id=datasource_id, 
+                    parent_task_id=parent_task_id, 
+                    status=TaskStatus.PENDING
+                )
                 session.add(new_task)
                 await session.commit()
                 await session.refresh(new_task)
-                self.logger.log_database_operation("INSERT", "Tasks", "SUCCESS", task_id=new_task.ID, **context)
+                self.logger.log_database_operation("INSERT", "Tasks", "SUCCESS", task_id=new_task.id, **context)
                 return new_task
         except Exception as e:
             self.error_handler.handle_error(e, context="create_task", **context)
             raise
+
 
     async def assign_task_to_worker(self, task_id: int, worker_id: str, lease_duration_seconds: int, context: Optional[Dict[str, Any]] = None) -> bool:
         context = context or {}
         self.logger.log_database_operation("UPDATE", "Tasks", "STARTED", task_id=task_id, worker_id=worker_id, **context)
         try:
             async with self.get_async_session() as session:
-                stmt = update(Task).where(Task.ID == task_id, Task.Status == TaskStatus.PENDING).values(
-                    Status=TaskStatus.ASSIGNED,
-                    WorkerID=worker_id,
-                    LeaseExpiry=datetime.now(timezone.utc) + timedelta(seconds=lease_duration_seconds),
-                    RetryCount=Task.RetryCount + 1
+                stmt = update(Task).where(Task.id == task_id, Task.status == TaskStatus.PENDING).values(
+                    status=TaskStatus.ASSIGNED,
+                    worker_id=worker_id,
+                    lease_expiry=datetime.now(timezone.utc) + timedelta(seconds=lease_duration_seconds),
+                    retry_count=Task.retry_count + 1
                 )
                 result = await session.execute(stmt)
                 await session.commit()
@@ -1080,16 +1210,20 @@ class DatabaseInterface:
 
     async def complete_task(self, task_id: int, context: Optional[Dict[str, Any]] = None) -> None:
         context = context or {}
-        self.logger.log_database_operation("UPDATE", "Tasks", "STARTED", operation="complete_task", task_id=task_id, **context)
+        # CORRECTED LINE:
+        self.logger.log_database_operation("UPDATE", "Tasks", "STARTED", operation_name="complete_task", task_id=task_id, **context)
         try:
             async with self.get_async_session() as session:
-                stmt = update(Task).where(Task.ID == task_id).values(Status=TaskStatus.COMPLETED)
+                stmt = update(Task).where(Task.id == task_id).values(status=TaskStatus.COMPLETED)
                 await session.execute(stmt)
                 await session.commit()
-                self.logger.log_database_operation("UPDATE", "Tasks", "SUCCESS", operation="complete_task", task_id=task_id, **context)
+                # CORRECTED LINE:
+                self.logger.log_database_operation("UPDATE", "Tasks", "SUCCESS", operation_name="complete_task", task_id=task_id, **context)
         except Exception as e:
             self.error_handler.handle_error(e, context="complete_task", task_id=task_id, **context)
             raise
+
+
 
     async def fail_task(self, task_id: int, is_retryable: bool, max_retries: int = 3, context: Optional[Dict[str, Any]] = None) -> None:
         context = context or {}
@@ -1099,14 +1233,14 @@ class DatabaseInterface:
                 task = await session.get(Task, task_id)
                 if not task: return
                 
-                if is_retryable and task.RetryCount < max_retries:
-                    task.Status = TaskStatus.PENDING
-                    task.WorkerID = None
-                    task.LeaseExpiry = None
+                if is_retryable and task.retry_count < max_retries:
+                    task.status = TaskStatus.PENDING
+                    task.worker_id = None
+                    task.lease_expiry = None
                 else:
-                    task.Status = TaskStatus.FAILED
+                    task.status = TaskStatus.FAILED
                 await session.commit()
-                self.logger.log_database_operation("UPDATE", "Tasks", "SUCCESS", operation="fail_task", new_status=task.Status.value, **context)
+                self.logger.log_database_operation("UPDATE", "Tasks", "SUCCESS", operation="fail_task", new_status=task.status.value, **context)
         except Exception as e:
             self.error_handler.handle_error(e, context="fail_task", task_id=task_id, **context)
             raise
@@ -1116,7 +1250,7 @@ class DatabaseInterface:
         self.logger.log_database_operation("SELECT", "Tasks", "STARTED", job_id=job_id, batch_size=batch_size, **context)
         try:
             async with self.get_async_session() as session:
-                stmt = select(Task).where(Task.JobID == job_id, Task.Status == TaskStatus.PENDING).order_by(Task.ID).limit(batch_size)
+                stmt = select(Task).where(Task.job_id == job_id, Task.status == TaskStatus.PENDING).order_by(Task.id).limit(batch_size)
                 result = await session.scalars(stmt)
                 results = list(result.all())
                 self.logger.log_database_operation("SELECT", "Tasks", "SUCCESS", row_count=len(results), **context)
@@ -1131,7 +1265,7 @@ class DatabaseInterface:
         try:
             async with self.get_async_session() as session:
                 expiry_threshold = datetime.now(timezone.utc) - timedelta(seconds=timeout_seconds)
-                stmt = select(Task).where(Task.Status == TaskStatus.ASSIGNED, Task.LeaseExpiry < expiry_threshold)
+                stmt = select(Task).where(Task.status == TaskStatus.ASSIGNED, Task.lease_expiry < expiry_threshold)
                 result = await session.scalars(stmt)
                 results = list(result.all())
                 self.logger.log_database_operation("SELECT", "Tasks", "SUCCESS", row_count=len(results), **context)
@@ -1144,27 +1278,34 @@ class DatabaseInterface:
     # Pipelining and Progress
     # =================================================================
 
+
     async def write_task_output_record(self, task_id: int, output_type: str, payload: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> TaskOutputRecord:
         context = context or {}
         self.logger.log_database_operation("INSERT", "TaskOutputRecords", "STARTED", task_id=task_id, **context)
         try:
             async with self.get_async_session() as session:
-                record = TaskOutputRecord(TaskID=task_id, OutputType=output_type, OutputPayload=payload, Status='PENDING_PROCESSING')
+                record = TaskOutputRecord(
+                    task_id=task_id, 
+                    output_type=output_type, 
+                    output_payload=payload, 
+                    status='PENDING_PROCESSING'
+                )
                 session.add(record)
                 await session.commit()
                 await session.refresh(record)
-                self.logger.log_database_operation("INSERT", "TaskOutputRecords", "SUCCESS", record_id=record.ID, **context)
+                self.logger.log_database_operation("INSERT", "TaskOutputRecords", "SUCCESS", record_id=record.id, **context)
                 return record
         except Exception as e:
             self.error_handler.handle_error(e, context="write_task_output_record", **context)
             raise
+
 
     async def get_pending_output_records(self, limit: int = 100, context: Optional[Dict[str, Any]] = None) -> List[TaskOutputRecord]:
         context = context or {}
         self.logger.log_database_operation("SELECT", "TaskOutputRecords", "STARTED", limit=limit, **context)
         try:
             async with self.get_async_session() as session:
-                stmt = select(TaskOutputRecord).where(TaskOutputRecord.Status == 'PENDING_PROCESSING').limit(limit)
+                stmt = select(TaskOutputRecord).where(TaskOutputRecord.status == 'PENDING_PROCESSING').limit(limit)
                 result = await session.scalars(stmt)
                 results = list(result.all())
                 self.logger.log_database_operation("SELECT", "TaskOutputRecords", "SUCCESS", row_count=len(results), **context)
@@ -1269,7 +1410,6 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, context="bulk_insert_mappings", table_name=table_name, **context)
             raise
 
-
     async def execute_delta_comparison(self, staging_table_name: str, datasource_id: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
         """
         Compares a staging table against the ObjectMetadata master table to find
@@ -1281,14 +1421,14 @@ class DatabaseInterface:
         try:
             async with self.get_async_session() as session:
                 # 1. Get hashes from the staging table (newly discovered objects)
-                staging_hashes_query = text(f'SELECT "ObjectKeyHash" FROM {staging_table_name}')
+                staging_hashes_query = text(f'SELECT "object_key_hash" FROM {staging_table_name}')
                 staging_result = await session.execute(staging_hashes_query)
                 staging_hashes = set(staging_result.scalars().all())
 
                 # 2. Get existing hashes for this datasource from the master metadata table
-                main_hashes_query = select(ObjectMetadata.ObjectKeyHash).where(
-                    ObjectMetadata.DataSourceID == datasource_id,
-                    ObjectMetadata.IsAvailable == True
+                main_hashes_query = select(ObjectMetadata.object_key_hash).where(
+                    ObjectMetadata.data_source_id == datasource_id,
+                    ObjectMetadata.is_available == True
                 )
                 main_result = await session.execute(main_hashes_query)
                 main_hashes = set(main_result.scalars().all())
@@ -1301,8 +1441,8 @@ class DatabaseInterface:
                 if deleted_hashes:
                     delete_stmt = (
                         update(ObjectMetadata)
-                        .where(ObjectMetadata.ObjectKeyHash.in_(deleted_hashes))
-                        .values(IsAvailable=False, RemovedDate=datetime.now(timezone.utc))
+                        .where(ObjectMetadata.object_key_hash.in_(deleted_hashes))
+                        .values(is_available=False, removed_date=datetime.now(timezone.utc))
                     )
                     await session.execute(delete_stmt)
 
@@ -1315,7 +1455,7 @@ class DatabaseInterface:
                     insert_sql = text(
                         f'INSERT INTO "ObjectMetadata" ({target_cols_str}) '
                         f'SELECT {target_cols_str} FROM {staging_table_name} '
-                        f'WHERE "ObjectKeyHash" IN :hashes'
+                        f'WHERE "object_key_hash" IN :hashes'
                     )
                     await session.execute(insert_sql, {"hashes": tuple(new_hashes)})
 
@@ -1328,13 +1468,12 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, context="execute_delta_comparison", staging_table=staging_table_name, **context)
             raise
 
-
     async def get_objects_needing_classification_rescan(self, cutoff_date: datetime, context: Optional[Dict[str, Any]] = None) -> List[int]:
         context = context or {}
         self.logger.log_database_operation("SELECT", "DiscoveredObjectClassificationDateInfo", "STARTED", operation="rescan_check", **context)
         try:
             async with self.get_async_session() as session:
-                stmt = select(DiscoveredObjectClassificationDateInfo.ObjectID).where(DiscoveredObjectClassificationDateInfo.LastClassificationDate < cutoff_date)
+                stmt = select(DiscoveredObjectClassificationDateInfo.object_id).where(DiscoveredObjectClassificationDateInfo.last_classification_date < cutoff_date)
                 result = await session.scalars(stmt)
                 results = list(result.all())
                 self.logger.log_database_operation("SELECT", "DiscoveredObjectClassificationDateInfo", "SUCCESS", row_count=len(results), **context)
@@ -1342,6 +1481,7 @@ class DatabaseInterface:
         except Exception as e:
             self.error_handler.handle_error(e, context="get_objects_needing_classification_rescan", **context)
             raise
+
             
     async def get_datasource_with_schedule(self, datasource_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[DataSource]:
         """
@@ -1437,13 +1577,14 @@ class DatabaseInterface:
         self.logger.log_database_operation("UPDATE", "TaskOutputRecords", "STARTED", operation="update_status", record_id=record_id, **context)
         try:
             async with self.get_async_session() as session:
-                stmt = update(TaskOutputRecord).where(TaskOutputRecord.ID == record_id).values(Status=status)
+                stmt = update(TaskOutputRecord).where(TaskOutputRecord.id == record_id).values(status=status)
                 await session.execute(stmt)
                 await session.commit()
                 self.logger.log_database_operation("UPDATE", "TaskOutputRecords", "SUCCESS", operation="update_status", **context)
         except Exception as e:
             self.error_handler.handle_error(e, context="update_output_record_status", record_id=record_id, **context)
             raise
+
 
     async def extend_task_lease(self, task_id: int, duration_seconds: int, context: Optional[Dict[str, Any]] = None) -> bool:
         """Extends the lease of an ASSIGNED task, preventing it from timing out."""
@@ -1454,9 +1595,9 @@ class DatabaseInterface:
                 new_expiry = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
                 # The WHERE clause ensures we only update an active, assigned task (optimistic locking).
                 stmt = update(Task).where(
-                    Task.ID == task_id,
-                    Task.Status == TaskStatus.ASSIGNED
-                ).values(LeaseExpiry=new_expiry)
+                    Task.id == task_id,
+                    Task.status == TaskStatus.ASSIGNED
+                ).values(lease_expiry=new_expiry)
                 result = await session.execute(stmt)
                 await session.commit()
                 was_successful = result.rowcount > 0
@@ -1474,13 +1615,13 @@ class DatabaseInterface:
         ResourceCoordinator for any affected tasks.
         """
         context = context or {}
-        self.logger.log_database_operation("UPDATE", "Tasks", "STARTED", operation="cancel_pending", job_id=job_id, **context)
+        self.logger.log_database_operation("UPDATE", "Tasks", "STARTED", operation_name="cancel_pending", job_id=job_id, **context)
         try:
             async with self.get_async_session() as session:
                 stmt = update(Task).where(
-                    Task.JobID == job_id,
-                    Task.Status == TaskStatus.PENDING
-                ).values(Status=TaskStatus.CANCELLED)
+                    Task.job_id == job_id,
+                    Task.status == TaskStatus.PENDING
+                ).values(status=TaskStatus.CANCELLED)
                 result = await session.execute(stmt)
                 await session.commit()
                 cancelled_count = result.rowcount
@@ -1489,7 +1630,7 @@ class DatabaseInterface:
         except Exception as e:
             self.error_handler.handle_error(e, context="cancel_pending_tasks_for_job", job_id=job_id, **context)
             raise
-            
+           
     async def get_scan_template_by_id(self, template_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[ScanTemplate]:
         """Get scan template by ID with caching."""
         cache_key = f"scan_template:{template_id}"
@@ -1521,7 +1662,7 @@ class DatabaseInterface:
         try:
             async with self.get_async_session() as session:
                 # Subquery to check for active tasks
-                active_task_subquery = select(Task.ID).where(Task.JobID == job_id, Task.Status == TaskStatus.ASSIGNED).limit(1).exists()
+                active_task_subquery = select(Task.id).where(Task.JobID == job_id, Task.status == TaskStatus.ASSIGNED).limit(1).exists()
                 # Atomic update
                 stmt = update(Job).where(
                     Job.id == job_id,
@@ -1653,7 +1794,7 @@ class DatabaseInterface:
             async with self.get_async_session() as session:
                 stmt = select(RemediationLedger).where(
                     RemediationLedger.plan_id == plan_id,
-                    RemediationLedger.Status == status
+                    RemediationLedger.status == status
                 )
                 result = await session.scalars(stmt)
                 bins = result.all()
@@ -1662,3 +1803,11 @@ class DatabaseInterface:
         except Exception as e:
             self.error_handler.handle_error(e, context="get_ledger_bins_by_status", plan_id=plan_id, status=status.value, **context)
             raise
+            
+    async def close_async(self):
+        """
+        Gracefully disposes of the database engine and its connection pool.
+        """
+        if self.async_engine:
+            self.logger.info("Closing database connection pool.")
+            await self.async_engine.dispose()

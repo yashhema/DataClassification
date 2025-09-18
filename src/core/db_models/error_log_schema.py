@@ -14,8 +14,10 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .base import Base
 
 class SystemErrorLog(Base):
-    """SQLAlchemy ORM model for the SystemErrorLogs table."""
-    __tablename__ = 'SystemErrorLogs'
+    """SQLAlchemy ORM model for the system_error_logs table."""
+    __tablename__ = 'system_error_logs'
+    __table_args__ = {'extend_existing': True}
+    
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     error_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     error_type: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -28,5 +30,5 @@ class SystemErrorLog(Base):
     source_machine: Mapped[Optional[str]] = mapped_column(String(255), comment="The hostname, pod name, or machine name where the error occurred.")
     node_group: Mapped[Optional[str]] = mapped_column(String(255), comment="The logical group of workers the source machine belongs to, if applicable.")
 
-    context: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=True)
+    context: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
     stack_trace: Mapped[Optional[str]] = mapped_column(Text)

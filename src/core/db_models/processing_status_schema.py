@@ -14,9 +14,9 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .base import Base
 
 class ObjectProcessingStatus(Base):
-    __tablename__ = 'ObjectProcessingStatuses'
+    __tablename__ = 'object_processing_statuses'
     __table_args__ = (
-        Index('IX_ObjectProcessingStatuses_JobID', 'JobID', unique=False),
+        Index('ix_object_processing_statuses_job_id', 'job_id', unique=False),
         {'extend_existing': True} # For robustness with validation scripts
     )
     __doc__ = """
@@ -27,18 +27,17 @@ class ObjectProcessingStatus(Base):
     
     # The unique, string-based object_id (e.g., 'ds_smb:hash:path/file.txt')
     # is used as the primary key. This avoids needing a separate lookup query.
-    ObjectID_str: Mapped[str] = mapped_column(String(255), primary_key=True, comment="The unique string identifier for the object.")
+    object_id_str: Mapped[str] = mapped_column(String(255), primary_key=True, comment="The unique string identifier for the object.")
     
-    JobID: Mapped[int] = mapped_column(Integer, nullable=False, comment="The ID of the job that was running when this status was recorded.")
+    job_id: Mapped[int] = mapped_column(Integer, nullable=False, comment="The ID of the job that was running when this status was recorded.")
     
-    Status: Mapped[str] = mapped_column(String(100), nullable=False, comment="The processing status, e.g., 'FileTooLarge', 'Corrupted'.")
+    status: Mapped[str] = mapped_column(String(100), nullable=False, comment="The processing status, e.g., 'FileTooLarge', 'Corrupted'.")
     
-    Details: Mapped[Optional[str]] = mapped_column(Text, nullable=True, comment="Details about the status, like an error message from the content extractor.")
+    details: Mapped[Optional[str]] = mapped_column(Text, nullable=True, comment="Details about the status, like an error message from the content extractor.")
     
-    ScanTimestamp: Mapped[datetime] = mapped_column(
+    scan_timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), 
         nullable=False, 
         default=lambda: datetime.now(timezone.utc),
         comment="The timestamp when this status was recorded."
     )
-

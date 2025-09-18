@@ -58,11 +58,11 @@ class Pipeliner:
                         await self._process_output_record(record)
                     except Exception as record_error:
                         self.logger.error(
-                            f"Error processing output record {record.ID}",
-                            record_id=record.ID,
+                            f"Error processing output record {record.id}",
+                            record_id=record.id,
                             exc_info=True
                         )
-                        await self.db.update_output_record_status(record.ID, "FAILED")
+                        await self.db.update_output_record_status(record.id, "FAILED")
                         continue
 
                 self.orchestrator.update_thread_liveness("pipeliner")
@@ -79,15 +79,15 @@ class Pipeliner:
         Main dispatcher for all multi-stage workflows. It routes records to the
         correct handler based on their OutputType.
         """
-        parent_task = await self.db.get_task_by_id(record.TaskID)
+        parent_task = await self.db.get_task_by_id(record.task_id)
         
-        if not parent_task or parent_task.Status != TaskStatus.COMPLETED:
-            self.logger.warning(f"Orphaning output record {record.ID} from a non-completed or missing parent task.")
-            await self.db.update_output_record_status(record.ID, "ORPHANED")
+        if not parent_task or parent_task.status != TaskStatus.COMPLETED:
+            self.logger.warning(f"Orphaning output record {record.id} from a non-completed or missing parent task.")
+            await self.db.update_output_record_status(record.id, "ORPHANED")
             return
 
         # --- Main Dispatcher Logic ---
-        output_type = record.OutputType
+        output_type = record.output_type
         if output_type == "SELECTION_PLAN_CREATED":
             await self._fan_out_selection_tasks(parent_task, record)
         elif output_type == "ACTION_PLAN_CREATED":
@@ -98,28 +98,28 @@ class Pipeliner:
             await self._create_next_stage_scan_task(parent_task, record)
         
         # Mark the record as processed to prevent duplicate task creation
-        await self.db.update_output_record_status(record.ID, "PROCESSED")
+        await self.db.update_output_record_status(record.id, "PROCESSED")
 
     async def _fan_out_selection_tasks(self, parent_task, record):
         """Reads a selection plan blueprint and creates parallel POLICY_SELECTOR_EXECUTE tasks."""
-        blueprint = record.OutputPayload
+        blueprint = record.output_payload
         total_objects = blueprint.get("total_objects", 0)
         batch_size = blueprint.get("selection_batch_size", 10000)
         plan_id = blueprint.get("plan_id")
         
         if total_objects == 0:
-            self.logger.info(f"Selection plan for job {parent_task.JobID} found no objects. Proceeding to finalize.", job_id=parent_task.JobID)
+            self.logger.info(f"Selection plan for job {parent_task.job_id} found no objects. Proceeding to finalize.", job_id=parent_task.job_id)
             # If no objects, we can move directly to finalizing the job.
             # A simple way is to create the commit task which will find no bins and complete.
             await self.db.create_task(
-                job_id=parent_task.JobID,
+                job_id=parent_task.job_id,
                 task_type=TaskType.POLICY_COMMIT_PLAN,
                 work_packet={"payload": {"plan_id": plan_id, "action_definition": blueprint.get("action_definition")}}
             )
             return
 
         num_tasks = ceil(total_objects / batch_size)
-        self.logger.info(f"Pipeliner fanning out selection phase for job {parent_task.JobID}: creating {num_tasks} tasks.", job_id=parent_task.JobID)
+        self.logger.info(f"Pipeliner fanning out selection phase for job {parent_task.job_id}: creating {num_tasks} tasks.", job_id=parent_task.job_id)
 
         query_def = QueryDefinition(**blueprint.get("query_definition", {}))
 
@@ -130,67 +130,108 @@ class Pipeliner:
                 pagination=Pagination(offset=(i * batch_size), limit=batch_size)
             )
             await self.db.create_task(
-                job_id=parent_task.JobID,
+                job_id=parent_task.job_id,
                 task_type=TaskType.POLICY_SELECTOR_EXECUTE,
                 work_packet={"payload": payload.dict()},
-                parent_task_id=parent_task.ID
+                parent_task_id=parent_task.id
             )
 
     async def _fan_out_action_tasks(self, parent_task, record):
         """Reads an action plan and creates parallel POLICY_ACTION_EXECUTE tasks for each bin in the ledger."""
-        action_plan = record.OutputPayload
+        action_plan = record.output_payload
         plan_id = action_plan.get("plan_id")
         action_def = ActionDefinition(**action_plan.get("action_definition"))
 
         bins_to_process = await self.db.get_ledger_bins_by_status(plan_id, LedgerStatus.PLANNED)
         
         if not bins_to_process:
-            self.logger.warning(f"Action phase for job {parent_task.JobID} triggered, but no PLANNED bins found.", job_id=parent_task.JobID)
+            self.logger.warning(f"Action phase for job {parent_task.job_id} triggered, but no PLANNED bins found.", job_id=parent_task.job_id)
             return
 
-        self.logger.info(f"Pipeliner fanning out action phase for job {parent_task.JobID}: creating {len(bins_to_process)} tasks.", job_id=parent_task.JobID)
+        self.logger.info(f"Pipeliner fanning out action phase for job {parent_task.job_id}: creating {len(bins_to_process)} tasks.", job_id=parent_task.job_id)
 
         for ledger_bin in bins_to_process:
             payload = PolicyActionExecutePayload(
                 plan_id=plan_id,
                 bin_id=ledger_bin.bin_id,
                 action=action_def,
-                objects_to_process=[{"ObjectID": oid, "ObjectPath": opath} for oid, opath in zip(ledger_bin.ObjectIDs, ledger_bin.ObjectPaths)]
+                objects_to_process=[{"object_id": oid, "object_path": opath} for oid, opath in zip(ledger_bin.object_ids, ledger_bin.object_paths)]
             )
             await self.db.create_task(
-                job_id=parent_task.JobID,
+                job_id=parent_task.job_id,
                 task_type=TaskType.POLICY_ACTION_EXECUTE,
                 work_packet={"payload": payload.dict()},
-                parent_task_id=parent_task.ID
+                parent_task_id=parent_task.id
             )
 
     async def _create_reconciliation_task(self, parent_task, record):
         """Creates a single, lightweight POLICY_RECONCILE task."""
-        payload_data = record.OutputPayload
+        payload_data = record.output_payload
         payload = PolicyReconcilePayload(
-            plan_id=parent_task.WorkPacket.get("payload", {}).get("plan_id"),
+            plan_id=parent_task.work_packet.get("payload", {}).get("plan_id"),
             updates=payload_data.get("updates", [])
         )
         await self.db.create_task(
-            job_id=parent_task.JobID,
+            job_id=parent_task.job_id,
             task_type=TaskType.POLICY_RECONCILE,
             work_packet={"payload": payload.dict()},
-            parent_task_id=parent_task.ID
+            parent_task_id=parent_task.id
         )
 
     async def _create_next_stage_scan_task(self, parent_task, record):
-        """Original logic for standard SCANNING jobs."""
+        """
+        Creates the correct next-stage task by reading the discovery_workflow
+        flag from the job's underlying data source configuration.
+        """
+        context = {"parent_task_id": parent_task.id, "record_id": record.id}
+
+        # Step 1: Get the parent job to find the datasource ID
+        job_result = await self.db.get_jobs_by_ids([parent_task.job_id], context=context)
+        if not job_result:
+            self.logger.error(f"Cannot pipeline task for missing job {parent_task.job_id}", job_id=parent_task.job_id, **context)
+            return
+        job = job_result[0]
+
+        # Step 2: Get the datasource ID from the job's configuration
+        datasource_targets = job.configuration.get('datasource_targets', [])
+        if not datasource_targets:
+            self.logger.error(f"Job {job.id} has no datasource targets in its configuration.", job_id=job.id, **context)
+            return
+        # A child job is scoped to a single node group, so we can safely use the first datasource
+        datasource_id = datasource_targets[0]['datasource_id']
+
+        # Step 3: Fetch the full datasource object from the database
+        datasources = await self.db.get_datasources_by_ids([datasource_id], context=context)
+        if not datasources:
+            self.logger.error(f"Could not find datasource '{datasource_id}' for job {job.id}", job_id=job.id, datasource_id=datasource_id, **context)
+            return
+        
+        # Step 4: Read the workflow flag from the datasource's configuration.
+        # Default to 'two-phase' for safety and backward compatibility if the flag isn't set.
+        workflow = datasources[0].configuration.get("discovery_workflow", "single-phase")
+        
         next_task_type_str = None
-        if record.OutputType == "DISCOVERED_OBJECTS":
-            next_task_type_str = "DISCOVERY_GET_DETAILS"
-        elif record.OutputType == "OBJECT_DETAILS_FETCHED":
+        if record.output_type == "DISCOVERED_OBJECTS":
+            if workflow == "single-phase":
+                # For databases, enumeration is the only discovery step. The next step is classification.
+                next_task_type_str = "CLASSIFICATION"
+            else: # "two-phase"
+                # For files, the next step is to get detailed metadata (like permissions).
+                next_task_type_str = "DISCOVERY_GET_DETAILS"
+
+        elif record.output_type == "OBJECT_DETAILS_FETCHED":
+            # This record only comes from a two-phase workflow; the next step is always classification.
             next_task_type_str = "CLASSIFICATION"
 
         if next_task_type_str:
+            self.logger.info(
+                f"Pipelining job {job.id}: Creating next stage task '{next_task_type_str}' from output '{record.output_type}'.",
+                job_id=job.id, next_task=next_task_type_str, **context
+            )
             await self.db.create_task(
-                job_id=parent_task.JobID,
+                job_id=parent_task.job_id,
                 task_type=TaskType(next_task_type_str),
-                work_packet={"payload": record.OutputPayload},
-                datasource_id=parent_task.DatasourceID,
-                parent_task_id=parent_task.ID
+                work_packet={"payload": record.output_payload},
+                datasource_id=parent_task.datasource_id,
+                parent_task_id=parent_task.id
             )

@@ -88,15 +88,26 @@ class SQLSearchProvider(AbstractSearchProvider):
             result = await session.execute(stmt)
             return result.scalar_one()
 
+
+
     async def get_object_page(self, query: QueryDefinition, pagination: Pagination) -> List[Dict[str, Any]]:
         table = self._get_table_from_source(query.source)
-        stmt = select(table.ObjectID, table.ObjectPath) # Select only the needed fields
         
+        # CORRECTED: Select different columns based on the table source
+        if query.source == "metadata":
+            stmt = select(table.id, table.object_path)
+        elif query.source == "findings":
+            # ScanFindingSummary has file_path, not object_path
+            stmt = select(table.id, table.file_path)
+        else:
+            # Fallback for any future sources
+            raise ValueError(f"Invalid query source for get_object_page: {query.source}")
+
         where_clause = self._build_where_clause(table, query.filters)
         if where_clause is not None:
             stmt = stmt.where(where_clause)
 
-        # Apply sorting for deterministic pagination
+        # Apply sorting
         if query.sort:
             for s in query.sort:
                 col = getattr(table, s.field)
@@ -107,8 +118,14 @@ class SQLSearchProvider(AbstractSearchProvider):
         
         async with self.db.get_async_session() as session:
             result = await session.execute(stmt)
-            # Convert SQLAlchemy rows to the simple dict format the worker expects
-            return [{"ObjectID": row.ObjectID, "ObjectPath": row.ObjectPath} for row in result.all()]
+            rows = result.all()
+
+            # CORRECTED: Handle the different column names to produce a consistent output
+            if query.source == "metadata":
+                return [{"object_id": row.id, "object_path": row.object_path} for row in rows]
+            elif query.source == "findings":
+                # Alias 'file_path' to 'object_path' for a consistent return format
+                return [{"object_id": row.id, "object_path": row.file_path} for row in rows]
 
 class ElasticsearchSearchProvider(AbstractSearchProvider):
     """

@@ -239,8 +239,8 @@ class ResourceCoordinator:
 
     def get_next_job_for_assignment(self, active_jobs: List[Job]) -> Optional[Job]:
         if not active_jobs: return None
-        highest_priority = min(j.Priority for j in active_jobs)
-        top_priority_jobs = sorted([j for j in active_jobs if j.Priority == highest_priority], key=lambda j: j.name)
+        highest_priority = min(j.priority for j in active_jobs)
+        top_priority_jobs = sorted([j for j in active_jobs if j.priority == highest_priority], key=lambda j: j.name)
         job_ids_str = [str(j.id) for j in top_priority_jobs]
         counts_map = self.state_manager.get_worker_counts_for_jobs(job_ids_str)
         chosen_job = min(top_priority_jobs, key=lambda j: counts_map.get(str(j.id), 0))

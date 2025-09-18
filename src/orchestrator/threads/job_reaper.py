@@ -58,17 +58,17 @@ class JobReaper:
         now = datetime.now(timezone.utc)
         
         # Check if previous warnings are stale
-        is_stale = (job.LastLeaseWarningTimestamp is None or 
-                    (now - job.LastLeaseWarningTimestamp) > self.warning_window)
+        is_stale = (job.last_lease_warning_timestamp is None or 
+                    (now - job.last_lease_warning_timestamp) > self.warning_window)
 
         if is_stale:
             # First warning or previous warnings are too old; reset the count.
             await self.db.update_job_warning_count(job.id, new_count=1)
             self.logger.warning(f"Lease expired for job {job.id}. This is warning 1 of {self.warning_threshold}.", job_id=job.id)
         
-        elif job.LeaseWarningCount < self.warning_threshold - 1:
+        elif job.lease_warning_count < self.warning_threshold - 1:
             # Warnings are recent, but we are still within the grace period. Increment the count.
-            new_count = job.LeaseWarningCount + 1
+            new_count = job.lease_warning_count + 1
             await self.db.update_job_warning_count(job.id, new_count=new_count)
             self.logger.warning(f"Lease still expired for job {job.id}. This is warning {new_count} of {self.warning_threshold}.", job_id=job.id)
 
@@ -79,7 +79,7 @@ class JobReaper:
             # The takeover method uses the 'Version' column for a safe, atomic update
             was_takeover_successful = await self.db.takeover_abandoned_job(
                 job_id=job.id,
-                job_version=job.Version,
+                job_version=job.version,
                 new_orchestrator_id=self.orchestrator.instance_id
             )
 

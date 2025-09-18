@@ -6,7 +6,7 @@ It uses an optimistic locking pattern to prevent race conditions.
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # Import for type hinting
 from typing import TYPE_CHECKING
@@ -71,10 +71,12 @@ class LeaseManager:
 
                 if was_renewed:
                     # Update the in-memory state with the new lease expiry and version
-                    async with self.orchestrator._state_lock:
-                        if job_id in self.orchestrator.job_states:
-                           self.orchestrator.job_states[job_id]["version"] += 1
-                           self.orchestrator.job_states[job_id]["lease_expiry"] = datetime.now(timezone.utc) + timedelta(seconds=self.lease_duration_sec)
+                    new_expiry = datetime.now(timezone.utc) + timedelta(seconds=self.lease_duration_sec)
+                    await self.orchestrator._update_job_in_memory_state(
+                        job_id=job_id,
+                        version=current_version + 1,
+                        lease_expiry=new_expiry
+                    )
                 else:
                     # If the renewal failed, we have lost the lease.
                     await self._handle_lost_lease(job_id)
@@ -95,5 +97,5 @@ class LeaseManager:
         async with self.orchestrator._state_lock:
             # Safely remove the job from all in-memory structures
             self.orchestrator.job_states.pop(job_id, None)
-            self.orchestrator.job_task_cache.pop(job_id, None)
+            self.orchestrator.job_cache.pop(job_id, None)
             self.orchestrator.snoozed_jobs.pop(job_id, None)

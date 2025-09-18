@@ -1,0 +1,71 @@
+Of course. Here is an updated design document that reflects the final, robust architecture we have developed for your system.
+
+---
+## **System Design Document: Asynchronous Data Classification Platform (v3.0)**
+**Date**: September 17, 2025
+
+### **1. Introduction & Core Principles**
+
+#### **1.1. Purpose**
+This document outlines the architecture of the Asynchronous Data Classification Platform, a high-performance, distributed system designed to discover, classify, and act upon sensitive data across enterprise data sources. The system is architected for scalability, resilience, and multi-region deployments.
+
+#### **1.2. Core Architectural Principles**
+* [cite_start]**Asynchronous & Decoupled**: The system is built on an asynchronous model using Python's `asyncio` library. [cite: 12] [cite_start]All core components (Orchestrator, Worker, CLI) are decoupled and operate as independent services, communicating solely through a central database. [cite: 14]
+* **Database as Coordinator**: The central SQL database acts as the single source of truth and the primary coordination mechanism. It is used to manage job queues, track state, and facilitate asynchronous communication between components, eliminating the need for direct service-to-service calls.
+* **Lease-Based Job Ownership**: To ensure high availability, a running job is actively "owned" by a specific Orchestrator instance via a database lease. A robust failover mechanism with a "Job Reaper" allows any healthy Orchestrator to recover jobs from a failed instance.
+* **Configuration-Driven Logic**: The behavior of the system, from authentication methods to connector-specific settings, is defined declaratively in the database. This allows for flexible administration without requiring application code changes.
+
+---
+### **2. System Components**
+
+#### **2.1. CLI (Command Line Interface)**
+A standalone, synchronous Python application (`cli.py`) that acts as the primary user-facing tool for managing the system.
+* **Job Composer**: Its main role is to act as a "Job Composer." It reads a `ScanTemplate`, queries the `DataSources` table to group targets by `NodeGroup`, and creates fully-formed, self-contained "Child Jobs" directly in the database.
+* **Command Issuer**: For real-time commands (`pause`, `cancel`, etc.), it writes the command to the `master_pending_commands` field in the appropriate `Jobs` table records.
+
+#### **2.2. Orchestrator**
+The central job execution and state management service. Multiple Orchestrator instances can run simultaneously within a `NodeGroup` for scalability and resilience.
+* **Job Executor**: The Orchestrator's `TaskAssigner` discovers `QUEUED` jobs in the database that match its `NodeGroup` and competes to claim them using an atomic database update.
+* **Lease Manager**: A background coroutine that periodically renews the database lease for all jobs the Orchestrator currently owns. It also checks for and executes any commands found in the `master_pending_commands` field.
+* **Job Reaper**: A background coroutine that finds and recovers abandoned jobs whose leases have expired, providing a failover mechanism.
+* **Task Management**: Once a job is claimed, the Orchestrator is responsible for creating all necessary tasks and dispatching them to the worker pool.
+
+#### **2.3. Worker**
+A stateless execution engine responsible for performing individual tasks.
+* **Task Execution**: Receives a `WorkPacket` from the Orchestrator and executes the specified task (e.g., enumeration, classification).
+* **On-Demand Connectors**: Uses a `ConnectorFactory` to create connector instances on-demand based on the `datasource_id` of the task it receives.
+* [cite_start]**Credential Management**: Connectors use a central `CredentialManager` to securely fetch secrets (e.g., passwords) from a configured provider (like a file or a vault) at runtime. [cite: 1729]
+
+---
+### **3. Database Schema**
+
+The schema is standardized on the **snake_case** naming convention. Key tables include:
+
+* **`master_jobs`**: Stores the high-level, user-facing job requests.
+* **`jobs`**: Stores the individual "Child Job" records. This is the primary table for the Orchestrator. Key columns include:
+    * `master_job_id`: A foreign key linking the child job back to the master request.
+    * `node_group`: The datacenter/region this job is assigned to.
+    * `orchestrator_id`, `orchestrator_lease_expiry`, `version`: Columns that manage the job ownership and optimistic locking for failover.
+    * `master_pending_commands`: The field used by the CLI to issue asynchronous commands.
+    * `configuration`: A JSON field containing a complete, self-contained copy of the filtered scan configuration.
+* **`tasks`**: Stores the individual units of work for a job.
+* **`datasources`**: Stores the configuration for all connectable data sources, including their `node_group`.
+
+---
+### **4. System Workflows**
+
+#### **4.1. Starting a New Job**
+1.  **CLI**: The user executes `python cli.py start_job <template_id>`.
+2.  **CLI**: The script reads the specified `ScanTemplate` from the database.
+3.  **CLI**: It queries the `DataSources` table to group the target `datasource_ids` from the template by their `node_group`.
+4.  **CLI**: For each `node_group`, it inserts a new row into the `jobs` table with `status='QUEUED'` and `master_pending_commands='START'`. The `configuration` for this job is a self-contained copy of the template's configuration, filtered to only include the data sources for that specific group.
+5.  **Orchestrator**: An idle Orchestrator in the corresponding `node_group` discovers the new `QUEUED` job.
+6.  **Orchestrator**: It executes an atomic `UPDATE` to claim the job, changing its `status` to `RUNNING` and acquiring a lease.
+7.  **Orchestrator**: It then begins creating and dispatching tasks for the job.
+
+#### **4.2. Issuing a Real-Time Command (e.g., Pause)**
+1.  **CLI**: The user executes `python cli.py pause <master_job_id>`.
+2.  **CLI**: The script finds all child jobs in the `jobs` table with a matching `master_job_id`.
+3.  **CLI**: For each child job, it issues an `UPDATE` to set the `master_pending_commands` field to `'PAUSE'`.
+4.  **Orchestrator**: The Orchestrator instance that owns the lease for a paused job, during its next `LeaseManager` cycle, will see the `'PAUSE'` command.
+5.  **Orchestrator**: It will then execute the pause logic (change the job's `status` to `PAUSING`) and clear the `master_pending_commands` field in the same transaction.

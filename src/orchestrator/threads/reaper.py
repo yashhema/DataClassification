@@ -5,6 +5,11 @@ periodically scans for tasks that have exceeded their lease duration.
 It is a critical component for system resilience, ensuring that hung
 or failed workers do not cause tasks to be permanently stuck.
 
+FIXES APPLIED:
+- Fixed schema compliance: uses task.job_id instead of task.JobID
+- Updated to call ResourceCoordinator directly instead of deleted orchestrator method
+- Maintained all original timeout and recovery logic
+
 ASYNC CONVERSION:
 - Converted from threading.Thread to async coroutine
 - All database calls now use await
@@ -43,14 +48,19 @@ class Reaper:
                 if expired_tasks:
                     self.logger.warning(f"Reaper found {len(expired_tasks)} expired tasks.", count=len(expired_tasks))
                     for task in expired_tasks:
-                        self.logger.log_lease_expiry(task.ID, task.WorkerID, job_id=task.JobID)
+                        # FIXED: Use task.job_id instead of task.JobID
+                        self.logger.log_lease_expiry(task.id, task.worker_id, job_id=task.job_id)
                         
-                        # Use the central Orchestrator method to release resources,
-                        # ensuring consistent state management.
-                        self.orchestrator.release_resources_for_task(task)
+                        # UPDATED: Call ResourceCoordinator directly instead of deleted orchestrator method
+                        # Release worker slot for the job
+                        self.orchestrator.resource_coordinator.state_manager.release_job_worker_slot(task.job_id)
+                        
+                        # Release datasource connection if the task had one
+                        if task.datasource_id:
+                            self.orchestrator.resource_coordinator.state_manager.release_datasource_connection(task.datasource_id)
                         
                         # Re-queue the task by marking it as failed and retryable.
-                        await self.db.fail_task(task.ID, is_retryable=True)
+                        await self.db.fail_task(task.id, is_retryable=True)
                 
                 # Update the liveness timestamp to show the coroutine is healthy and not deadlocked.
                 self.orchestrator.update_thread_liveness("reaper")

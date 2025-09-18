@@ -229,7 +229,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
         """Load datasource and connector configuration asynchronously."""
         if self.datasource_config is None:
             # Load datasource configuration from database (async)
-            self.datasource_config = await self.db.get_datasource_configuration_async(self.datasource_id)
+            self.datasource_config = await self.db.get_datasource_configuration(self.datasource_id)
             if not self.datasource_config:
                 raise ConfigurationError(
                     f"Datasource configuration not found: {self.datasource_id}",
@@ -239,7 +239,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
         
         if self.connector_config is None:
             # Load connector-specific configuration (SQL queries) (async)
-            self.connector_config = await self.db.get_connector_configuration_async("sqlserver", "default")
+            self.connector_config = await self.db.get_connector_configuration("sqlserver", "default")
             if not self.connector_config:
                 raise ConfigurationError(
                     "SQL Server connector configuration not found",
@@ -483,11 +483,11 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                         continue
                     
                     discovered_obj = discovered_objects[0]
-                    object_path = discovered_obj.ObjectPath
+                    object_path = discovered_obj.object_path
                     
                     # Extract content based on object type (async)
                     content = await self._extract_content_for_classification_async(
-                        object_path, discovered_obj.ObjectType, trace_id, task_id
+                        object_path, discovered_obj.object_type, trace_id, task_id
                     )
                     
                     if content:
@@ -497,7 +497,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                             "content": content,
                             "metadata": {
                                 "object_path": object_path,
-                                "object_type": discovered_obj.ObjectType,
+                                "object_type": discovered_obj.object_type,
                                 "datasource_id": self.datasource_id
                             }
                         }
@@ -564,8 +564,8 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                     if not credential_id:
                         raise ValueError(f"credential_id is required for '{auth_method}' authentication.")
                     
-                    credential_record = await self.db.get_credential_by_id_async(credential_id)
-                    password = await self.credential_manager.get_password_async(credential_record.store_details)
+                    credential_record = await self.db.get_credential_for_datasource(credential_id)
+                    password = await self.credential_manager.get_password_async(credential_data['store_details'])
                     
                     # Inject the fetched password into the connection config
                     auth_config['password'] = password
@@ -905,20 +905,20 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                 object_key_hash = hashlib.sha256(key_string.encode()).digest()
                 
                 mapping = {
-                    'ObjectKeyHash': object_key_hash,
-                    'DataSourceID': obj.datasource_id,
-                    'ObjectType': obj.object_type,
-                    'ObjectPath': obj.object_path,
-                    'SizeBytes': obj.object_metadata.size_bytes,
-                    'CreatedDate': obj.object_metadata.created_date,
-                    'LastModified': obj.object_metadata.last_modified,
-                    'LastAccessed': obj.object_metadata.last_accessed,
-                    'DiscoveryTimestamp': datetime.now(timezone.utc)
-                }
+                    'object_key_hash': object_key_hash,
+                    'data_source_id': obj.datasource_id,
+                    'object_type': obj.object_type,
+                    'object_path': obj.object_path,
+                    'size_bytes': obj.object_metadata.size_bytes,
+                    'created_date': obj.object_metadata.created_date,
+                    'last_modified': obj.object_metadata.last_modified,
+                    'last_accessed': obj.object_metadata.last_accessed,
+                    'discovery_timestamp': datetime.now(timezone.utc)
+                    }
                 batch_mappings.append(mapping)
             
             # Insert into staging table (async)
-            await self.db.insert_discovered_object_batch_async(
+            await self.db.insert_discovered_object_batch(
                 batch_mappings, 
                 staging_table_name,
                 context={'trace_id': trace_id, 'task_id': task_id}
@@ -939,13 +939,13 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
         """Get detailed metadata for a specific object (async)."""
         try:
             # Get discovered object from database (async)
-            discovered_objects = await self.db.get_objects_for_classification_async([object_id])
+            discovered_objects = await self.db.get_objects_for_classification([object_id])
             
             if not discovered_objects:
                 return None
             
             discovered_obj = discovered_objects[0]
-            object_path = discovered_obj.ObjectPath
+            object_path = discovered_obj.object_path
             
             # Parse object path
             path_parts = object_path.split('.')
