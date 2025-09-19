@@ -12,7 +12,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base
-from .association_tables import datasource_tag_link
+from .association_tables import DataSourceTagLink
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -35,7 +35,7 @@ class Tag(Base):
     parent: Mapped["Tag"] = relationship(back_populates="children", remote_side=[id])
     children: Mapped[List["Tag"]] = relationship(back_populates="parent")
     metadata_json: Mapped[Optional[Dict[str, Any]]] = mapped_column("metadata", JSON)
-    datasources: Mapped[List["DataSource"]] = relationship(secondary=datasource_tag_link, back_populates="tags")
+    datasources: Mapped[List["DataSource"]] = relationship(secondary=DataSourceTagLink, back_populates="tags")
 
 class DataSource(Base):
     __tablename__ = 'datasources'
@@ -55,5 +55,5 @@ class DataSource(Base):
     node_group_id: Mapped[Optional[int]] = mapped_column(ForeignKey('node_groups.id'))
     calendar_id: Mapped[Optional[int]] = mapped_column(ForeignKey('calendars.id'))
     calendar: Mapped[Optional["Calendar"]] = relationship()
-    tags: Mapped[List["Tag"]] = relationship(secondary=datasource_tag_link, back_populates="datasources")
+    tags: Mapped[List["Tag"]] = relationship(secondary=DataSourceTagLink, back_populates="datasources")
 

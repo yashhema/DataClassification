@@ -12,7 +12,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base
-from .association_tables import classifier_template_link
+from .association_tables import ClassifierTemplateLink
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -45,7 +45,7 @@ class Classifier(Base):
     validation_rules: Mapped[List["ClassifierValidationRule"]] = relationship(back_populates="classifier", cascade="all, delete-orphan")
     exclude_list: Mapped[List["ClassifierExcludeTerm"]] = relationship(back_populates="classifier", cascade="all, delete-orphan")
     templates: Mapped[List["ClassifierTemplate"]] = relationship(
-        secondary=classifier_template_link,
+        secondary=ClassifierTemplateLink,
         back_populates="classifiers"
     )
 

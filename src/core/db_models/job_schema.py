@@ -9,9 +9,10 @@ from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 
 from sqlalchemy import (
-    String, Integer, ForeignKey, DateTime, JSON, Boolean, func, Index, Enum as SQLAlchemyEnum, and_
+    String, Integer, ForeignKey, DateTime, JSON, Boolean, func, Index, Enum as SQLAlchemyEnum, and_,
+    text, BigInteger
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship, foreign
+from sqlalchemy.orm import Mapped, mapped_column, relationship, foreign, remote
 
 from .base import Base
 
@@ -28,6 +29,8 @@ class JobStatus(str, enum.Enum):
     CANCELLING = "CANCELLING"
     CANCELLED = "CANCELLED"
     COMPLETED = "COMPLETED"
+    # NEW: Added for more descriptive final state
+    COMPLETED_WITH_FAILURES = "COMPLETED_WITH_FAILURES" 
     FAILED = "FAILED"
 
 class TaskStatus(str, enum.Enum):
@@ -38,7 +41,7 @@ class TaskStatus(str, enum.Enum):
     CANCELLED = "CANCELLED"
 
 # =================================================================
-# NEW: MasterJob Model
+# NEW: MasterJob and MasterJobStateSummary Models
 # =================================================================
 class MasterJob(Base):
     __tablename__ = 'master_jobs'
@@ -46,10 +49,33 @@ class MasterJob(Base):
     master_job_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(String(1024))
+    # NEW: Added JobStatus to MasterJob for high-level tracking
+    status: Mapped[JobStatus] = mapped_column(SQLAlchemyEnum(JobStatus), nullable=False, default=JobStatus.QUEUED)
     configuration: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
 
+# NEW: Complete schema for the state summary table
+class MasterJobStateSummary(Base):
+    __tablename__ = 'master_job_state_summary'
+    __table_args__ = (
+        Index('ix_summary_last_updated', 'last_updated'),
+    )
+
+    master_job_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    total_children: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    queued_children: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    running_children: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pausing_children: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    paused_children: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cancelling_children: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cancelled_children: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completed_children: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_children: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1)
+    last_updated: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    created_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
 # =================================================================
-# Template Models
+# Template Models (Unchanged)
 # =================================================================
 class PolicyTemplate(Base):
     __tablename__ = 'policy_templates'
@@ -59,13 +85,16 @@ class PolicyTemplate(Base):
     description: Mapped[Optional[str]] = mapped_column(String(1024))
     is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     configuration: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
-    
     jobs: Mapped[List["Job"]] = relationship(
         "Job",
-        primaryjoin="and_(PolicyTemplate.id == Job.template_table_id, Job.template_type == 'POLICY')",
+        primaryjoin=lambda: and_(
+            PolicyTemplate.id == foreign(Job.template_table_id),
+            Job.template_type == 'POLICY'
+        ),
         back_populates="policy_template",
-        overlaps="scan_template,jobs"
+        viewonly=True
     )
+
 
 class ScanTemplate(Base):
     __tablename__ = 'scan_templates'
@@ -78,16 +107,19 @@ class ScanTemplate(Base):
     classifier_template_id: Mapped[str] = mapped_column(String(255), nullable=False)
     is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     configuration: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
-
     jobs: Mapped[List["Job"]] = relationship(
         "Job",
-        primaryjoin="and_(ScanTemplate.id == Job.template_table_id, Job.template_type == 'SCANNING')",
+        primaryjoin=lambda: and_(
+            ScanTemplate.id == foreign(Job.template_table_id),
+            Job.template_type == 'SCANNING'
+        ),
         back_populates="scan_template",
-        overlaps="policy_template,jobs"
+        viewonly=True
     )
 
+
 # =================================================================
-# Job Model
+# Job Model (Unchanged)
 # =================================================================
 class Job(Base):
     __tablename__ = 'jobs'
@@ -96,7 +128,7 @@ class Job(Base):
         Index(
             'ix_jobs_lease_for_recovery', 
             'node_group', 'status', 'orchestrator_lease_expiry',
-            postgresql_where=lambda: "status = 'RUNNING'"
+            mssql_where=text("status = 'RUNNING'")
         ),
     )
     
@@ -104,40 +136,42 @@ class Job(Base):
     execution_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     master_job_id: Mapped[Optional[str]] = mapped_column(String(255), comment="The ID of the master job that created this child job.")
     master_pending_commands: Mapped[Optional[str]] = mapped_column(String(255), comment="Command issued by the master cli.")
-    # Audit trail back to the original template
     template_table_id: Mapped[int] = mapped_column(Integer, nullable=False)
     template_type: Mapped[JobType] = mapped_column(SQLAlchemyEnum(JobType), nullable=False)
-
-    # Self-contained, filtered configuration for this specific job
     configuration: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, comment="A self-contained copy of the filtered scan configuration.")
-    
-    # Columns for leasing, recovery, and regional assignment
     node_group: Mapped[Optional[str]] = mapped_column(String(255), comment="The datacenter/region this job is assigned to.")
     orchestrator_id: Mapped[Optional[str]] = mapped_column(String(255), comment="The unique ID of the orchestrator instance that owns this job.")
     orchestrator_lease_expiry: Mapped[Optional[datetime]] = mapped_column(DateTime, comment="The timestamp when the current lease expires.")
     lease_warning_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="A counter for the failover grace period.")
     last_lease_warning_timestamp: Mapped[Optional[datetime]] = mapped_column(DateTime, comment="Timestamp of the last lease expiry warning.")
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, comment="Version number for optimistic locking.")
-    
-    # Core job properties
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
     status: Mapped[JobStatus] = mapped_column(SQLAlchemyEnum(JobStatus), nullable=False, default=JobStatus.QUEUED)
     trigger_type: Mapped[str] = mapped_column(String(50), nullable=False)
     created_timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
     completed_timestamp: Mapped[Optional[datetime]] = mapped_column(DateTime)
-
-    # Relationships
     scan_template: Mapped[Optional["ScanTemplate"]] = relationship(
-        primaryjoin="and_(ScanTemplate.id == Job.template_table_id, Job.template_type == 'SCANNING')",
+        "ScanTemplate",
+        primaryjoin=lambda: and_(
+            remote(ScanTemplate.id) == foreign(Job.template_table_id),
+            Job.template_type == 'SCANNING'
+        ),
         back_populates="jobs",
-        overlaps="policy_template"
+        viewonly=True
     )
+    
     policy_template: Mapped[Optional["PolicyTemplate"]] = relationship(
-        primaryjoin="and_(PolicyTemplate.id == Job.template_table_id, Job.template_type == 'POLICY')",
+        "PolicyTemplate", 
+        primaryjoin=lambda: and_(
+            remote(PolicyTemplate.id) == foreign(Job.template_table_id),
+            Job.template_type == 'POLICY'
+        ),
         back_populates="jobs",
-        overlaps="scan_template"
+        viewonly=True
     )
     tasks: Mapped[List["Task"]] = relationship(cascade="all, delete-orphan")
+
+
 
 # =================================================================
 # Task Models
@@ -166,6 +200,7 @@ class TaskOutputRecord(Base):
     )
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     task_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # UPDATED: Added status column for pipeline integrity
     status: Mapped[str] = mapped_column(String(50), nullable=False, default='PENDING_PROCESSING')
     output_type: Mapped[str] = mapped_column(String(100), nullable=False)
     output_payload: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)

@@ -47,6 +47,12 @@ from ..logging.system_logger import SystemLogger
 from ..errors import ErrorHandler
 from ..db_models.job_schema import MasterJob
 
+class LeaseRenewalResult(NamedTuple):
+    """Structured result for the lease renewal and command processing operation."""
+    outcome: str  # e.g., "SUCCESS", "LOCK_FAILED"
+    new_status: Optional[JobStatus] = None
+    new_version: Optional[int] = None
+
 class ConfigCache:
     """Configuration cache with LRU eviction and 24-hour expiry."""
     
@@ -141,7 +147,286 @@ class DatabaseInterface:
         if not self._safe_table_name_pattern.match(table_name):
             raise ValueError(f"Invalid characters in table name: {table_name}")
 
+    # =================================================================
+    # NEW: Master Job and Summary Management Methods
+    # =================================================================
+    
+    async def get_master_job_summary(self, master_job_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[MasterJobStateSummary]:
+        """Fetches the state summary record for a master job."""
+        context = context or {}
+        self.logger.log_database_operation("SELECT", "MasterJobStateSummary", "STARTED", master_job_id=master_job_id, **context)
+        try:
+            async with self.get_async_session() as session:
+                stmt = select(MasterJobStateSummary).where(MasterJobStateSummary.master_job_id == master_job_id)
+                result = await session.scalars(stmt)
+                summary = result.one_or_none()
+                self.logger.log_database_operation("SELECT", "MasterJobStateSummary", "SUCCESS", found=(summary is not None), **context)
+                return summary
+        except Exception as e:
+            self.error_handler.handle_error(e, "get_master_job_summary", master_job_id=master_job_id, **context)
+            raise
 
+    async def create_master_job_summary(self, master_job_id: str, total_children: int, context: Optional[Dict[str, Any]] = None) -> None:
+        """Creates the initial summary record for a new Master Job."""
+        context = context or {}
+        self.logger.log_database_operation("INSERT", "MasterJobStateSummary", "STARTED", master_job_id=master_job_id, **context)
+        try:
+            async with self.get_async_session() as session:
+                summary = MasterJobStateSummary(
+                    master_job_id=master_job_id,
+                    total_children=total_children,
+                    queued_children=total_children
+                )
+                session.add(summary)
+                await session.commit()
+                self.logger.log_database_operation("INSERT", "MasterJobStateSummary", "SUCCESS", master_job_id=master_job_id, **context)
+        except Exception as e:
+            self.error_handler.handle_error(e, "create_master_job_summary", master_job_id=master_job_id, **context)
+            raise
+
+    async def update_master_job_summary_counters(self, master_job_id: str, from_status: JobStatus, to_status: JobStatus, current_version: int, context: Optional[Dict[str, Any]] = None) -> bool:
+        """Atomically updates summary counters using optimistic locking."""
+        context = context or {}
+        self.logger.log_database_operation("UPDATE", "MasterJobStateSummary", "STARTED", operation="update_counters", master_job_id=master_job_id, **context)
+        try:
+            async with self.get_async_session() as session:
+                from_field = f"{from_status.value.lower()}_children"
+                to_field = f"{to_status.value.lower()}_children"
+
+                stmt = (
+                    update(MasterJobStateSummary)
+                    .where(
+                        MasterJobStateSummary.master_job_id == master_job_id,
+                        MasterJobStateSummary.version == current_version
+                    )
+                    .values(
+                        **{
+                            from_field: getattr(MasterJobStateSummary, from_field) - 1,
+                            to_field: getattr(MasterJobStateSummary, to_field) + 1,
+                            "version": MasterJobStateSummary.version + 1,
+                        }
+                    )
+                )
+                result = await session.execute(stmt)
+                await session.commit()
+                
+                was_successful = result.rowcount > 0
+                self.logger.log_database_operation("UPDATE", "MasterJobStateSummary", "SUCCESS" if was_successful else "FAILURE_OPTIMISTIC_LOCK", operation="update_counters", **context)
+                return was_successful
+        except Exception as e:
+            self.error_handler.handle_error(e, "update_master_job_summary_counters", master_job_id=master_job_id, **context)
+            raise
+
+    async def get_active_master_jobs_for_monitoring(self, context: Optional[Dict[str, Any]] = None) -> List[MasterJob]:
+        """Gets all Master Jobs that are in a non-terminal state for monitoring."""
+        context = context or {}
+        self.logger.log_database_operation("SELECT", "MasterJobs", "STARTED", operation="get_active_for_monitoring", **context)
+        try:
+            async with self.get_async_session() as session:
+                terminal_statuses = [JobStatus.COMPLETED, JobStatus.COMPLETED_WITH_FAILURES, JobStatus.FAILED, JobStatus.CANCELLED]
+                stmt = select(MasterJob).where(MasterJob.status.notin_(terminal_statuses))
+                result = await session.scalars(stmt)
+                jobs = result.all()
+                self.logger.log_database_operation("SELECT", "MasterJobs", "SUCCESS", count=len(jobs), **context)
+                return jobs
+        except Exception as e:
+            self.error_handler.handle_error(e, "get_active_master_jobs_for_monitoring", **context)
+            raise
+
+    async def recalculate_and_correct_summary(self, master_job_id: str, context: Optional[Dict[str, Any]] = None) -> None:
+        """Recalculates the true child job counts and corrects the summary table."""
+        context = context or {}
+        self.logger.log_database_operation("RECONCILE", "MasterJobStateSummary", "STARTED", master_job_id=master_job_id, **context)
+        try:
+            async with self.get_async_session() as session:
+                # Get the true counts with a GROUP BY query
+                stmt = select(Job.status, func.count(Job.id)).where(Job.master_job_id == master_job_id).group_by(Job.status)
+                result = await session.execute(stmt)
+                true_counts = {status.value.lower(): count for status, count in result.all()}
+
+                # Construct the update values, defaulting to 0 for any missing statuses
+                update_values = {f"{status.value.lower()}_children": true_counts.get(status.value.lower(), 0) for status in JobStatus}
+                update_values["version"] = MasterJobStateSummary.version + 1 # Increment version
+
+                update_stmt = update(MasterJobStateSummary).where(MasterJobStateSummary.master_job_id == master_job_id).values(**update_values)
+                await session.execute(update_stmt)
+                await session.commit()
+                self.logger.info(f"Reconciliation successful for master job {master_job_id}.", master_job_id=master_job_id, **context)
+        except Exception as e:
+            self.error_handler.handle_error(e, "recalculate_and_correct_summary", master_job_id=master_job_id, **context)
+            raise
+
+    async def update_master_job_status(self, master_job_id: str, new_status: JobStatus, context: Optional[Dict[str, Any]] = None) -> None:
+        """Updates the status of a Master Job record."""
+        context = context or {}
+        self.logger.log_database_operation("UPDATE", "MasterJobs", "STARTED", master_job_id=master_job_id, new_status=new_status.value, **context)
+        try:
+            async with self.get_async_session() as session:
+                stmt = update(MasterJob).where(MasterJob.master_job_id == master_job_id).values(status=new_status)
+                await session.execute(stmt)
+                await session.commit()
+                self.logger.log_database_operation("UPDATE", "MasterJobs", "SUCCESS", master_job_id=master_job_id, **context)
+        except Exception as e:
+            self.error_handler.handle_error(e, "update_master_job_status", master_job_id=master_job_id, **context)
+            raise
+            
+    # =================================================================
+    # Pipeline Integrity Methods
+    # =================================================================
+    
+    async def has_pending_output_records(self, job_id: int, context: Optional[Dict[str, Any]] = None) -> bool:
+        """Checks if a job has any pending task output records."""
+        context = context or {}
+        self.logger.log_database_operation("QUERY", "TaskOutputRecords", "STARTED", operation="check_pending", job_id=job_id, **context)
+        try:
+            async with self.get_async_session() as session:
+                # This subquery finds all task_ids for the given job_id
+                task_ids_subquery = select(Task.id).where(Task.job_id == job_id)
+                
+                # The main query counts records linked to those task_ids
+                stmt = select(func.count()).select_from(TaskOutputRecord).where(
+                    TaskOutputRecord.task_id.in_(task_ids_subquery),
+                    TaskOutputRecord.status == 'PENDING_PROCESSING'
+                )
+                result = await session.execute(stmt)
+                count = result.scalar_one()
+                return count > 0
+        except Exception as e:
+            self.error_handler.handle_error(e, "has_pending_output_records", job_id=job_id, **context)
+            raise
+
+    # =================================================================
+    # Lease atomic methods
+    # =================================================================
+    # NEW: Atomic method for combined lease renewal and command processing.
+    async def renew_lease_and_process_command(
+        self,
+        job_id: int,
+        orchestrator_id: str,
+        current_version: int,
+        lease_duration_sec: int,
+        context: Optional[Dict[str, Any]] = None
+    ) -> LeaseRenewalResult:
+        """
+        Atomically renews a job's lease and processes any pending command in a single
+        operation using optimistic locking and conditional logic.
+        """
+        context = context or {}
+        self.logger.log_database_operation("UPDATE", "jobs", "STARTED", operation="renew_and_process_command", job_id=job_id, **context)
+        try:
+            async with self.get_async_session() as session:
+                new_expiry = datetime.now(timezone.utc) + timedelta(seconds=lease_duration_sec)
+                
+                # This complex UPDATE uses a CASE statement to enforce state transition rules atomically.
+                stmt = (
+                    update(Job)
+                    .where(
+                        Job.id == job_id,
+                        Job.orchestrator_id == orchestrator_id,
+                        Job.version == current_version  # Optimistic lock
+                    )
+                    .values(
+                        orchestrator_lease_expiry=new_expiry,
+                        status=case(
+                            (Job.master_pending_commands == 'CANCEL', JobStatus.CANCELLING),
+                            (and_(Job.master_pending_commands == 'PAUSE', Job.status == JobStatus.RUNNING), JobStatus.PAUSING),
+                            (and_(Job.master_pending_commands == 'RESUME', Job.status == JobStatus.PAUSED), JobStatus.RUNNING),
+                            else_=Job.status # No command or invalid command, keep current status
+                        ),
+                        master_pending_commands=None, # Atomically clear the command
+                        version=Job.version + 1
+                    )
+                    .returning(Job.status, Job.version) # Return the final state
+                )
+
+                result = await session.execute(stmt)
+                await session.commit()
+                
+                updated_state = result.fetchone()
+
+                if updated_state:
+                    new_status, new_version = updated_state
+                    self.logger.log_database_operation("UPDATE", "jobs", "SUCCESS", operation="renew_and_process_command", job_id=job_id, new_status=new_status.value, **context)
+                    return LeaseRenewalResult("SUCCESS", new_status, new_version)
+                else:
+                    # This means the optimistic lock failed (rowcount was 0)
+                    self.logger.warning(f"Lease renewal for job {job_id} failed optimistic lock.", job_id=job_id, **context)
+                    return LeaseRenewalResult("LOCK_FAILED")
+        except Exception as e:
+            self.error_handler.handle_error(e, "renew_lease_and_process_command", job_id=job_id, **context)
+            # Return a specific error outcome
+            return LeaseRenewalResult("ERROR")
+
+    # =================================================================
+    # Startup Validation Method
+    # =================================================================
+
+    async def set_and_verify_master_monitor_instance(self, instance_id: str, context: Optional[Dict[str, Any]] = None) -> bool:
+        """Sets this instance as the active monitor, checking for a split-brain scenario."""
+        context = context or {}
+        param_name = "active_master_monitor_instance"
+        self.logger.info(f"Attempting to acquire master monitor role for instance '{instance_id}'.", **context)
+        try:
+            async with self.get_async_session() as session:
+                stmt = select(SystemParameter).where(SystemParameter.parameter_name == param_name)
+                result = await session.scalars(stmt)
+                param = result.one_or_none()
+
+                now = datetime.now(timezone.utc)
+                if param and param.parameter_value:
+                    try:
+                        stored_value = json.loads(param.parameter_value)
+                        last_heartbeat = datetime.fromisoformat(stored_value.get("timestamp", ""))
+                        # Stale lock check (e.g., if the previous instance crashed without cleanup)
+                        if now - last_heartbeat < timedelta(minutes=5):
+                            if stored_value.get("instance_id") != instance_id:
+                                self.logger.critical(f"SPLIT-BRAIN DETECTED: Another active master monitor '{stored_value['instance_id']}' holds the role.", **context)
+                                return False
+                    except (json.JSONDecodeError, TypeError):
+                        self.logger.warning("Could not parse existing master monitor parameter. Overwriting.", **context)
+
+                # Acquire or update the role
+                new_value = json.dumps({"instance_id": instance_id, "timestamp": now.isoformat()})
+                if param:
+                    param.parameter_value = new_value
+                else:
+                    param = SystemParameter(parameter_name=param_name, parameter_value=new_value, applicable_to='ORCHESTRATOR')
+                
+                await session.merge(param)
+                await session.commit()
+                self.logger.info(f"Successfully acquired master monitor role for instance '{instance_id}'.", **context)
+                return True
+
+        except Exception as e:
+            self.error_handler.handle_error(e, "set_and_verify_master_monitor_instance", instance_id=instance_id, **context)
+            return False # Fail safe: if we can't verify, don't start central functions.
+
+
+    
+    async def acknowledge_and_update_job_status(self, job_id: int, new_status: JobStatus, context: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Atomically updates a job's status and clears the pending command field.
+        """
+        context = context or {}
+        self.logger.log_database_operation(
+            "UPDATE", "Jobs", "STARTED", 
+            operation="acknowledge_and_update_status", 
+            job_id=job_id, 
+            **context
+        )
+        try:
+            async with self.get_async_session() as session:
+                stmt = update(Job).where(Job.id == job_id).values(
+                    status=new_status,
+                    master_pending_commands=None, # Clear the command
+                    version=Job.version + 1       # Increment version
+                )
+                await session.execute(stmt)
+                await session.commit()
+                self.logger.log_database_operation("UPDATE", "Jobs", "SUCCESS", operation="acknowledge_and_update_status", **context)
+        except Exception as e:
+            self.error_handler.handle_error(e, "acknowledge_and_update_job_status", job_id=job_id, **context)
+            raise
 
     async def create_master_job(self, master_job_id: str, name: str, configuration: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> MasterJob:
         """Creates a new record in the MasterJobs table."""
@@ -178,7 +463,22 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, "get_master_job_by_id", master_job_id=master_job_id, **context)
             raise
 
-
+    async def get_master_job_by_id_with_cache(self, master_job_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[MasterJob]:
+        """
+        Gets a master job by its ID, utilizing the central configuration cache
+        to avoid repeated database lookups.
+        """
+        if not master_job_id:
+            return None
+            
+        cache_key = f"master_job:{master_job_id}"
+        
+        # Use the existing get_or_fetch method from the ConfigCache
+        return await self.config_cache.get_or_fetch(
+            cache_key,
+            lambda: self.get_master_job_by_id(master_job_id, context),
+            is_classifier=False # Master jobs are general configuration
+        )
 
     async def get_jobs_by_ids(self, job_ids: List[int], context: Optional[Dict[str, Any]] = None) -> List[Job]:
         """
@@ -1633,6 +1933,7 @@ class DatabaseInterface:
            
     async def get_scan_template_by_id(self, template_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[ScanTemplate]:
         """Get scan template by ID with caching."""
+        print(f"CLI THREAD: In get_scan_template_by_id'.")
         cache_key = f"scan_template:{template_id}"
         return await self.config_cache.get_or_fetch(
             cache_key,
@@ -1644,6 +1945,7 @@ class DatabaseInterface:
         """Internal method to fetch scan template from database."""
         context = context or {}
         self.logger.log_database_operation("SELECT", "ScanTemplates", "STARTED", template_id=template_id, **context)
+        print(f"CLI THREAD: In _fetch_scan_template_by_id'.")
         try:
             async with self.get_async_session() as session:
                 stmt = select(ScanTemplate).where(ScanTemplate.template_id == template_id)
@@ -1652,6 +1954,7 @@ class DatabaseInterface:
                 self.logger.log_database_operation("SELECT", "ScanTemplates", "SUCCESS", found=(result is not None), **context)
                 return result
         except Exception as e:
+            print(f"CLI THREAD: In _fetch_scan_template_by_id exception'.")
             self.error_handler.handle_error(e, context="get_scan_template_by_id", **context)
             raise
 

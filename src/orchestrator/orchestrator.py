@@ -1,6 +1,6 @@
 # src/orchestrator/orchestrator.py
 import asyncio
-from collections import deque
+from collections import deque,defaultdict
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
 
@@ -37,6 +37,7 @@ class Orchestrator:
         JobState.FAILED: [],
     }
 
+
     def __init__(self, settings: SystemConfig, db: DatabaseInterface, logger: SystemLogger, error_handler: ErrorHandler):
         self.settings = settings
         self.db = db
@@ -48,15 +49,12 @@ class Orchestrator:
         
         self._shutdown_event = asyncio.Event()
         
-        # --- UNIFIED AND CORRECTED IN-MEMORY STATE ---
         self._state_lock = asyncio.Lock()
         self.job_states: Dict[int, Dict[str, Any]] = {}
-        # Use defaultdict to prevent KeyErrors on first access
         self.job_cache: Dict[int, deque] = defaultdict(deque)
         self.snoozed_jobs: Dict[int, float] = {}
         self.thread_liveness: Dict[str, float] = {}
         
-        # Add missing attributes for single-process communication
         self.is_single_process_mode = self.settings.orchestrator.deployment_model.upper() == "SINGLE_PROCESS"
         self._in_process_work_queue: Optional[asyncio.Queue] = None
         self._background_tasks = []
@@ -69,17 +67,44 @@ class Orchestrator:
         self.pipeliner = Pipeliner(self)
         self.job_monitor = JobCompletionMonitor(self)
         self.lease_manager = LeaseManager(self)
+        
+        # Conditionally instantiate central components
+        self.master_job_monitor = None
+        self.summary_reconciler = None
+        if self.settings.orchestrator.is_master_monitor_enabled:
+            self.master_job_monitor = MasterJobMonitor(self)
+            self.summary_reconciler = SummaryReconciler(self)
             
         self.logger.log_component_lifecycle("Orchestrator", "INITIALIZED")
+
+    async def _perform_startup_validation(self):
+        """
+        Performs critical validation before starting coroutines.
+        For the central manager, this prevents a "split-brain" scenario.
+        """
+        if self.settings.orchestrator.is_master_monitor_enabled:
+            self.logger.info("This instance is configured as the central manager. Performing startup validation...")
+            is_lock_acquired = await self.db.set_and_verify_master_monitor_instance(self.instance_id)
+            if not is_lock_acquired:
+                self.logger.critical(
+                    "STARTUP FAILED: Another active master monitor instance was detected. "
+                    "Correct the configuration to ensure only one orchestrator has 'is_master_monitor_enabled' set to true. Exiting."
+                )
+                # Hard exit is the safest action to prevent a split-brain
+                sys.exit(1)
+            else:
+                self.logger.info("Startup validation successful. This instance is the active central manager.")
 
     async def start_async(self, in_process_queue: Optional[asyncio.Queue] = None):
         """Starts all background coroutines for the Orchestrator service."""
         try:
-            # Store the queue if provided for single-process mode
             if self.is_single_process_mode:
                 if not in_process_queue:
                     raise ValueError("An in-process queue is required for single_process mode.")
                 self._in_process_work_queue = in_process_queue
+
+            # Perform startup validation before starting any coroutines
+            await self._perform_startup_validation()
 
             self.logger.log_component_lifecycle("Orchestrator", "STARTING_ASYNC_COROUTINES")
             
@@ -92,8 +117,13 @@ class Orchestrator:
                 self.lease_manager.run_async(),
                 self.pipeliner.run_async(),
                 self.job_monitor.run_async(),
-                self._garbage_collect_states_async(), # Add the new garbage collector
             ]
+            
+            # Conditionally add central coroutines to the startup list
+            if self.master_job_monitor:
+                coroutines_to_start.append(self.master_job_monitor.run_async())
+            if self.summary_reconciler:
+                coroutines_to_start.append(self.summary_reconciler.run_async())
             
             self._background_tasks = [asyncio.create_task(coro) for coro in coroutines_to_start]
             
@@ -102,6 +132,10 @@ class Orchestrator:
         except Exception as e:
             self.error_handler.handle_error(e, "orchestrator_async_startup")
             raise
+
+
+
+
             
     async def shutdown_async(self):
         """Initiates a graceful shutdown of the Orchestrator and its components."""
@@ -119,32 +153,80 @@ class Orchestrator:
         except Exception as e:
             self.error_handler.handle_error(e, "orchestrator_async_shutdown")
 
+
+
+    async def handle_job_command_async(self, job, command: str):
+        """Dispatches a command from the CLI to the appropriate handler."""
+        command = command.upper()
+        self.logger.info(f"Orchestrator received command '{command}' for job {job.id}", job_id=job.id)
+        
+        if command == "PAUSE":
+            await self._handle_pause_command_async(job)
+        elif command == "CANCEL":
+            await self._handle_cancel_command_async(job)
+        elif command == "RESUME":
+            await self._handle_resume_command_async(job)
+        elif command == "START":
+            # If we see a START command, the job is already running.
+            # We just need to acknowledge and clear the command from the database.
+            # This call will clear the command field while keeping the status the same.
+            await self.db.acknowledge_and_update_job_status(job.id, job.status)        
+        else:
+            self.logger.warning(f"Unknown command '{command}' received for job {job.id}", job_id=job.id)
+
+    async def _handle_pause_command_async(self, job):
+        """Transitions a job to the PAUSING state."""
+        if job.status not in [JobStatus.RUNNING, JobStatus.QUEUED]:
+            self.logger.warning(f"Cannot pause job {job.id}, it is not in a pausable state.", job_id=job.id)
+            return
+
+        await self.db.acknowledge_and_update_job_status(job.id, JobStatus.PAUSING)
+        await self._update_job_in_memory_state(job.id, JobState.PAUSING)
+
+    async def _handle_cancel_command_async(self, job):
+        """Transitions a job to the CANCELLING state and cancels its pending tasks."""
+        if job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+            self.logger.warning(f"Cannot cancel job {job.id}, it is already in a terminal state.", job_id=job.id)
+            return
+        
+        # First, cancel all tasks that haven't been dispatched yet
+        cancelled_count = await self.db.cancel_pending_tasks_for_job(job.id)
+        self.logger.info(f"Cancelled {cancelled_count} pending tasks for job {job.id}.", job_id=job.id)
+
+        # Then, update the job state
+        await self.db.acknowledge_and_update_job_status(job.id, JobStatus.CANCELLING)
+        await self._update_job_in_memory_state(job.id, JobState.CANCELLING)
+
+    async def _handle_resume_command_async(self, job):
+        """Transitions a job from PAUSED back to RUNNING."""
+        if job.status != JobStatus.PAUSED:
+            self.logger.warning(f"Cannot resume job {job.id}, it is not paused.", job_id=job.id)
+            return
+
+        await self.db.acknowledge_and_update_job_status(job.id, JobStatus.RUNNING)
+        await self._update_job_in_memory_state(job.id, JobState.RUNNING)
+
+
+
+
+
     async def get_task_async(self, worker_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Provides a task to a worker by getting it from the in-memory queue.
-        This method is for single-process mode only.
-        """
         if not self.is_single_process_mode:
-            self.logger.error("get_task_async is only supported in single_process mode.")
+            return None
+        
+        # Check queue size first - returns immediately
+        if self._in_process_work_queue.qsize() == 0:
             return None
         
         try:
-            # This will wait asynchronously until a task is available on the queue.
-            task = await self._in_process_work_queue.get()
-            # The worker needs the full WorkPacket dictionary to reconstruct the Pydantic model.
+            task = self._in_process_work_queue.get_nowait()
             work_packet_dict = task.work_packet
-            self.logger.info(f"Dequeued task {work_packet_dict['header']['task_id']} for worker {worker_id}", 
-                             task_id=work_packet_dict['header']['task_id'], worker_id=worker_id)
+            self.logger.info(f"Dequeued task {work_packet_dict['header']['task_id']} for worker {worker_id}")
             return work_packet_dict
-        except asyncio.CancelledError:
-            self.logger.info("get_task_async was cancelled during shutdown.")
+        except Empty:  # Handle race condition where queue became empty
             return None
         except Exception as e:
-            self.error_handler.handle_error(
-                e, "get_task_async",
-                operation="worker_task_request",
-                worker_id=worker_id
-            )
+            self.error_handler.handle_error(e, "get_task_async")
             return None
 
     def _release_resources_for_task(self, task, context: Optional[Dict] = None):

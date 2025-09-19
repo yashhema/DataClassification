@@ -50,7 +50,7 @@ class DiscoveredObject(Base):
         default=lambda: datetime.now(timezone.utc)
     )
     
-    # Establishes the one-to-one relationship with the metadata and classification info tables
+    # FIXED: Corrected relationship names to match back_populates
     object_metadata: Mapped[Optional["ObjectMetadata"]] = relationship(back_populates="discovered_object")
     classification_info: Mapped[Optional["DiscoveredObjectClassificationDateInfo"]] = relationship(back_populates="discovered_object")
 
@@ -77,8 +77,8 @@ class ObjectMetadata(Base):
         default=lambda: datetime.now(timezone.utc)
     )
 
-    # Establishes the back-reference for the one-to-one relationship
-    discovered_object: Mapped["DiscoveredObject"] = relationship(back_populates="metadata")
+    # FIXED: Changed back_populates to match the relationship name on DiscoveredObject
+    discovered_object: Mapped["DiscoveredObject"] = relationship(back_populates="object_metadata")
 
 
 class DiscoveredObjectClassificationDateInfo(Base):

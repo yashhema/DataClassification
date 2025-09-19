@@ -10,6 +10,10 @@ import logging
 import signal
 import sys
 import os
+# --- ADD THESE THREE LINES ---
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+# -----------------------------
 import socket
 import queue
 import traceback
@@ -41,7 +45,7 @@ def graceful_shutdown_handler(signum, frame):
     # It is thread-safe and does not need to be wrapped in a task.
     shutdown_event.set()
 
-async def create_system_components(settings, logger, error_handler):
+async def create_system_components(settings, logger, error_handler, config_manager):
     """
     Create and configure all system components with proper dependency injection.
     """
@@ -122,6 +126,8 @@ async def create_system_components(settings, logger, error_handler):
             await db_interface.close_async()
         raise
 
+
+
 async def run_single_process_mode(orchestrator: Orchestrator, workers: List[Worker], logger, base_log_context):
     logger.info("Starting single-process mode...", **base_log_context)
     tasks = []
@@ -130,7 +136,18 @@ async def run_single_process_mode(orchestrator: Orchestrator, workers: List[Work
         tasks.append(asyncio.create_task(worker.start_async(), name=f"worker_{i}"))
     
     logger.info(f"Single-process mode started with {len(tasks)} async tasks", **base_log_context)
-    await shutdown_event.wait()
+    
+    try:
+        while not shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=0.5)  # Increased to 500ms
+                break
+            except asyncio.TimeoutError:
+                continue
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received", **base_log_context)
+        shutdown_event.set()
+    
     logger.info("Shutting down single-process mode...", **base_log_context)
     
     for task in tasks:
@@ -174,7 +191,15 @@ async def run_worker_mode(workers: List[Worker], logger, base_log_context):
     for worker in workers:
         await worker.shutdown_async()
     logger.info("Worker-only mode shutdown complete", **base_log_context)
+# Add this debugging task to your main() function, right after creating the CLI thread
 
+async def debug_event_loop_activity():
+    """Debug task that logs periodically to verify the event loop is active"""
+    counter = 0
+    while not shutdown_event.is_set():
+        await asyncio.sleep(5)  # Log every 5 seconds
+        counter += 1
+        logger.info(f"EVENT LOOP DEBUG: Tick #{counter} - Loop is processing tasks")
 
 async def main():
     """ The main asynchronous entry point for the application service. """
@@ -198,6 +223,11 @@ async def main():
 
         # 3. Initialize Database and Load Overrides (Phase 2: Inside async)
         db_interface = DatabaseInterface(config_manager.get_db_connection_string(), temp_logger, error_handler)
+        
+        # --- ADD THIS WARM-UP CALL ---
+        # Force the connection pool to initialize before anything else uses it.
+        await db_interface.test_connection()
+        
         await config_manager.load_database_overrides_async(db_interface)
         config_manager.finalize()
         settings = config_manager.settings
@@ -233,17 +263,20 @@ async def main():
         logger.info(f"System starting up in {run_mode.upper()} mode.", **base_log_context)
 
         # 6. Component Initialization & Health Checks
-        orchestrator, workers, db_interface_ref = await create_system_components(settings, logger, error_handler)
+        orchestrator, workers, db_interface_ref = await create_system_components(settings, logger, error_handler, config_manager)
         db_interface = db_interface_ref # Keep reference for the final close
         logger.log_component_lifecycle("System", "INITIALIZATION_SUCCESS", **base_log_context)
 
         # 7. Start CLI in background thread (ADD THIS NEW SECTION)
         logger.info("Starting CLI in background thread...", **base_log_context)
+        
         import threading
         from cli import DatabaseInterfaceSyncWrapper, run_cli
 
         # Get main event loop reference BEFORE creating thread
         main_loop = asyncio.get_running_loop()
+        logger.info(f"MAIN: Event loop ID: {id(main_loop)}", **base_log_context)
+        
         settings = config_manager.settings
         def cli_wrapper():
             try:
@@ -251,10 +284,15 @@ async def main():
                 run_cli(db_sync, settings)
             except Exception as e:
                 logger.error(f"CLI thread error: {e}", **base_log_context)
+                traceback.print_exc()
 
         cli_thread = threading.Thread(target=cli_wrapper, daemon=True)
         cli_thread.start()
         logger.info("CLI thread started", **base_log_context)
+
+        # ADD THIS DEBUG TASK
+        debug_task = asyncio.create_task(debug_event_loop_activity(), name="debug_loop")
+        logger.info("Debug task started", **base_log_context)
 
         # 8. Setup Signal Handlers
         signal.signal(signal.SIGINT, graceful_shutdown_handler)

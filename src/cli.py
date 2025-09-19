@@ -5,46 +5,14 @@ import time
 import logging
 import threading
 from collections import defaultdict
-
+import traceback
 # Core infrastructure imports needed by the CLI
 from core.config.configuration_manager import ConfigurationManager
 from core.db.database_interface import DatabaseInterface
+from core.db.database_interface_sync_wrapper import DatabaseInterfaceSyncWrapper
 from core.errors import ErrorHandler
 from core.logging.system_logger import SystemLogger
 from core.db_models.job_schema import JobType
-
-class DatabaseInterfaceSyncWrapper:
-    """
-    Thread-safe wrapper that submits database operations to the main event loop
-    instead of creating a separate loop.
-    """
-    def __init__(self, async_db_interface, main_loop):
-        self.db = async_db_interface
-        self.main_loop = main_loop  # Reference to main app's event loop
-
-    def _run_coro_in_main_loop(self, coro):
-        """Submits a coroutine to the main event loop and waits for result."""
-        future = asyncio.run_coroutine_threadsafe(coro, self.main_loop)
-        return future.result()  # This blocks until the coroutine completes
-
-    def get_scan_template_by_id(self, template_id: str):
-        return self._run_coro_in_main_loop(self.db.get_scan_template_by_id(template_id))
-
-    def get_datasources_by_ids(self, datasource_ids: list):
-        return self._run_coro_in_main_loop(self.db.get_datasources_by_ids(datasource_ids))
-
-    def create_job_execution(self, **kwargs):
-        return self._run_coro_in_main_loop(self.db.create_job_execution(**kwargs))
-    
-    def issue_job_command(self, job_id, command):
-        return self._run_coro_in_main_loop(self.db.update_job_command(job_id, command))
-
-    def get_all_child_jobs_for_master(self, master_job_id):
-        return self._run_coro_in_main_loop(self.db.get_child_jobs_by_master_id(master_job_id))
-
-    def shutdown(self):
-        """No separate loop to shutdown - database will be closed by main app."""
-        pass
 
 def run_cli(db_sync: DatabaseInterfaceSyncWrapper, settings):
     print("CLI Ready. Type 'help' for commands.")
@@ -56,49 +24,56 @@ def run_cli(db_sync: DatabaseInterfaceSyncWrapper, settings):
             command = parts[0].lower()
 
             if command == "start_job":
-                template_id = parts[1]
-                scan_template = db_sync.get_scan_template_by_id(template_id)
-                if not scan_template:
-                    print(f"Error: ScanTemplate '{template_id}' not found.")
-                    continue
-
-                datasource_targets = scan_template.configuration.get("datasource_targets", [])
-                datasource_ids = [t.get("datasource_id") for t in targets]
-                
-                # Fetch the full datasource objects
-                datasources = db_sync.get_datasources_by_ids(datasource_ids)
-                if not datasources:
-                    print(f"Error: No valid datasources found for the IDs in template '{template_id}'.")
-                    continue
-
-                master_job_id = f"master-{template_id}-{int(time.time())}"
-                
-                # --- NEW LOGIC: Loop per datasource ---
-                for ds in datasources:
-                    # Create a self-contained configuration for this single datasource job
-                    child_config = scan_template.configuration.copy()
-                    child_config["datasource_targets"] = [{"datasource_id": ds.datasource_id}]
+                try:
+                    print("DEBUG: Entered 'start_job' command.")
+                    template_id = parts[1]
                     
-                    # Inject the system-level failure threshold for this job
-                    child_config["failure_threshold_percent"] = settings.job.failure_threshold_percent
+                    print(f"DEBUG: Fetching ScanTemplate '{template_id}'...")
+                    scan_template = db_sync.get_scan_template_by_id(template_id)
+                    print("DEBUG: ScanTemplate fetched.")
 
-                    # Determine the nodegroup for this specific datasource
-                    nodegroup_name = ds.node_group.name if ds.node_group else 'default'
+                    if not scan_template:
+                        print(f"Error: ScanTemplate '{template_id}' not found.")
+                        continue
 
-                    db_sync.create_job_execution(
-                        master_job_id=master_job_id,
-                        template_table_id=scan_template.id,
-                        template_type=scan_template.job_type,
-                        execution_id=f"run-{master_job_id}-{ds.datasource_id}", # Unique ID per datasource
-                        trigger_type="cli",
-                        nodegroup=nodegroup_name,
-                        configuration=child_config,
-                        priority=scan_template.priority,
-                        master_pending_commands="START"
-                    )
-                
-                print(f"Successfully created {len(datasources)} jobs under master_job_id: {master_job_id}")
-            elif command == "list_jobs":
+                    datasource_targets = scan_template.configuration.get("datasource_targets", [])
+                    datasource_ids = [t.get("datasource_id") for t in datasource_targets]
+                    
+                    print(f"DEBUG: Fetching {len(datasource_ids)} datasources...")
+                    datasources = db_sync.get_datasources_by_ids(datasource_ids)
+                    print("DEBUG: Datasources fetched.")
+
+                    if not datasources:
+                        print(f"Error: No valid datasources found for the IDs in template '{template_id}'.")
+                        continue
+
+                    master_job_id = f"master-{template_id}-{int(time.time())}"
+                    
+                    print(f"DEBUG: Starting loop to create {len(datasources)} jobs...")
+                    for i, ds in enumerate(datasources):
+                        print(f"DEBUG: Creating job {i+1}/{len(datasources)} for datasource '{ds.datasource_id}'...")
+                        child_config = scan_template.configuration.copy()
+                        child_config["datasource_targets"] = [{"datasource_id": ds.datasource_id}]
+                        child_config["failure_threshold_percent"] = settings.job.failure_threshold_percent
+                        nodegroup_name = ds.node_group.name if ds.node_group else 'default'
+
+                        db_sync.create_job_execution(
+                            master_job_id=master_job_id,
+                            template_table_id=scan_template.id,
+                            template_type=scan_template.job_type,
+                            execution_id=f"run-{master_job_id}-{ds.datasource_id}",
+                            trigger_type="cli",
+                            nodegroup=nodegroup_name,
+                            configuration=child_config,
+                            priority=scan_template.priority,
+                            master_pending_commands="START"
+                        )
+                        print(f"DEBUG: Job for datasource '{ds.datasource_id}' created.")
+                    
+                    print(f"\nSuccessfully created {len(datasources)} jobs under master_job_id: {master_job_id}")
+                except Exception as e:
+                    print(f"AN EXCEPTION OCCURRED IN 'start_job': {e}")
+                    traceback.print_exc() # Also print the full traceback to the console            elif command == "list_jobs":
                 print("Fetching all active jobs (Queued, Running, Pausing, Cancelling)...")
                 active_jobs = db_sync.get_active_jobs()
                 if not active_jobs:

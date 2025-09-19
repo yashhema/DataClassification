@@ -2,26 +2,29 @@
 """
 The LeaseManager coroutine is a background process that periodically renews
 the lease for all jobs currently owned by this Orchestrator instance.
-It uses an optimistic locking pattern to prevent race conditions.
+It uses an optimistic locking pattern and an atomic database operation to
+process asynchronous commands sent from the CLI.
 """
 
 import asyncio
 from datetime import datetime, timezone, timedelta
-
-# Import for type hinting
 from typing import TYPE_CHECKING
+
+# NEW: Import the new safe mapping function and result type
+from orchestrator.orchestrator_state import map_db_status_to_memory_state, JobState
+from core.db.database_interface import LeaseRenewalResult
+
 if TYPE_CHECKING:
     from orchestrator.orchestrator import Orchestrator
 
 class LeaseManager:
-    """Coroutine responsible for renewing job leases."""
+    """Coroutine responsible for renewing job leases and processing commands."""
 
     def __init__(self, orchestrator: "Orchestrator"):
         self.orchestrator = orchestrator
         self.logger = orchestrator.logger
         self.db = orchestrator.db
-        # We'll set the interval to be 1/3 of the lease duration for safety
-        self.lease_duration_sec = 300 # e.g., 5 minutes
+        self.lease_duration_sec = 300 # 5 minutes
         self.interval_sec = self.lease_duration_sec / 3
         self.name = "LeaseManagerCoroutine"
 
@@ -38,52 +41,68 @@ class LeaseManager:
 
             except Exception as e:
                 self.orchestrator.error_handler.handle_error(e, "lease_manager_main_loop")
-                # Avoid a tight loop on repeated database failures
                 await asyncio.sleep(self.interval_sec)
 
         self.logger.log_component_lifecycle("LeaseManager", "STOPPED")
 
     async def _renew_all_active_leases(self):
-        """Iterates through all owned jobs and attempts to renew their lease."""
-        
-        # Create a copy of the job IDs to prevent issues if the dictionary is modified during iteration
+        """
+        Atomically renews leases and processes commands for all owned jobs.
+        """
+        owned_job_ids = []
         async with self.orchestrator._state_lock:
-            owned_jobs = list(self.orchestrator.job_states.items())
+            if not self.orchestrator.job_states:
+                return
+            owned_job_ids = list(self.orchestrator.job_states.keys())
 
-        if not owned_jobs:
+        if not owned_job_ids:
             return
+            
+        self.logger.info(f"LeaseManager checking {len(owned_job_ids)} active jobs.", count=len(owned_job_ids))
 
-        self.logger.info(f"LeaseManager renewing leases for {len(owned_jobs)} active jobs.", count=len(owned_jobs))
-
-        for job_id, state_info in owned_jobs:
+        for job_id in owned_job_ids:
             try:
+                state_info = await self.orchestrator.get_job_state_safely(job_id)
+                if not state_info:
+                    continue 
+
                 current_version = state_info.get("version")
                 if current_version is None:
-                    self.logger.warning(f"Cannot renew lease for job {job_id}: version number is missing from in-memory state.", job_id=job_id)
+                    self.logger.warning(f"Cannot renew lease for job {job_id}: version missing from in-memory state.", job_id=job_id)
                     continue
 
-                was_renewed = await self.db.renew_job_lease(
+                # A single atomic call to renew the lease AND process any command.
+                result: LeaseRenewalResult = await self.db.renew_lease_and_process_command(
                     job_id=job_id,
                     orchestrator_id=self.orchestrator.instance_id,
                     current_version=current_version,
                     lease_duration_sec=self.lease_duration_sec
                 )
 
-                if was_renewed:
-                    # Update the in-memory state with the new lease expiry and version
+                # Process the structured result
+                if result.outcome == "SUCCESS":
                     new_expiry = datetime.now(timezone.utc) + timedelta(seconds=self.lease_duration_sec)
+                    
+                    # Use the safe mapping function to convert the DB status to the in-memory state
+                    new_in_memory_state = map_db_status_to_memory_state(result.new_status)
+                    
                     await self.orchestrator._update_job_in_memory_state(
                         job_id=job_id,
-                        version=current_version + 1,
+                        new_status=new_in_memory_state,
+                        version=result.new_version,
                         lease_expiry=new_expiry
                     )
-                else:
-                    # If the renewal failed, we have lost the lease.
+                elif result.outcome == "LOCK_FAILED":
+                    # The optimistic lock failed. Another process has taken ownership.
                     await self._handle_lost_lease(job_id)
+                elif result.outcome == "ERROR":
+                    # An unexpected DB error occurred and was handled by the ErrorHandler.
+                    # We log it here but do not purge the job from memory, as it may be a transient issue.
+                    self.logger.error(f"A database error occurred while trying to renew the lease for job {job_id}. Will retry on the next cycle.", job_id=job_id)
 
             except Exception as e:
                 self.orchestrator.error_handler.handle_error(e, "renew_lease_for_job", job_id=job_id)
-                continue # Continue to the next job even if one fails
+                continue
 
     async def _handle_lost_lease(self, job_id: int):
         """
@@ -95,7 +114,8 @@ class LeaseManager:
             job_id=job_id
         )
         async with self.orchestrator._state_lock:
-            # Safely remove the job from all in-memory structures
+            # Safely remove the job from all in-memory structures to halt all processing
             self.orchestrator.job_states.pop(job_id, None)
             self.orchestrator.job_cache.pop(job_id, None)
             self.orchestrator.snoozed_jobs.pop(job_id, None)
+

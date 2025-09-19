@@ -466,9 +466,11 @@ class Worker:
                     await self._process_task_async(work_packet)
                 else:
                     # No work available, wait before retrying
-                    await asyncio.sleep(1)
+                    #print(f"WORKER {self.worker_id}: No work available, about to sleep")
+                    await asyncio.sleep(10)
                     
             except Exception as e:
+                print(f"WORKER {self.worker_id}: In Exception")
                 error = self.error_handler.handle_error(
                     e, "worker_main_loop",
                     operation="main_loop_iteration",
@@ -995,7 +997,7 @@ class Worker:
             }
             
             # Store results using database interface (ASYNC)
-            await self.db_interface.insert_scan_findings_async(db_records, context=job_context)
+            await self.db_interface.insert_scan_findings(db_records, context=job_context)
             
             self.logger.info("Classification results stored successfully",
                             task_id=work_packet.header.task_id,

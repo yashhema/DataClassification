@@ -11,7 +11,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base
-from .association_tables import classifier_template_link
+from .association_tables import ClassifierTemplateLink
 from .classifier_schema import Classifier
 
 
@@ -26,6 +26,6 @@ class ClassifierTemplate(Base):
     is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, comment="Whether this template is active and can be used in jobs.")
     configuration: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, comment="JSON object containing all detailed, nested configurations like prediction_weights, cross_column_analysis, etc.")
     classifiers: Mapped[List["Classifier"]] = relationship(
-        secondary=classifier_template_link,
+        secondary=ClassifierTemplateLink,
         back_populates="templates"
     )

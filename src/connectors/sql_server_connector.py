@@ -604,18 +604,13 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             self.logger.warning("Error during async connection cleanup", error_id=error.error_id)
 
     async def _discover_all_objects_async(self, work_packet: WorkPacket) -> AsyncIterator[DiscoveredObject]:
-        """Discover all objects based on processing mode (async)."""
-        processing_mode = self.datasource_config.configuration.get('processing_mode', 'column')
-        scan_config = self.datasource_config.configuration.get('scan_config', {})
-        
-        if processing_mode == "row":
-            # Phase 1: Table-level discovery for row processing
+            """Discovers table-level objects for row processing mode."""
+            scan_config = self.datasource_config.configuration.get('scan_config', {})
+            
+            # This now exclusively uses the table-level discovery method.
             async for obj in self._discover_tables_for_row_processing_async(work_packet, scan_config):
                 yield obj
-        else:
-            # Legacy: Column-level discovery
-            async for obj in self._discover_columns_for_classification_async(work_packet, scan_config):
-                yield obj
+
 
     async def _discover_tables_for_row_processing_async(self, work_packet: WorkPacket, scan_config: Dict[str, Any]) -> AsyncIterator[DiscoveredObject]:
         """Discover table-level objects for row processing mode (async)."""
@@ -988,10 +983,6 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                 database_name, schema_name, table_name = path_parts
                 return await self._sample_table_content_async(database_name, schema_name, table_name)
                 
-            elif len(path_parts) == 4:
-                # Column-level content (legacy mode)
-                database_name, schema_name, table_name, column_name = path_parts
-                return await self._sample_column_content_async(database_name, schema_name, table_name, column_name)
             
             else:
                 raise ProcessingError(
@@ -1064,31 +1055,9 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                 operation="sample_table_content_async"
             )
 
-    async def _sample_column_content_async(self, database_name: str, schema_name: str, table_name: str, column_name: str) -> str:
-        """Sample content from specific column for classification (async)."""
-        try:
-            sample_size = self.datasource_config.configuration.get('scan_config', {}).get('max_sample_rows', 1000)
-            
-            query = f"""
-                SELECT TOP {sample_size} [{column_name}]
-                FROM [{database_name}].[{schema_name}].[{table_name}]
-                WHERE [{column_name}] IS NOT NULL
-                ORDER BY ABS(CHECKSUM(NEWID()))
-            """
-            
-            result = await self.connection.execute_query_async(query)
-            
-            # Extract column values
-            values = [str(row[column_name]) for row in result if row[column_name] is not None]
-            
-            return '\n'.join(values)
-            
-        except Exception as e:
-            raise ProcessingError(
-                f"Failed to sample column content {database_name}.{schema_name}.{table_name}.{column_name}: {str(e)}",
-                ErrorType.PROCESSING_LOGIC_ERROR,
-                operation="sample_column_content_async"
-            )
+
+
+
 
     async def _get_table_metadata_async(self, database_name: str, schema_name: str, table_name: str) -> ObjectMetadata:
         """Get comprehensive table metadata (async)."""

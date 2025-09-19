@@ -78,7 +78,7 @@ class OrchestratorConfig(BaseModel):
     task_assigner_interval_sec: int = Field(2)
     job_reaper_interval_seconds: int = Field(180, description="How often the Job Reaper checks for abandoned jobs.")
     instance_id: str = Field("orchestrator-default-01", description="A stable, persistent ID for this orchestrator instance.")
-
+    is_master_monitor_enabled: bool = Field(False, description="If true, this instance runs the MasterJobMonitor and other central management tasks.")
 class JobConfig(BaseModel):
     failure_threshold_percent: int = Field(10)
 
