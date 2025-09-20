@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
 from sqlalchemy import (
-    String, Integer, LargeBinary, DateTime, JSON, Index, ForeignKey, Text, Boolean
+    String, Integer, LargeBinary, DateTime, JSON, Index, ForeignKey
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 

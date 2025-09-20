@@ -6,7 +6,7 @@ Defines the database schema for Classifier Templates using the SQLAlchemy ORM.
 from typing import List, Optional, Dict, Any
 
 from sqlalchemy import (
-    String, Float, Boolean, JSON
+    String, Boolean, JSON
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 

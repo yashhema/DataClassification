@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional,Union
 
 # SQLAlchemy imports for the SQL Provider
-from sqlalchemy import select, func, text, and_, or_, not_
+from sqlalchemy import select, func, and_, or_, not_
 from sqlalchemy.sql.elements import BinaryExpression
 
 # Pydantic models for the query structure
@@ -27,12 +27,10 @@ class AbstractSearchProvider(ABC):
     @abstractmethod
     async def get_object_count(self, query: QueryDefinition) -> int:
         """Returns the total number of objects matching the query."""
-        pass
 
     @abstractmethod
     async def get_object_page(self, query: QueryDefinition, pagination: Pagination) -> List[Dict[str, Any]]:
         """Returns a single page of objects matching the query."""
-        pass
 
 class SQLSearchProvider(AbstractSearchProvider):
     """

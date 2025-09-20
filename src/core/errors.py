@@ -14,10 +14,9 @@ import traceback
 import threading
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, Any, Optional, List, Union
+from typing import Dict, Any, Optional, List
 import logging
 import sys
-import random
 
 
 # =============================================================================
@@ -33,7 +32,7 @@ class ErrorCategory(Enum):
     RESOURCE = "resource"
     VALIDATION = "validation"
     SYSTEM = "system"
-
+    FATAL_BUG = "fatal_bug" 
 
 class ErrorSeverity(Enum):
     """Error severity levels"""
@@ -85,8 +84,12 @@ class ErrorType(Enum):
     VALIDATION_CONSTRAINT_VIOLATION = "validation_constraint_violation"
     VALIDATION_TYPE_ERROR = "validation_type_error"
     
+    #compilation errors
+    PROGRAMMING_ERROR = "programming_error"
+    
     # System errors
     SYSTEM_INTERNAL_ERROR = "system_internal_error"
+    
     SYSTEM_SERVICE_UNAVAILABLE = "system_service_unavailable"
     SYSTEM_DEPENDENCY_ERROR = "system_dependency_error"
     SYSTEM_SHUTDOWN_REQUESTED = "system_shutdown_requested"
@@ -480,6 +483,17 @@ class ErrorHandler:
                 ErrorType.VALIDATION_TYPE_ERROR,
                 cause=error,
                 context={'original_context': context, 'operation': operation, **additional_context}
+            )
+
+        elif isinstance(error, (NameError, SyntaxError, AttributeError)):
+            return ClassificationError(
+                f"FATAL BUG: {type(error).__name__}: {str(error)}",
+                ErrorType.PROGRAMMING_ERROR, # A new ErrorType would also be added
+                ErrorCategory.FATAL_BUG,
+                ErrorSeverity.CRITICAL,
+                retryable=False,  # Never retry fatal bugs
+                cause=error,
+                context={'original_context': context, **additional_context}
             )
         
         elif isinstance(error, MemoryError):

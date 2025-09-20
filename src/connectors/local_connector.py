@@ -1,8 +1,6 @@
 # src/connectors/local_connector.py
 import os
 import shutil
-import asyncio
-from pathlib import Path
 from typing import AsyncIterator, List, Dict, Any, Optional
 
 from core.interfaces.worker_interfaces import IFileDataSourceConnector

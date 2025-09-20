@@ -24,7 +24,7 @@ from core.models.models import (
     TaskType
     
 )
-
+from core.errors import ErrorCategory
 # Import for type hinting
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -56,7 +56,7 @@ class Pipeliner:
                 for record in records:
                     try:
                         await self._process_output_record(record)
-                    except Exception as record_error:
+                    except Exception:
                         self.logger.error(
                             f"Error processing output record {record.id}",
                             record_id=record.id,
@@ -70,7 +70,18 @@ class Pipeliner:
             
             except Exception as e:
                 self.logger.error("An unexpected error occurred in the Pipeliner loop.", exc_info=True)
-                await asyncio.sleep(self.interval)
+                error = self.orchestrator.error_handler.handle_error(e, "Pipeliner_main_loop")
+                
+                # Fatal error detection and propagation
+                if error.error_category == ErrorCategory.FATAL_BUG:
+                    self.logger.critical(f"Fatal error detected in {self.__class__.__name__}: {error}")
+                    raise  # Propagate to TaskManager
+                
+                # Existing retry logic for operational errors
+                self.logger.warning(f"Transient error in {self.__class__.__name__}, retrying: {error}")
+                await asyncio.sleep(self.interval )
+
+                
 
         self.logger.log_component_lifecycle("Pipeliner", "STOPPED")
 

@@ -4,29 +4,13 @@ Script to create a new database with snake_case naming from SQLAlchemy models
 This version only creates the schema without copying any data.
 """
 
-import asyncio
 import logging
 import sys
-import os
 from sqlalchemy import create_engine, text
 
 try:
     # Import your base and all models (running from src directory)
     from core.db_models.base import Base
-    from core.db_models.calendar_schema import Calendar, CalendarRule
-    from core.db_models.classifier_schema import Category, Classifier, ClassifierPattern, ClassifierContextRule, ClassifierValidationRule, ClassifierExcludeTerm
-    from core.db_models.classifiertemplate_schema import ClassifierTemplate
-    from core.db_models.connector_config_schema import ConnectorConfiguration
-    from core.db_models.credentials_schema import Credential
-    from core.db_models.datasource_schema import NodeGroup, Tag, DataSource
-    from core.db_models.discovery_catalog_schema import DiscoveredObject, ObjectMetadata, DiscoveredObjectClassificationDateInfo
-    from core.db_models.error_log_schema import SystemErrorLog
-    from core.db_models.findings_schema import ScanFindingSummary, ScanFindingOccurrence
-    from core.db_models.job_schema import MasterJob, PolicyTemplate, ScanTemplate, Job, Task, TaskOutputRecord
-    from core.db_models.processing_status_schema import ObjectProcessingStatus
-    from core.db_models.remediation_ledger_schema import RemediationLedger
-    from core.db_models.system_parameters_schema import SystemParameter
-    from core.db_models.association_tables import classifier_template_link, datasource_tag_link
     
     print("✓ All SQLAlchemy models imported successfully")
     

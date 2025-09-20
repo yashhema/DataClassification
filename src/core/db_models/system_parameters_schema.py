@@ -9,9 +9,9 @@ from typing import Optional
 import enum
 
 from sqlalchemy import (
-    String, Integer, ForeignKey, Enum as SQLAlchemyEnum
+    String, ForeignKey, Enum as SQLAlchemyEnum
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
 

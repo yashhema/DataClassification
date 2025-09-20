@@ -4,7 +4,6 @@ dynamically apply all database-driven classifier rules.
 """
 
 import re
-import time
 import threading
 from typing import List, Dict, Any, Optional
 
@@ -136,7 +135,7 @@ class ClassificationEngine:
                     processed_findings.append(finding)
 
                 return processed_findings
-            except Exception as e:
+            except Exception:
                 # Let the interface handle logging and error conversion
                 raise
 

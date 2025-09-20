@@ -8,10 +8,10 @@ a clean, simple API to the rest of the application (e.g., the Orchestrator).
 
 import asyncio
 import json
-import hashlib
+
 from typing import Dict, Any, List, Tuple, Optional
 from collections import defaultdict
-
+from core.errors import ProcessingError
 # Import from project structure
 from .engine import ClassificationEngine
 from .row_processor import RowProcessor
@@ -269,7 +269,7 @@ if __name__ == "__main__":
     from unittest.mock import MagicMock
     # Import mocked ORM models for the example
     from ..db_models.classifiertemplate_schema import ClassifierTemplate as OrmClassifierTemplate
-    from ..db_models.classifier_schema import Classifier as OrmClassifier, RuleType
+    from ..db_models.classifier_schema import Classifier as OrmClassifier
     
     # --- 1. SETUP: This would happen once at the start of a worker process ---
     # Create mock core services

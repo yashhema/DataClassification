@@ -23,9 +23,10 @@ if TYPE_CHECKING:
 
 # Import from the neutral state file
 from orchestrator.orchestrator_state import JobState
-import uuid
+
 from core.db_models.job_schema import JobType
 from core.models.models import TaskType, PolicySelectorPlanPayload, PolicyConfiguration
+from core.errors import ErrorCategory
 class TaskAssigner:
     """Finds, approves, and dispatches tasks, respecting all system constraints."""
     
@@ -71,7 +72,15 @@ class TaskAssigner:
                 self.orchestrator.update_thread_liveness("task_assigner")
             
             except Exception as e:
-                self.orchestrator.error_handler.handle_error(e, "task_assigner_main_loop")
+                error = self.orchestrator.error_handler.handle_error(e, "task_assigner_main_loop")
+                
+                # Fatal error detection and propagation
+                if error.error_category == ErrorCategory.FATAL_BUG:
+                    self.logger.critical(f"Fatal error detected in {self.__class__.__name__}: {error}")
+                    raise  # Propagate to TaskManager
+                
+                # Existing retry logic for operational errors
+                self.logger.warning(f"Transient error in {self.__class__.__name__}, retrying: {error}")
                 await asyncio.sleep(self.interval * 5)
 
         self.logger.log_component_lifecycle("TaskAssigner", "STOPPED")
@@ -220,10 +229,10 @@ class TaskAssigner:
             return None # Return None to allow the main loop to cycle
 
         # Fetch the full job objects from the DB to get priority and other details
-        active_jobs = await self.db.get_jobs_by_ids(owned_job_ids) [cite: 1960]
+        active_jobs = await self.db.get_jobs_by_ids(owned_job_ids)
         
         # Filter for jobs that currently have tasks in their in-memory cache
-        jobs_with_tasks = [job for job in active_jobs if job.id in self.orchestrator.job_cache and self.orchestrator.job_cache[job.id]] [cite: 1961]
+        jobs_with_tasks = [job for job in active_jobs if job.id in self.orchestrator.job_cache and self.orchestrator.job_cache[job.id]] 
         
         #
         # --- Main Selection Logic ---
@@ -231,7 +240,7 @@ class TaskAssigner:
         if jobs_with_tasks:
             # If we have jobs with ready tasks, use the Resource Coordinator's fairness
             # logic to pick the best one to process next.
-            return self.rc.get_next_job_for_assignment(jobs_with_tasks) [cite: 1962]
+            return self.rc.get_next_job_for_assignment(jobs_with_tasks) 
         else:
             # If none of our currently owned jobs have tasks in their cache,
             # it's an opportune moment to check for new work.

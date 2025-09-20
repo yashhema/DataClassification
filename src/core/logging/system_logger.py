@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 import copy
 
 # Assuming errors.py is in a sibling directory
-# from ..errors import ClassificationError
+from ..errors import ClassificationError
 
 class JsonFormatter(logging.Formatter):
     """
@@ -251,7 +251,9 @@ class SystemLogger:
     def debug(self, message: str, **context):
         """Log a debug message."""
         self._log(logging.DEBUG, message, context)
-
+    def critical(self, message: str, **context):
+        """Log a critical message."""
+        self._log(logging.CRITICAL, message, context)
     # --- Utility Methods for System Health ---
 
     def get_sampling_stats(self) -> Dict[str, Any]:

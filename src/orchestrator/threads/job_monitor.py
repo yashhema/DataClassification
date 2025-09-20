@@ -10,7 +10,7 @@ drives the event-driven updates to the master job summary table.
 import asyncio
 import random
 from typing import TYPE_CHECKING
-from core.db_models.job_schema import JobStatus, TaskStatus
+from core.db_models.job_schema import JobStatus
 
 if TYPE_CHECKING:
     from orchestrator.orchestrator import Orchestrator

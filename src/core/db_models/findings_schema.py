@@ -10,7 +10,7 @@ This schema uses a two-table, decoupled approach for performance:
     the details of every individual finding.
 """
 
-from typing import Optional, Dict, Any
+from typing import Optional
 
 
 from sqlalchemy import (

@@ -9,7 +9,7 @@ not the sensitive secrets themselves.
 from typing import Optional, Dict, Any
 
 from sqlalchemy import String, JSON
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
 

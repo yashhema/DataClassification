@@ -5,7 +5,6 @@ Run this in your src directory: python diagnostic.py
 """
 
 import sys
-import traceback
 
 def test_import(module_path, description):
     """Test if a module can be imported"""

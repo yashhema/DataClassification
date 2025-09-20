@@ -14,17 +14,13 @@ This worker implements the contracts defined in:
 
 import asyncio
 import time
-import threading
-import requests
-import json
 from typing import Optional, Dict, Any, List, Union
 from datetime import datetime, timezone
-import traceback
 from enum import Enum
-
+import hashlib
 from core.logging.system_logger import SystemLogger
 from core.config.configuration_manager import SystemConfig
-from core.errors import ErrorHandler, ClassificationError, NetworkError, ProcessingError
+from core.errors import ErrorHandler
 
 from core.interfaces.worker_interfaces import (
     IDatabaseDataSourceConnector, 
@@ -33,18 +29,17 @@ from core.interfaces.worker_interfaces import (
 from classification.engineinterface import EngineInterface
 from core.db.database_interface import DatabaseInterface
 from core.config.configuration_manager import ConfigurationManager
-from core.config.configuration_manager import ClassificationConfidenceConfig
 from core.models.models import (
-    TaskType, WorkPacket, ProgressUpdate, ContentComponent, PIIFinding,
-    TaskOutputRecord,
+    TaskType, WorkPacket, ContentComponent, PIIFinding, TaskOutputRecord,
     PolicySelectorPlanPayload,
     PolicySelectorExecutePayload,
     PolicyActionExecutePayload,
-    ObjectToProcess,PolicyCommitPlanPayload,PolicyEnrichmentPayload,PolicyReconcilePayload,
-    RemediationResult
+    PolicyCommitPlanPayload,
+    PolicyReconcilePayload,RemediationResult
 )
 from .search_provider import create_search_provider
-
+from core.db_models.remediation_ledger_schema import LedgerStatus
+from core.models.models import ActionType
 class WorkerStatus(str, Enum):
     """Worker operational states."""
     STARTING = "STARTING"
@@ -124,6 +119,7 @@ class Worker:
 
 
     # It's good practice to have a small helper for consistent logging context
+    @staticmethod
     def job_context(work_packet: WorkPacket) -> Dict[str, Any]:
         """Extracts a consistent context dictionary for logging."""
         return {
@@ -140,7 +136,7 @@ class Worker:
         objects that match the policy and creates a blueprint for the Pipeliner.
         """
         payload: PolicySelectorPlanPayload = work_packet.payload
-        context = job_context(work_packet)
+        context = self.job_context(work_packet)
         self.logger.info(f"Starting POLICY_SELECTOR_PLAN for plan_id: {payload.plan_id}", **context)
 
         try:
@@ -171,7 +167,7 @@ class Worker:
         results (a batch of objects) to the RemediationLedger.
         """
         payload: PolicySelectorExecutePayload = work_packet.payload
-        context = job_context(work_packet)
+        context = self.job_context(work_packet)
         self.logger.info(f"Starting POLICY_SELECTOR_EXECUTE for plan_id: {payload.plan_id}, offset: {payload.pagination.offset}", **context)
 
         try:
@@ -205,7 +201,7 @@ class Worker:
         """
         payload = work_packet.payload
         plan_id = payload.get("plan_id")
-        context = job_context(work_packet)
+        context = self.job_context(work_packet)
         self.logger.info(f"Starting POLICY_ACTION_PLAN for plan_id: {plan_id}", **context)
 
         # This task signals the Pipeliner that the selection phase is 100% complete
@@ -228,7 +224,7 @@ class Worker:
         reconciliation step.
         """
         payload: PolicyActionExecutePayload = work_packet.payload
-        context = job_context(work_packet)
+        context = self.job_context(work_packet)
         self.logger.info(f"Starting POLICY_ACTION_EXECUTE for bin: {payload.bin_id}", **context)
 
         try:
@@ -330,7 +326,7 @@ class Worker:
         the action tasks.
         """
         payload: PolicyCommitPlanPayload = work_packet.payload
-        context = job_context(work_packet)
+        context = self.job_context(work_packet)
         self.logger.info(f"Starting POLICY_COMMIT_PLAN for plan_id: {payload.plan_id}", **context)
 
         try:
@@ -364,7 +360,7 @@ class Worker:
         from a completed action task and writes them to the master data catalog.
         """
         payload: PolicyReconcilePayload = work_packet.payload
-        context = job_context(work_packet)
+        context = self.job_context(work_packet)
         self.logger.info(f"Starting POLICY_RECONCILE for plan_id: {payload.plan_id}", **context)
 
         try:
@@ -750,7 +746,7 @@ class Worker:
         all_findings = []
         objects_processed = 0
         total_rows_scanned = 0
-        
+        total_objects = 0
         self.logger.info("Starting database classification (row-by-row)", task_id=work_packet.header.task_id)
 
         # The connector will yield batches of rows for each table/column it processes

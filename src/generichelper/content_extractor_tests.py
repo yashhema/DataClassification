@@ -12,10 +12,8 @@ import tempfile
 import os
 import json
 import zipfile
-import tarfile
 from pathlib import Path
-from unittest.mock import Mock, patch, AsyncMock
-from typing import List, Dict, Any
+from unittest.mock import Mock, patch
 
 # Import the system under test - adjust these imports to match your actual module structure
 

@@ -4,12 +4,11 @@ Row-level processing for structured data following Presidio best practices.
 Processes database rows and documents with field-level tracking.
 """
 
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Dict, List, Any
 from datetime import datetime, timezone
 import asyncio
 
 from .field_mapper import FieldMapper, filter_fields_for_classification
-from core.models.models import PIIFinding
 
 
 class RowProcessor:

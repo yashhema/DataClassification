@@ -9,24 +9,25 @@ UPDATED: Converted to async/await pattern with configuration caching.
 """
 
 import re
-import asyncio
-from typing import List, Dict, Any, Optional,Union
+from typing import List, Dict, Any, Optional,Union,NamedTuple
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import joinedload
 
 from sqlalchemy import (
-    select, update, text, inspect, Table, MetaData, func, delete, Column,
-    Integer, String, DateTime, LargeBinary
+    select, update, text, inspect, Table, func, Column, Integer, String,
+    DateTime, LargeBinary, case
 )
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from sqlalchemy.exc import SQLAlchemyError
-
+from sqlalchemy import and_
+import json
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from ..db_models.processing_status_schema import ObjectProcessingStatus
 # Import all ORM models from schema definitions
 from ..db_models.base import Base
-from ..db_models.job_schema import ScanTemplate, Job, Task, TaskStatus, TaskOutputRecord
+from ..db_models.job_schema import ScanTemplate, Job, Task, TaskStatus, TaskOutputRecord,MasterJobStateSummary
 from ..db_models.discovery_catalog_schema import DiscoveredObject as OrmDiscoveredObject, ObjectMetadata
 from ..db_models.discovery_catalog_schema import DiscoveredObjectClassificationDateInfo
-from ..db_models.findings_schema import ScanFindingSummary, ScanFindingOccurrence
+from ..db_models.findings_schema import ScanFindingSummary
 from ..db_models.system_parameters_schema import SystemParameter
 from ..db_models.datasource_schema import NodeGroup, DataSource
 from ..db_models.connector_config_schema import ConnectorConfiguration
@@ -39,8 +40,6 @@ from ..db_models.job_schema import PolicyTemplate
 from ..db_models.remediation_ledger_schema import RemediationLedger, LedgerStatus
 
 # Import Pydantic models for type hinting and data conversion
-from ..models.models import DiscoveredObject as PydanticDiscoveredObject
-from ..models.models import PIIFinding as PydanticPIIFinding
 
 # Import core services for integration
 from ..logging.system_logger import SystemLogger
@@ -1748,12 +1747,12 @@ class DatabaseInterface:
 
                 # 5. Handle new objects: Insert them from the staging table into the master table.
                 if new_hashes:
-                    target_columns = [c.name for c in ObjectMetadata.__table__.columns if hasattr(staging_table, c.name)]
+                    target_columns = [c.name for c in DiscoveredObject.__table__.columns if c.name != 'id']
                     target_cols_str = ", ".join([f'"{c}"' for c in target_columns])
                     
                     # This efficiently copies the new records from staging to the master table
                     insert_sql = text(
-                        f'INSERT INTO "ObjectMetadata" ({target_cols_str}) '
+                        f'INSERT INTO "discovered_objects" ({target_cols_str}) '
                         f'SELECT {target_cols_str} FROM {staging_table_name} '
                         f'WHERE "object_key_hash" IN :hashes'
                     )

@@ -5,7 +5,7 @@ stored in the database. These models provide validation and a single
 source of truth for configuration structures.
 """
 
-from typing import List, Optional, Dict, Any, Union, Literal, Annotated
+from typing import List, Optional, Dict, Union, Literal, Annotated
 from pydantic import BaseModel, Field
 
 # =================================================================

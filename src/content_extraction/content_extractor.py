@@ -19,10 +19,9 @@ ASYNC CONVERSION: Converted all file I/O to async operations
 import os
 import uuid
 import aiofiles.os
-import hashlib
 import tempfile
 import aiofiles
-from typing import AsyncIterator, Dict, Any, List, Union, Optional
+from typing import AsyncIterator, Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -538,7 +537,7 @@ class ContentExtractor:
         tables_found = False
         
         try:
-            import pymupdf as fitz
+            pass
             
             # PRIMARY: PyMuPDF table extraction
             for page_num in range(len(doc)):
@@ -806,7 +805,6 @@ class ContentExtractor:
         
         try:
             import pandas as pd
-            import openpyxl
             
             base_name = self._get_base_name(file_path)
             excel_file = pd.ExcelFile(file_path)
@@ -935,7 +933,6 @@ class ContentExtractor:
         
         try:
             from pptx import Presentation
-            from pptx.enum.shapes import MSO_SHAPE_TYPE
             
             prs = Presentation(file_path)
             base_name = self._get_base_name(file_path)
@@ -1996,34 +1993,28 @@ class ContentExtractor:
         
         # PDF processing
         try:
-            import pymupdf
             registry["pdf"] = self.extract_pdf_components
         except ImportError:
             missing_libraries.append("pymupdf")
         
         # Office processing
         try:
-            from docx import Document
             registry["docx"] = self.extract_docx_components
         except ImportError:
             missing_libraries.append("python-docx")
         
         try:
-            import pandas as pd
-            import openpyxl
             registry["xlsx"] = self.extract_xlsx_components
         except ImportError:
             missing_libraries.append("pandas/openpyxl")
         
         try:
-            from pptx import Presentation
             registry["pptx"] = self.extract_pptx_components
         except ImportError:
             missing_libraries.append("python-pptx")
         
         # HTML processing
         try:
-            from bs4 import BeautifulSoup
             registry["html"] = self.extract_html_components
         except ImportError:
             missing_libraries.append("beautifulsoup4")

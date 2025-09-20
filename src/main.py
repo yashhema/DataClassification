@@ -18,7 +18,7 @@ import socket
 import queue
 import traceback
 from uuid import uuid4
-from typing import Optional, List, Dict
+from typing import List
 
 # Core infrastructure imports
 from core.config.configuration_manager import ConfigurationManager  
@@ -32,12 +32,10 @@ from orchestrator.orchestrator import Orchestrator
 from worker.worker import Worker, ConnectorFactory
 from content_extraction.content_extractor import ContentExtractor
 from core.models.models import ContentExtractionConfig
-from cli import run_cli
-from core.db.database_interface_sync_wrapper import DatabaseInterfaceSyncWrapper
 
 # Global shutdown event
 shutdown_event = asyncio.Event()
-
+logger = None
 def graceful_shutdown_handler(signum, frame):
     """Signal handler to initiate a graceful async shutdown."""
     print(f"\nShutdown signal {signum} received. Initiating graceful shutdown...")
@@ -204,7 +202,7 @@ async def debug_event_loop_activity():
 async def main():
     """ The main asynchronous entry point for the application service. """
     db_interface = None
-    logger = None
+    
     try:
         # 1. Argument Parsing & Initial Mode Selection
         parser = argparse.ArgumentParser(description="Main launcher for the classification system.")
@@ -324,3 +322,15 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nApplication shutdown.")
+    except Exception as e:
+        print("="*80, file=sys.stderr)
+        print("FATAL, UNHANDLED EXCEPTION REACHED TOP-LEVEL.", file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        print("="*80, file=sys.stderr)
+        
+        # Brief delay to ensure stderr flushes
+        import time
+        time.sleep(0.1)
+        
+        sys.exit(1)

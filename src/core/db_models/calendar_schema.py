@@ -9,7 +9,7 @@ import datetime
 from typing import List, Optional
 
 from sqlalchemy import (
-    String, Integer, ForeignKey, Time, Enum as SQLAlchemyEnum
+    String, ForeignKey, Time, Enum as SQLAlchemyEnum
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 

@@ -6,7 +6,6 @@ This version is fully integrated with the system's core logging and error
 handling frameworks and contains the complete schema for all system components.
 """
 
-import logging
 import socket
 from typing import List, Dict, Any, Optional
 
@@ -14,7 +13,6 @@ import yaml
 from pydantic import BaseModel, Field, ValidationError as PydanticValidationError
 
 from ..db_models.system_parameters_schema import SystemParameter
-from ..errors import ConfigurationError
 
 # Forward reference for core components to avoid circular imports at runtime
 from typing import TYPE_CHECKING
@@ -79,6 +77,20 @@ class OrchestratorConfig(BaseModel):
     job_reaper_interval_seconds: int = Field(180, description="How often the Job Reaper checks for abandoned jobs.")
     instance_id: str = Field("orchestrator-default-01", description="A stable, persistent ID for this orchestrator instance.")
     is_master_monitor_enabled: bool = Field(False, description="If true, this instance runs the MasterJobMonitor and other central management tasks.")
+
+# NEW: Dedicated configuration model for the TaskManager
+class TaskManagerConfig(BaseModel):
+    """Configuration for the resilient task supervisor."""
+    rapid_failure_seconds: int = Field(30, description="Time window in seconds for detecting a rapid crash loop.")
+    hourly_failure_threshold: int = Field(3, description="Max failures per hour for a task before escalating.")
+    restart_backoff_base: float = Field(2.0, description="Base for the exponential backoff delay calculation.")
+    restart_backoff_cap_seconds: float = Field(60.0, description="Maximum backoff delay in seconds before a restart.")
+    circuit_breaker_threshold: int = Field(5, description="Number of restarts for a task before its circuit breaker is opened.")
+    circuit_breaker_cooldown_seconds: int = Field(300, description="How long a circuit breaker remains open before allowing a retry.")
+    startup_validation_seconds: float = Field(0.5, description="Time to wait after starting a task to check for immediate failure.")
+
+
+
 class JobConfig(BaseModel):
     failure_threshold_percent: int = Field(10)
 
@@ -149,6 +161,7 @@ class SystemConfig(BaseModel):
     classification: ClassificationConfig = Field(default_factory=ClassificationConfig)
     task_cost_estimation: TaskCostEstimationConfig = Field(default_factory=TaskCostEstimationConfig)
     content_extraction: ContentExtractionSystemConfig = Field(default_factory=ContentExtractionSystemConfig)
+    task_manager: TaskManagerConfig = Field(default_factory=TaskManagerConfig)
 # =================================================================
 # The Configuration Manager
 # =================================================================

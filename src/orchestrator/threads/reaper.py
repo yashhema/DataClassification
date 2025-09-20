@@ -22,7 +22,7 @@ import asyncio
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from orchestrator.orchestrator import Orchestrator
-
+from core.errors import ErrorCategory
 class Reaper:
     """Coroutine responsible for finding and re-queuing hung or timed-out tasks."""
     
@@ -70,8 +70,14 @@ class Reaper:
             
             except Exception as e:
                 # Catch exceptions to prevent the coroutine from crashing.
-                self.logger.error("An unexpected error occurred in the Reaper loop.", exc_info=True)
+                error = self.orchestrator.error_handler.handle_error(e, "reaper_main_loop")
                 # Avoid a tight loop on repeated database failures
-                await asyncio.sleep(self.interval)
-
+                # Fatal error detection and propagation
+                if error.error_category == ErrorCategory.FATAL_BUG:
+                    self.logger.critical(f"Fatal error detected in {self.__class__.__name__}: {error}")
+                    raise  # Propagate to TaskManager
+                
+                # Existing retry logic for operational errors
+                self.logger.warning(f"Transient error in {self.__class__.__name__}, retrying: {error}")
+                await asyncio.sleep(self.interval )
         self.logger.log_component_lifecycle("Reaper", "STOPPED")

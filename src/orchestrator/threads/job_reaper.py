@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from orchestrator.orchestrator import Orchestrator
-
+from core.errors import ErrorCategory
 class JobReaper:
     """Coroutine to find and recover abandoned jobs."""
 
@@ -48,7 +48,18 @@ class JobReaper:
                 await asyncio.sleep(self.interval_sec)
 
             except Exception as e:
-                self.orchestrator.error_handler.handle_error(e, "job_reaper_main_loop")
+                
+                error = self.orchestrator.error_handler.handle_error(e, "job_reaper_main_loop")
+                
+                # Fatal error detection and propagation
+                if error.error_category == ErrorCategory.FATAL_BUG:
+                    self.logger.critical(f"Fatal error detected in {self.__class__.__name__}: {error}")
+                    raise  # Propagate to TaskManager
+                
+                # Existing retry logic for operational errors
+                self.logger.warning(f"Transient error in {self.__class__.__name__}, retrying: {error}")
+                
+
                 await asyncio.sleep(self.interval_sec) # Avoid tight loop on failure
 
         self.logger.log_component_lifecycle("JobReaper", "STOPPED")

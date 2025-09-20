@@ -6,7 +6,6 @@ Maps Presidio findings back to source fields with position tracking.
 
 from typing import Dict, Tuple, List, Any, Optional
 from dataclasses import dataclass
-import re
 
 
 @dataclass

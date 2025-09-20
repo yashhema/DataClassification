@@ -4,7 +4,6 @@ Run this first to ensure pytest is working correctly
 """
 
 import pytest
-import os
 from pathlib import Path
 
 

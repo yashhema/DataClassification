@@ -21,9 +21,9 @@ from typing import AsyncIterator, Optional, Dict, Any, List,Tuple
 from pathlib import Path
 from datetime import datetime, timezone
 
+from core.models.models import ContentExtractionConfig, FailedObject
 # SMB protocol imports
 try:
-    import smbprotocol
     from smbprotocol.connection import Connection
     from smbprotocol.session import Session
     from smbprotocol.tree import TreeConnect
@@ -31,8 +31,8 @@ try:
         Open, CreateDisposition, ShareAccess, FileAttributes, 
         CreateOptions, FilePipePrinterAccessMask, ImpersonationLevel
     )
-    from smbprotocol.file_info import FileInformationClass, FileFullDirectoryInformation
-    from smbprotocol.exceptions import SMBException, SMBResponseException
+    from smbprotocol.file_info import FileInformationClass
+    from smbprotocol.exceptions import SMBException
     from smbprotocol.security_descriptor import SMB2CreateSDBuffer
 except ImportError as e:
     raise ImportError(
@@ -46,8 +46,7 @@ from core.models.models import (
      ContentComponent,TombstoneConfig,RemediationResult
 )
 from core.errors import (
-    NetworkError, RightsError, ProcessingError, ConfigurationError,
-    ErrorType, ClassificationError
+    NetworkError, RightsError, ProcessingError, ErrorType
 )
 from core.logging.system_logger import SystemLogger
 from content_extraction.content_extractor import ContentExtractor
@@ -519,7 +518,7 @@ class SMBConnector(IFileDataSourceConnector):
                 )
                 succeeded_paths.append(path)
             except Exception as e:
-                error = self.error_handler.handle_error(e, f"smb_delete_{path}", **context)
+                self.error_handler.handle_error(e, f"smb_delete_{path}", **context)
                 failed_paths.append(FailedObject(path=path, error_message=str(e)))
         
         return RemediationResult(
@@ -589,7 +588,7 @@ class SMBConnector(IFileDataSourceConnector):
                 )
                 succeeded_paths.append(path)
             except Exception as e:
-                error = self.error_handler.handle_error(e, f"smb_move_{path}", **context)
+                self.error_handler.handle_error(e, f"smb_move_{path}", **context)
                 failed_paths.append(FailedObject(path=path, error_message=str(e)))
                 
         return RemediationResult(
@@ -615,8 +614,9 @@ class SMBConnector(IFileDataSourceConnector):
                 CreateDisposition.FILE_OPEN,
                 0
             )
-            f.set_info(dest_path, FileRenameInformation)
-
+            # The new path is passed directly to the set_info method.
+            # The library handles the FileRenameInformation class internally.
+            f.set_info(dest_path) 
         # If move was successful and tombstone is requested, create it at the original location
         if tombstone_config:
             self._create_tombstone_sync(normalized_source, tombstone_config)
@@ -663,7 +663,7 @@ class SMBConnector(IFileDataSourceConnector):
 
                 succeeded_paths.append(path)
             except Exception as e:
-                error = self.error_handler.handle_error(e, f"smb_mip_{path}", **context)
+                self.error_handler.handle_error(e, f"smb_mip_{path}", **context)
                 failed_paths.append(FailedObject(path=path, error_message=str(e)))
             finally:
                 # 4. Clean up the temporary local file
@@ -1196,7 +1196,7 @@ class SMBConnector(IFileDataSourceConnector):
             
             return permissions if permissions else ["unknown"]
             
-        except Exception as e:
+        except Exception:
             return [f"raw_mask_{hex(access_mask)}"]
 
     def _get_smb_version(self) -> str:

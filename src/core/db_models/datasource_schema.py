@@ -7,7 +7,7 @@ tables (Tags, NodeGroups) using the SQLAlchemy ORM.
 from typing import List, Optional, Dict, Any
 
 from sqlalchemy import (
-    String, Integer, ForeignKey, JSON, Table, Column
+    String, ForeignKey, JSON
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .calendar_schema import Calendar
     # Import the Pydantic model for documentation purposes
-    from core.config.config_models import DataSourceConfiguration
 
 class NodeGroup(Base):
     __tablename__ = 'node_groups'

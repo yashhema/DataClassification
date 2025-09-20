@@ -9,7 +9,7 @@ from typing import List, AsyncIterator, Optional, Dict, Any, Tuple
 
 # Import the strongly-typed Pydantic models
 from core.models.models import DiscoveredObject, ObjectMetadata, RemediationResult
-from core.models.models import WorkPacket, PIIFinding, ContentComponent, TombstoneConfig
+from core.models.models import WorkPacket, ContentComponent, TombstoneConfig
 
 
 class IDatabaseDataSourceConnector(ABC):
@@ -20,17 +20,14 @@ class IDatabaseDataSourceConnector(ABC):
     @abstractmethod
     async def enumerate_objects(self, work_packet: WorkPacket) -> AsyncIterator[List[DiscoveredObject]]:
         """Performs a fast, streaming enumeration of objects from the source."""
-        pass
 
     @abstractmethod
     async def get_object_details(self, work_packet: WorkPacket) -> List[ObjectMetadata]:
         """Fetches rich, detailed metadata for a batch of objects."""
-        pass
 
     @abstractmethod
     async def get_object_content(self, work_packet: WorkPacket) -> AsyncIterator[dict]:
         """Retrieves the actual content of an object for classification."""
-        pass
 
 # NEW: Interface for post-scan remediation actions
 class IRemediationConnector(ABC):
@@ -50,7 +47,6 @@ class IRemediationConnector(ABC):
         Moves a batch of objects. If tombstone_config is provided, it must create
         a tombstone file at the original location after a successful move.
         """
-        pass
 
     @abstractmethod
     async def delete_objects(self, 
@@ -61,7 +57,6 @@ class IRemediationConnector(ABC):
         Deletes a batch of objects. If tombstone_config is provided, it must create
         a tombstone file in place of the deleted object.
         """
-        pass
 
     @abstractmethod
     async def tag_objects(self, 
@@ -73,7 +68,6 @@ class IRemediationConnector(ABC):
             objects_with_tags: A list of tuples, where each tuple contains an
                                object_path and a list of tags to apply.
         """
-        pass
 
     @abstractmethod
     async def apply_encryption(self, 
@@ -83,7 +77,6 @@ class IRemediationConnector(ABC):
         """
         Placeholder method to encrypt a batch of objects in-place.
         """
-        pass
 
     @abstractmethod
     async def apply_mip_labels(self, 
@@ -95,7 +88,6 @@ class IRemediationConnector(ABC):
             objects_with_labels: A list of tuples, where each tuple contains an
                                  object_path and the specific MIP Label ID to apply.
         """
-        pass
 
 # UPDATED: IFileDataSourceConnector now inherits from IRemediationConnector
 class IFileDataSourceConnector(IRemediationConnector):
@@ -114,5 +106,4 @@ class IFileDataSourceConnector(IRemediationConnector):
         """
         Retrieves and extracts content components from files for classification.
         """
-        pass
 

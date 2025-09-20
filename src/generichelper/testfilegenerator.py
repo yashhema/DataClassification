@@ -12,7 +12,6 @@ import zipfile
 import tarfile
 import tempfile
 from pathlib import Path
-from datetime import datetime
 import xml.etree.ElementTree as ET
 
 class TestFileGenerator:

@@ -1,18 +1,9 @@
 # Modified cli.py - Option 1: Use Main Event Loop
 
-import asyncio
 import time
-import logging
-import threading
-from collections import defaultdict
 import traceback
 # Core infrastructure imports needed by the CLI
-from core.config.configuration_manager import ConfigurationManager
-from core.db.database_interface import DatabaseInterface
 from core.db.database_interface_sync_wrapper import DatabaseInterfaceSyncWrapper
-from core.errors import ErrorHandler
-from core.logging.system_logger import SystemLogger
-from core.db_models.job_schema import JobType
 
 def run_cli(db_sync: DatabaseInterfaceSyncWrapper, settings):
     print("CLI Ready. Type 'help' for commands.")

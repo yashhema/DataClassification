@@ -1,15 +1,16 @@
 # src/orchestrator/orchestrator.py
 import asyncio
+import sys
 from collections import deque,defaultdict
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
-
+from .task_manager import TaskManager
 # Core system imports
 from core.logging.system_logger import SystemLogger
 from core.config.configuration_manager import SystemConfig
 from core.db.database_interface import DatabaseInterface
 from orchestrator.resource_coordinator import ResourceCoordinator
-from core.db_models.job_schema import JobStatus, JobType
+from core.db_models.job_schema import JobStatus
 from core.errors import ErrorHandler
 
 # Import background thread components
@@ -22,7 +23,10 @@ from .threads.lease_manager import LeaseManager
 import time
 # Import the neutral state model
 from .orchestrator_state import JobState
-
+from .healthcheck import HealthCheck
+from .threads.master_job_monitor import MasterJobMonitor
+from queue import Empty
+from .threads.summary_reconciler import SummaryReconciler
 class Orchestrator:
     """Manages the lifecycle of jobs and tasks for a specific NodeGroup."""
 
@@ -58,7 +62,8 @@ class Orchestrator:
         self.is_single_process_mode = self.settings.orchestrator.deployment_model.upper() == "SINGLE_PROCESS"
         self._in_process_work_queue: Optional[asyncio.Queue] = None
         self._background_tasks = []
-
+        # Pass the specific config section to the TaskManager
+        self.task_manager = TaskManager(self, config=self.settings.task_manager)
         # --- Internal Components ---
         self.resource_coordinator = ResourceCoordinator(settings, logger, db)
         self.task_assigner = TaskAssigner(self)
@@ -67,7 +72,8 @@ class Orchestrator:
         self.pipeliner = Pipeliner(self)
         self.job_monitor = JobCompletionMonitor(self)
         self.lease_manager = LeaseManager(self)
-        
+        # Add this line to create the health check instance
+        self.health_check = HealthCheck(self) 
         # Conditionally instantiate central components
         self.master_job_monitor = None
         self.summary_reconciler = None
@@ -128,13 +134,61 @@ class Orchestrator:
             self._background_tasks = [asyncio.create_task(coro) for coro in coroutines_to_start]
             
             self.logger.log_component_lifecycle("Orchestrator", "ALL_ASYNC_COROUTINES_STARTED")
+            self.logger.log_component_lifecycle("Orchestrator", "VALIDATING AND STARTING SUPERVISED COROUTINES")
             
+            try:
+                # --- Startup Failure Cascade Prevention & Graceful Degradation ---
+                # First, start all essential tasks. If any fail immediately, the entire orchestrator will fail to start.
+                self.logger.info("Starting essential tasks...")
+                await self.task_manager.start_supervised_task("TaskAssigner", self.task_assigner.run_async, is_essential=True)
+                await self.task_manager.start_supervised_task("LeaseManager", self.lease_manager.run_async, is_essential=True)
+                
+
+                # Then, start non-essential tasks. Their failure will be managed but won't stop startup.
+                self.logger.info("Starting non-essential tasks...")
+                await self.task_manager.start_supervised_task("Reaper", self.reaper.run_async, is_essential=False)
+                await self.task_manager.start_supervised_task("JobReaper", self.job_reaper.run_async, is_essential=False)
+                await self.task_manager.start_supervised_task("Pipeliner", self.pipeliner.run_async, is_essential=False)
+                await self.task_manager.start_supervised_task("JobMonitor", self.job_monitor.run_async, is_essential=False)
+                await self.task_manager.start_supervised_task("HealthCheck", self.health_check.run_async, is_essential=True)
+            except RuntimeError as e:
+                self.logger.critical(f"A critical component failed its startup validation: {e}", exc_info=True)
+                await self.emergency_shutdown(f"Critical component startup failure: {e}")
+                return
+
+            # The supervisor itself is the primary background task.
+            supervisor_task = asyncio.create_task(self.task_manager.supervise_tasks())
+            self._background_tasks.append(supervisor_task)
+            
+            self.logger.log_component_lifecycle("Orchestrator", "ALL_COROUTINES_STARTED")            
         except Exception as e:
             self.error_handler.handle_error(e, "orchestrator_async_startup")
             raise
 
 
+    async def emergency_shutdown(self, reason: str):
+        """Immediate, non-graceful shutdown with a more robust cleanup timeout."""
+        if self._shutdown_event.is_set(): return
 
+        self.logger.critical(f"EMERGENCY SHUTDOWN INITIATED. Reason: {reason}")
+        self._shutdown_event.set()
+
+        # Consolidate all managed tasks for cancellation
+        all_tasks = self._background_tasks + [task for _, task, _ in self.task_manager.critical_tasks.values()]
+        for task in all_tasks:
+            if not task.done():
+                task.cancel()
+
+        try:
+            # Wait for all tasks to acknowledge cancellation with a generous timeout
+            await asyncio.wait_for(asyncio.gather(*all_tasks, return_exceptions=True), timeout=10.0)
+            self.logger.info("All background tasks gracefully cancelled during emergency shutdown.")
+        except asyncio.TimeoutError:
+            self.logger.warning("Cleanup timeout exceeded during emergency shutdown. Forcing exit.")
+        except Exception as e:
+            self.logger.error(f"Error during shutdown cleanup: {e}")
+
+        sys.exit(1)
 
             
     async def shutdown_async(self):

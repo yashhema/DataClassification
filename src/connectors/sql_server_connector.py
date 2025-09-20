@@ -13,17 +13,16 @@ Task 8 Complete: Full async conversion with AsyncIterator support
 
 import asyncio
 import hashlib
-import time
-from typing import AsyncIterator, List, Dict, Any, Optional, Tuple
+from typing import AsyncIterator, List, Dict, Any, Optional
 from datetime import datetime, timezone
 from urllib.parse import quote_plus
 
 # SQL Server specific imports with async support
 try:
     import sqlalchemy
-    from sqlalchemy import text, inspect, MetaData
+    from sqlalchemy import text
     from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine, AsyncSession, async_sessionmaker
-    from sqlalchemy.exc import SQLAlchemyError, OperationalError, ProgrammingError
+    from sqlalchemy.exc import SQLAlchemyError
     from sqlalchemy.pool import QueuePool
 except ImportError as e:
     raise ImportError("SQL Server datasource requires sqlalchemy[asyncio]: pip install 'sqlalchemy[asyncio]' aiodbc") from e
@@ -34,7 +33,6 @@ from core.models.models import WorkPacket, DiscoveredObject, ObjectMetadata
 from core.logging.system_logger import SystemLogger
 from core.errors import ErrorHandler, NetworkError, RightsError, ProcessingError, ConfigurationError, ErrorType
 from core.db.database_interface import DatabaseInterface
-from core.models.models import ContentComponent
 
 class AsyncSQLServerConnection:
     """Manages async SQL Server connections with proper error handling and cleanup."""
@@ -282,7 +280,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             
             # Get configuration from work packet
             batch_size = work_packet.config.batch_write_size
-            processing_mode = self.datasource_config.configuration.get('processing_mode', 'column')
+            self.datasource_config.configuration.get('processing_mode', 'column')
             
             # Stream enumeration with batching
             batch_count = 0
@@ -564,8 +562,8 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                     if not credential_id:
                         raise ValueError(f"credential_id is required for '{auth_method}' authentication.")
                     
-                    credential_record = await self.db.get_credential_for_datasource(credential_id)
-                    password = await self.credential_manager.get_password_async(credential_data['store_details'])
+                    await self.db.get_credential_for_datasource(credential_id)
+                    password = await self.credential_manager.get_password_async(credential_record['store_details'])
                     
                     # Inject the fetched password into the connection config
                     auth_config['password'] = password
@@ -1094,7 +1092,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                 content_type='database/table'
             )
             
-        except Exception as e:
+        except Exception:
             # Return basic metadata on error
             return ObjectMetadata(
                 size_bytes=0,
@@ -1149,7 +1147,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                 content_type='database/column'
             )
             
-        except Exception as e:
+        except Exception:
             # Return basic metadata on error
             return ObjectMetadata(
                 size_bytes=0,
@@ -1238,7 +1236,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             
             return self._environment_info
             
-        except Exception as e:
+        except Exception:
             # Return safe default on detection failure
             self._environment_info = {
                 'environment_type': 'on_premise',
@@ -1257,7 +1255,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
         
         # Calculate object key hash
         key_string = f"{self.datasource_id}|{object_path}|table"
-        object_key_hash = hashlib.sha256(key_string.encode()).digest()
+        hashlib.sha256(key_string.encode()).digest()
         
         # Create metadata
         metadata = ObjectMetadata(

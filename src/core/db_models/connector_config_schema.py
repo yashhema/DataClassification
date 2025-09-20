@@ -16,7 +16,7 @@ from .base import Base
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     # Import the Pydantic model for documentation purposes
-    from core.config.config_models import ConnectorConfiguration as PydanticConnectorConfig
+    pass
 
 class ConnectorConfiguration(Base):
     __tablename__ = 'connector_configurations'

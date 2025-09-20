@@ -11,9 +11,9 @@ from datetime import datetime, timezone, timedelta
 from typing import TYPE_CHECKING
 
 # NEW: Import the new safe mapping function and result type
-from orchestrator.orchestrator_state import map_db_status_to_memory_state, JobState
+from orchestrator.orchestrator_state import map_db_status_to_memory_state
 from core.db.database_interface import LeaseRenewalResult
-
+from core.errors import ErrorCategory
 if TYPE_CHECKING:
     from orchestrator.orchestrator import Orchestrator
 
@@ -40,8 +40,18 @@ class LeaseManager:
                 await asyncio.sleep(self.interval_sec)
 
             except Exception as e:
-                self.orchestrator.error_handler.handle_error(e, "lease_manager_main_loop")
-                await asyncio.sleep(self.interval_sec)
+                
+                error = self.orchestrator.error_handler.handle_error(e, "lease_manager_main_loop")
+                
+                # Fatal error detection and propagation
+                if error.error_category == ErrorCategory.FATAL_BUG:
+                    self.logger.critical(f"Fatal error detected in {self.__class__.__name__}: {error}")
+                    raise  # Propagate to TaskManager
+                
+                # Existing retry logic for operational errors
+                self.logger.warning(f"Transient error in {self.__class__.__name__}, retrying: {error}")
+                await asyncio.sleep(self.interval * 5)
+                
 
         self.logger.log_component_lifecycle("LeaseManager", "STOPPED")
 
