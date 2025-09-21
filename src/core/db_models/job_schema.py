@@ -141,15 +141,15 @@ class Job(Base):
     configuration: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, comment="A self-contained copy of the filtered scan configuration.")
     node_group: Mapped[Optional[str]] = mapped_column(String(255), comment="The datacenter/region this job is assigned to.")
     orchestrator_id: Mapped[Optional[str]] = mapped_column(String(255), comment="The unique ID of the orchestrator instance that owns this job.")
-    orchestrator_lease_expiry: Mapped[Optional[datetime]] = mapped_column(DateTime, comment="The timestamp when the current lease expires.")
+    orchestrator_lease_expiry: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), comment="The timestamp when the current lease expires.")
     lease_warning_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="A counter for the failover grace period.")
-    last_lease_warning_timestamp: Mapped[Optional[datetime]] = mapped_column(DateTime, comment="Timestamp of the last lease expiry warning.")
+    last_lease_warning_timestamp: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), comment="Timestamp of the last lease expiry warning.")
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, comment="Version number for optimistic locking.")
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
     status: Mapped[JobStatus] = mapped_column(SQLAlchemyEnum(JobStatus), nullable=False, default=JobStatus.QUEUED)
     trigger_type: Mapped[str] = mapped_column(String(50), nullable=False)
-    created_timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
-    completed_timestamp: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    created_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    completed_timestamp: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     scan_template: Mapped[Optional["ScanTemplate"]] = relationship(
         "ScanTemplate",
         primaryjoin=lambda: and_(

@@ -17,8 +17,9 @@ from enum import Enum
 from typing import Dict, Any, Optional, List
 import logging
 import sys
-
-
+import asyncio
+import json
+import sqlalchemy
 # =============================================================================
 # Error Categories and Types
 # =============================================================================
@@ -386,7 +387,79 @@ class ErrorHandler:
         self._registry_lock = threading.Lock()
         self.error_registry: Dict[str, ClassificationError] = {}
         self._max_registry_size = 1000  # Prevent unbounded growth
-    
+
+    def _convert_exception_with_context(self, 
+                                      error: Exception, 
+                                      context: str,
+                                      operation: Optional[str] = None,
+                                      **additional_context) -> ClassificationError:
+        """Convert generic exception with context-aware classification logic"""
+        
+        error_message = str(error)
+        error_class = type(error).__name__
+        
+        # SOLUTION: Context-aware TypeError and ValueError handling
+        if isinstance(error, (TypeError, ValueError)):
+            # Check if error occurred in core system context
+            if self._is_core_system_context(context, operation, additional_context):
+                return ClassificationError(
+                    f"FATAL BUG in core system: {error_class}: {error_message}",
+                    ErrorType.PROGRAMMING_ERROR,
+                    ErrorCategory.FATAL_BUG,
+                    ErrorSeverity.CRITICAL,
+                    retryable=False,
+                    cause=error,
+                    context={'original_context': context, 'operation': operation, **additional_context}
+                )
+            else:
+                # Data processing context - treat as validation error
+                return ValidationError(
+                    f"Data validation error: {error_class}: {error_message}",
+                    ErrorType.VALIDATION_TYPE_ERROR,
+                    cause=error,
+                    context={'original_context': context, 'operation': operation, **additional_context}
+                )
+        
+        # For all other exception types, use your existing logic
+        # (copy the rest from your current _convert_exception method)
+
+    def _is_core_system_context(self, context: str, operation: Optional[str], 
+                              additional_context: Dict[str, Any]) -> bool:
+        """
+        Determine if error occurred in core system context.
+        Returns True if error should be treated as fatal programming bug.
+        """
+        
+        # Check context string for core system indicators
+        context_lower = context.lower()
+        core_indicators = [
+            'orchestrator', 'task_manager', 'task_assigner', 'job_monitor',
+            'lease_manager', 'state_transition', 'database_interface', 
+            'health_check', 'resource_coordinator', 'pipeliner', 'reaper'
+        ]
+        
+        for indicator in core_indicators:
+            if indicator in context_lower:
+                return True
+        
+        # Check for data processing indicators (return False)
+        data_processing_indicators = [
+            'connector', 'classification', 'content_extraction', 
+            'file_processing', 'database_content', 'row_processing'
+        ]
+        
+        for indicator in data_processing_indicators:
+            if indicator in context_lower:
+                return False
+        
+        # Check additional context for data processing keys
+        data_context_keys = {'file_path', 'object_path', 'datasource_id', 'content_type'}
+        if any(key in additional_context for key in data_context_keys):
+            return False
+        
+        # Default: treat as core system error for safety
+        return True
+
     def handle_error(self, 
                     error: Exception, 
                     context: str,
@@ -395,8 +468,15 @@ class ErrorHandler:
         """
         Convert any exception to ClassificationError and handle appropriately
         """
-
-        # FIXED: Use logger instead of print statements
+        if not isinstance(error, Exception):
+            self.logger.error(f"ERROR HANDLER BUG: Received non-Exception object: {type(error)}")
+            # Create a synthetic error to work with
+            error = RuntimeError(f"Invalid error object passed to handler: {str(error)}")
+        
+        if not context:
+            self.logger.warning("ERROR HANDLER: Empty context provided, using fallback")
+            context = "unknown_context"
+        # Log error details
         self.logger.error(f"ERROR in {context}")
         self.logger.error(f"Operation: {operation}")
         self.logger.error(f"Error Type: {type(error).__name__}")
@@ -409,7 +489,10 @@ class ErrorHandler:
         if additional_context:
             self.logger.error(f"Additional Context: {additional_context}")
 
-        # If it's already a ClassificationError, add context and return
+        # Initialize classification_error to None to track assignment
+        classification_error = None
+
+        # If it's already a ClassificationError, add context and use it
         if isinstance(error, ClassificationError):
             classification_error = error
             if operation:
@@ -421,14 +504,25 @@ class ErrorHandler:
             # Convert generic exception to ClassificationError
             classification_error = self._convert_exception(error, context, operation, **additional_context)
         
-        # Log the error
+        # CRITICAL FIX: Ensure we always have a valid ClassificationError
+        if classification_error is None:
+            self.logger.error("ERROR: _convert_exception returned None - creating fallback error")
+            classification_error = ClassificationError(
+                f"Error handler failed to classify exception: {type(error).__name__}: {str(error)}",
+                ErrorType.SYSTEM_INTERNAL_ERROR,
+                ErrorCategory.SYSTEM,
+                ErrorSeverity.HIGH,
+                cause=error,
+                context={'original_context': context, 'operation': operation, **additional_context}
+            )
+        
+        # Log the error (with null check)
         self._log_error(classification_error)
         
-        # FIXED: Thread-safe registry management
+        # Thread-safe registry management
         with self._registry_lock:
             # Check size limit and evict oldest if needed
             if len(self.error_registry) >= self._max_registry_size:
-                # Find and remove oldest error atomically
                 try:
                     oldest_id = min(self.error_registry.keys(), 
                                   key=lambda k: self.error_registry[k].timestamp)
@@ -441,7 +535,8 @@ class ErrorHandler:
             self.error_registry[classification_error.error_id] = classification_error
         
         return classification_error
-    
+
+
     def _convert_exception(self, 
                           error: Exception, 
                           context: str,
@@ -485,6 +580,32 @@ class ErrorHandler:
                 context={'original_context': context, 'operation': operation, **additional_context}
             )
 
+        # Add to _convert_exception method:
+        elif isinstance(error, (ImportError, ModuleNotFoundError)):
+            return ConfigurationError(
+                f"Module/import error: {error_class}: {error_message}",
+                ErrorType.CONFIGURATION_DEPENDENCY_MISSING,
+                cause=error,
+                context={'original_context': context, **additional_context}
+            )
+
+        elif isinstance(error, (asyncio.TimeoutError, asyncio.CancelledError)):
+            return ProcessingError(
+                f"Async operation failed: {error_class}: {error_message}",
+                ErrorType.PROCESSING_RESOURCE_EXHAUSTED,
+                cause=error,
+                retryable=True,
+                context={'original_context': context, **additional_context}
+            )
+
+        elif isinstance(error, json.JSONDecodeError):
+            return ValidationError(
+                f"JSON parsing failed: {error_message}",
+                ErrorType.VALIDATION_SCHEMA_ERROR,
+                cause=error,
+                context={'original_context': context, **additional_context}
+            )
+
         elif isinstance(error, (NameError, SyntaxError, AttributeError)):
             return ClassificationError(
                 f"FATAL BUG: {type(error).__name__}: {str(error)}",
@@ -504,7 +625,14 @@ class ErrorHandler:
                 retryable=True,
                 context={'original_context': context, 'operation': operation, **additional_context}
             )
-        
+        elif isinstance(error, (sqlalchemy.exc.DatabaseError, sqlalchemy.exc.DataError)):
+            return ProcessingError(
+                f"Database operation failed: {error_class}: {error_message}",
+                ErrorType.PROCESSING_LOGIC_ERROR,
+                cause=error,
+                retryable=True,  # Database format issues might be retryable
+                context={'original_context': context, 'operation': operation, **additional_context}
+            )        
         else:
             # Generic system error
             return ClassificationError(
@@ -516,8 +644,14 @@ class ErrorHandler:
                 context={'original_context': context, 'operation': operation, **additional_context}
             )
     
+
     def _log_error(self, error: ClassificationError):
         """Log error with appropriate level based on severity"""
+        
+        # Safety check to prevent cascading errors
+        if error is None:
+            self.logger.error("CRITICAL: _log_error received None instead of ClassificationError")
+            return
         
         error_dict = error.to_dict()
         
@@ -529,6 +663,7 @@ class ErrorHandler:
             self.logger.warning("Medium severity error occurred", extra={'error_data': error_dict})
         else:
             self.logger.info("Low severity error occurred", extra={'error_data': error_dict})
+
     
     def get_error_by_id(self, error_id: str) -> Optional[ClassificationError]:
         """Retrieve error by ID from registry (thread-safe)"""

@@ -43,6 +43,7 @@ class Reaper:
                 self.logger.info("Reaper running check for hung tasks...")
                 
                 # Fetch all tasks whose lease has expired
+                self.logger.info(f"DEBUG: Reaper about to Query for expired task")
                 expired_tasks = await self.db.get_expired_task_leases(self.task_timeout)
                 
                 if expired_tasks:
@@ -61,7 +62,8 @@ class Reaper:
                         
                         # Re-queue the task by marking it as failed and retryable.
                         await self.db.fail_task(task.id, is_retryable=True)
-                
+                else:
+                    self.logger.warning("Reaper found 0 expired tasks.")
                 # Update the liveness timestamp to show the coroutine is healthy and not deadlocked.
                 self.orchestrator.update_thread_liveness("reaper")
                 

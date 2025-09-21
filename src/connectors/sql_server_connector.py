@@ -110,46 +110,63 @@ class AsyncSQLServerConnection:
                 self.async_session_factory = None
             except Exception:
                 pass
-    
+ 
+ 
+# src/connectors/sql_server_connector.py -> inside AsyncSQLServerConnection class
+
     def _build_connection_string(self) -> str:
-        """Build async SQL Server connection string with proper encoding."""
+        """
+        Builds a robust, async SQL Server connection string that correctly
+        handles localhost connections by omitting the default port.
+        """
         host = self.connection_config['host']
         port = self.connection_config.get('port', 1433)
-        database = self.connection_config['database']
+        driver = self.connection_config.get('driver', 'ODBC Driver 17 for SQL Server')
+        encoded_driver = quote_plus(driver)
+
+        database = self.connection_config.get('database')
+        if not database:
+            self.logger.info("No specific database provided. Connecting to 'master' to enumerate all databases on the server.")
+            database = 'master'
+
+        # --- FIX IS HERE: Conditionally build the host part ---
+        host_part = host
+        if host.lower() != 'localhost':
+            host_part += f":{port}"
+        # --- END FIX ---
+
+        auth_config = self.connection_config.get('auth', {})
+        tls_config = self.connection_config.get('tls', {})
+        auth_method = auth_config.get('auth_method')
         
-        # Check authentication method
-        if self.connection_config.get('trusted_connection', False):
-            # Windows Authentication
-            driver = self.connection_config.get('driver', 'ODBC Driver 17 for SQL Server')
-            encoded_driver = quote_plus(driver)
+        base_string = ""
+
+        if auth_method == 'windows' or self.connection_config.get('trusted_connection'):
+            base_string = f"mssql+aioodbc://{host_part}/{database}?driver={encoded_driver}&trusted_connection=yes"
+        else: # Assumes standard username/password auth
+            username = self.connection_config.get('username')
+            password = self.connection_config.get('password')
+            if not username or not password:
+                raise ConfigurationError("Username and password are required for standard authentication.")
             
-            # Use async driver
-            connection_string = (
-                f"mssql+aiodbc://{host}:{port}/{database}"
-                f"?driver={encoded_driver}"
-                f"&trusted_connection=yes"
-                f"&TrustServerCertificate=yes"
-            )
-        else:
-            # SQL Server Authentication
-            username = self.connection_config['username']
-            password = self.connection_config['password']
-            driver = self.connection_config.get('driver', 'ODBC Driver 17 for SQL Server')
-            
-            # URL encode components
             encoded_username = quote_plus(username)
             encoded_password = quote_plus(password)
-            encoded_driver = quote_plus(driver)
-            
-            # Use async driver
-            connection_string = (
-                f"mssql+aiodbc://{encoded_username}:{encoded_password}@{host}:{port}/{database}"
-                f"?driver={encoded_driver}"
-                f"&TrustServerCertificate=yes"
-            )
+            base_string = f"mssql+aiodbc://{encoded_username}:{encoded_password}@{host_part}/{database}?driver={encoded_driver}"
+
+        if tls_config.get('trust_server_certificate', False):
+            base_string += "&TrustServerCertificate=yes"
+
+        log_string = base_string
+        if 'password' in self.connection_config:
+            encoded_password_for_redaction = quote_plus(self.connection_config['password'])
+            log_string = log_string.replace(encoded_password_for_redaction, '********')
         
-        return connection_string
-    
+        self.logger.debug(f"Built SQL Server connection string: {log_string}")
+
+        return base_string 
+ 
+ 
+ 
     async def execute_query_async(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """Execute query asynchronously and return results."""
         if not self.async_engine:
@@ -242,7 +259,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                 raise ConfigurationError(
                     "SQL Server connector configuration not found",
                     ErrorType.CONFIGURATION_MISSING,
-                    connector_type="sqlserver"
+                    config_section="sqlserver"
                 )
 
     # =============================================================================
@@ -546,30 +563,53 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
     # Private Async Implementation Methods
     # =================================================================
 
+
+
+
     async def _ensure_connection_async(self, trace_id: str, task_id: int) -> bool:
-        """Ensure async database connection is established."""
+        """
+        Establishes a connection to the target SQL Server, correctly handling
+        different authentication methods as defined in the datasource configuration.
+        """
         try:
             if not self.connection:
-                connection_config = self.datasource_config.configuration.get('connection_config', {})
+                connection_config = self.datasource_config.configuration.get('connection', {})
                 auth_config = connection_config.get('auth', {})
-                
-                # Read the declarative auth_method from the config
                 auth_method = auth_config.get('auth_method')
 
-                # Only fetch credentials if the method is 'standard' or 'ad'
-                if auth_method in ["standard", "ad"]:
-                    credential_id = self.datasource_config.configuration.get("scan_profiles", [{}])[0].get("credential_id")
+                # --- NEW: Conditional logic based on the auth_method ---
+                if auth_method == 'windows':
+                    self.logger.info(f"Connecting to datasource '{self.datasource_id}' using Windows Authentication.")
+                    # For Windows Auth, we tell the connection builder to use a trusted connection.
+                    # No password is required.
+                    connection_config['trusted_connection'] = True
+
+                elif auth_method == 'standard':
+                    self.logger.info(f"Connecting to datasource '{self.datasource_id}' using Standard Authentication.")
+                    # For Standard Auth, we must fetch the password from the credential manager.
+                    scan_profile = self.datasource_config.configuration.get("scan_profiles", [{}])[0]
+                    credential_id = scan_profile.get("credential_id")
+                    
                     if not credential_id:
-                        raise ValueError(f"credential_id is required for '{auth_method}' authentication.")
-                    
-                    await self.db.get_credential_for_datasource(credential_id)
-                    password = await self.credential_manager.get_password_async(credential_record['store_details'])
-                    
-                    # Inject the fetched password into the connection config
-                    auth_config['password'] = password
+                        raise ConfigurationError(f"credential_id is required for 'standard' authentication on datasource '{self.datasource_id}'.")
+
+                    credential_record = await self.db.get_credential_by_id_async(credential_id)
+                    if not credential_record:
+                        raise ValueError(f"Credential '{credential_id}' not found in database.")
+
+                    password = await self.credential_manager.get_password_async(credential_record.store_details)
+
+                    # Inject the fetched credentials into the config for the connection builder.
+                    connection_config['username'] = credential_record.username
+                    connection_config['password'] = password
+                    connection_config['trusted_connection'] = False
+                
+                else:
+                    raise ConfigurationError(f"Unsupported auth_method '{auth_method}' for datasource '{self.datasource_id}'.")
 
                 self.connection = AsyncSQLServerConnection(connection_config, self.logger, self.error_handler)
-                
+            
+            # The AsyncSQLServerConnection will now receive the correct parameters to build the right connection string.
             if not await self.connection.connect_async():
                 return False
             return True
@@ -584,6 +624,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             )
             self.logger.error("Failed to establish async SQL Server connection", error_id=error.error_id)
             return False
+
 
     async def _cleanup_connection_async(self):
         """Clean up async database connection."""
@@ -1160,24 +1201,22 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                 content_type='database/column'
             )
 
+
     async def _switch_database_context_async(self, database_name: str):
-        """Switch connection context to specific database (async)."""
+        """Efficiently switch connection context to a specific database."""
         try:
-            # For async SQL Server, we need to recreate connection with target database
-            if self.connection:
-                current_db = self.connection.connection_config.get('database')
-                if current_db != database_name:
-                    # Update connection config and reconnect
-                    self.connection.connection_config['database'] = database_name
-                    await self.connection.disconnect_async()
-                    await self.connection.connect_async()
-                    
+            if self.connection and self.connection.async_engine:
+                async with self.connection.async_engine.begin() as conn:
+                    await conn.execute(text(f"USE [{database_name}]"))
+                self.logger.debug(f"Switched database context to '{database_name}'.")
         except Exception as e:
             raise NetworkError(
                 f"Failed to switch to database {database_name}: {str(e)}",
                 ErrorType.NETWORK_CONNECTION_FAILED,
                 database_name=database_name
             )
+
+
 
     async def _get_environment_info_async(self) -> Dict[str, Any]:
         """Get or detect SQL Server environment information (async)."""
@@ -1253,9 +1292,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
         """Create DiscoveredObject for table (row processing mode)."""
         object_path = f"{database_name}.{schema_name}.{table_name}"
         
-        # Calculate object key hash
-        key_string = f"{self.datasource_id}|{object_path}|table"
-        hashlib.sha256(key_string.encode()).digest()
+
         
         # Create metadata
         metadata = ObjectMetadata(

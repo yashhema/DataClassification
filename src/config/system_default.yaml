@@ -77,7 +77,7 @@ connector:
 logging:
   # This level is for the CONSOLE
   format: TEXT
-  level: WARNING
+  level: DEBUG
   progress_sampling_rate: 0.1
   
   #  for file logging

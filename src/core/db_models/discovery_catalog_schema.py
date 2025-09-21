@@ -39,9 +39,9 @@ class DiscoveredObject(Base):
     
     # Basic metadata from enumeration
     size_bytes: Mapped[Optional[int]] = mapped_column(Integer)
-    created_date: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    last_modified: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    last_accessed: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    created_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_modified: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_accessed: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
     # System timestamp for when this object was first discovered
     discovery_timestamp: Mapped[datetime] = mapped_column(

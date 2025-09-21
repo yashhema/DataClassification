@@ -11,7 +11,7 @@ import asyncio
 import random
 from typing import TYPE_CHECKING
 from core.db_models.job_schema import JobStatus
-
+from datetime import datetime, timezone, timedelta
 if TYPE_CHECKING:
     from orchestrator.orchestrator import Orchestrator
 
@@ -72,7 +72,18 @@ class JobCompletionMonitor:
         assigned_tasks = stats.get('ASSIGNED', 0)
         pending_tasks = stats.get('PENDING', 0)
         failed_tasks = stats.get('FAILED', 0)
-
+        # --- NEW: Logic to detect and RE-QUEUE orphaned jobs ---
+        if total_tasks == 0 and job.status == JobStatus.RUNNING:
+            time_since_creation = datetime.now(timezone.utc) - job.created_timestamp
+            
+            if time_since_creation > timedelta(minutes=5):
+                self.logger.warning(
+                    f"Job {job.id} has been in RUNNING state for over 5 minutes with zero tasks. Resetting to QUEUED for recovery.",
+                    job_id=job.id
+                )
+                # This is a safe, self-healing action.
+                await self.db.requeue_job(job.id) # A new, dedicated DB method for this is cleanest
+                return
         # Handle PAUSING -> PAUSED transition
         if job.status == JobStatus.PAUSING and assigned_tasks == 0:
             self.logger.info(f"Child Job {job.id} has no more active tasks. Transitioning to PAUSED.", job_id=job.id)

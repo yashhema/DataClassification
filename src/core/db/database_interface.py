@@ -146,6 +146,32 @@ class DatabaseInterface:
         if not self._safe_table_name_pattern.match(table_name):
             raise ValueError(f"Invalid characters in table name: {table_name}")
 
+
+    async def requeue_job(self, job_id: int, context: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Resets a job to the QUEUED state, clearing its ownership and lease.
+        This is a recovery mechanism for orphaned or stalled jobs.
+        """
+        context = context or {}
+        self.logger.log_database_operation("UPDATE", "Jobs", "STARTED", operation_name="requeue_job", job_id=job_id, **context)
+        try:
+            async with self.get_async_session() as session:
+                stmt = update(Job).where(
+                    Job.id == job_id
+                ).values(
+                    status=JobStatus.QUEUED,
+                    orchestrator_id=None,
+                    orchestrator_lease_expiry=None,
+                    lease_warning_count=0,
+                    last_lease_warning_timestamp=None,
+                    version=Job.version + 1 # Increment version to invalidate old leases
+                )
+                await session.execute(stmt)
+                await session.commit()
+                self.logger.log_database_operation("UPDATE", "Jobs", "SUCCESS", operation_name="requeue_job", job_id=job_id, **context)
+        except Exception as e:
+            self.error_handler.handle_error(e, "requeue_job", job_id=job_id, **context)
+            raise
     # =================================================================
     # NEW: Master Job and Summary Management Methods
     # =================================================================
@@ -153,7 +179,7 @@ class DatabaseInterface:
     async def get_master_job_summary(self, master_job_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[MasterJobStateSummary]:
         """Fetches the state summary record for a master job."""
         context = context or {}
-        self.logger.log_database_operation("SELECT", "MasterJobStateSummary", "STARTED", master_job_id=master_job_id, **context)
+        self.logger.log_database_operation("SELECT", "MasterJobStateSummary", "STARTED", master_id=master_job_id, **context)
         try:
             async with self.get_async_session() as session:
                 stmt = select(MasterJobStateSummary).where(MasterJobStateSummary.master_job_id == master_job_id)
@@ -162,7 +188,7 @@ class DatabaseInterface:
                 self.logger.log_database_operation("SELECT", "MasterJobStateSummary", "SUCCESS", found=(summary is not None), **context)
                 return summary
         except Exception as e:
-            self.error_handler.handle_error(e, "get_master_job_summary", master_job_id=master_job_id, **context)
+            self.error_handler.handle_error(e, "get_master_job_summary", master_id=master_job_id, **context)
             raise
 
     async def create_master_job_summary(self, master_job_id: str, total_children: int, context: Optional[Dict[str, Any]] = None) -> None:
@@ -1373,32 +1399,31 @@ class DatabaseInterface:
     # =================================================================
     
 
-    async def update_job_command(self, job_id: int, command: str, context: Optional[Dict[str, Any]] = None) -> bool:
+    async def update_job_command(self, job_id: int, command: Optional[str], context: Optional[Dict[str, Any]] = None) -> bool:
         """
-        Updates the 'master_pending_commands' field for a specific job.
-        This is used by the CLI to issue asynchronous commands.
+        Updates or clears the 'master_pending_commands' field for a specific job.
+        This is used by the CLI to issue commands and by the Orchestrator to clear them.
         """
         context = context or {}
-        self.logger.log_database_operation("UPDATE", "Jobs", "STARTED", operation_name="issue_job_command", job_id=job_id, command=command, **context)
+        self.logger.log_database_operation("UPDATE", "Jobs", "STARTED", operation_name="update_job_command", job_id=job_id, command=command, **context)
         try:
             async with self.get_async_session() as session:
                 stmt = update(Job).where(
                     Job.id == job_id
                 ).values(
                     master_pending_commands=command,
-                    version=Job.version + 1 # Increment version to show a change has occurred
+                    version=Job.version + 1  # Increment version to show a change has occurred
                 )
                 
                 result = await session.execute(stmt)
                 await session.commit()
 
                 was_successful = result.rowcount > 0
-                self.logger.log_database_operation("UPDATE", "Jobs", "SUCCESS" if was_successful else "FAILURE", operation_name="issue_job_command", **context)
+                self.logger.log_database_operation("UPDATE", "Jobs", "SUCCESS" if was_successful else "FAILURE", operation_name="update_job_command", **context)
                 return was_successful
         except Exception as e:
             self.error_handler.handle_error(e, "update_job_command", job_id=job_id, command=command, **context)
             raise
-
 
     async def get_child_jobs_by_master_id(self, master_job_id: str, context: Optional[Dict[str, Any]] = None) -> List[Job]:
         """
@@ -1529,8 +1554,13 @@ class DatabaseInterface:
         self.logger.log_database_operation("UPDATE", "Tasks", "STARTED", operation="fail_task", task_id=task_id, **context)
         try:
             async with self.get_async_session() as session:
-                task = await session.get(Task, task_id)
-                if not task: return
+                # Eagerly fetch the task again within this session to prevent lazy-loading errors.
+                result = await session.execute(select(Task).where(Task.id == task_id))
+                task = result.scalar_one_or_none()
+                
+                if not task:
+                    self.logger.warning(f"Task {task_id} not found, cannot fail it.", task_id=task_id, **context)
+                    return
                 
                 if is_retryable and task.retry_count < max_retries:
                     task.status = TaskStatus.PENDING
@@ -1538,8 +1568,10 @@ class DatabaseInterface:
                     task.lease_expiry = None
                 else:
                     task.status = TaskStatus.FAILED
+                
+                final_status = task.status # Capture status before commit
                 await session.commit()
-                self.logger.log_database_operation("UPDATE", "Tasks", "SUCCESS", operation="fail_task", new_status=task.status.value, **context)
+                self.logger.log_database_operation("UPDATE", "Tasks", "SUCCESS", operation="fail_task", new_status=final_status.value, **context)
         except Exception as e:
             self.error_handler.handle_error(e, context="fail_task", task_id=task_id, **context)
             raise
@@ -1807,7 +1839,7 @@ class DatabaseInterface:
                     )
                 )
                 result = await session.scalars(stmt)
-                result = result.one_or_none()
+                result = result.unique().one_or_none()
                 
                 self.logger.log_database_operation("SELECT", "DataSources", "SUCCESS", operation="get_with_schedule", found=(result is not None), **context)
                 return result

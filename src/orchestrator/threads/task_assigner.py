@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 from orchestrator.orchestrator_state import JobState
 
 from core.db_models.job_schema import JobType
-from core.models.models import TaskType, PolicySelectorPlanPayload, PolicyConfiguration
+from core.models.models import TaskType, PolicySelectorPlanPayload, PolicyConfiguration, WorkPacketHeader, TaskConfig,WorkPacket
 from core.errors import ErrorCategory
 class TaskAssigner:
     """Finds, approves, and dispatches tasks, respecting all system constraints."""
@@ -110,6 +110,7 @@ class TaskAssigner:
                 job_id=job_to_claim.id
             )
             # Update in-memory state
+            self.logger.info(f"[DEBUG] taskassigner about to call _update_job_in_memory_state")
             await self.orchestrator._update_job_in_memory_state(
                 job_id=job_to_claim.id,
                 new_status=JobState.RUNNING,
@@ -122,18 +123,46 @@ class TaskAssigner:
             # --- Type-Aware First Task Creation Logic ---
             #
             if job_to_claim.template_type == JobType.SCANNING:
-                # Create the initial task for a standard SCANNING job
+                # --- FIX STARTS HERE ---
                 datasource_targets = job_to_claim.configuration.get('datasource_targets', [])
-                initial_payload = {
-                    "datasource_ids": [ds['datasource_id'] for ds in datasource_targets],
-                    "staging_table_name": f"staging_discovered_objects_job_{job_to_claim.id}"
+                
+                # A child job is scoped to a single datasource, so we can safely use the first one.
+                datasource_id = datasource_targets[0]['datasource_id'] if datasource_targets else None
+                if not datasource_id:
+                    # If a scanning job has no datasource, it's an unrecoverable configuration error.
+                    error_msg = f"Scanning Job {job_to_claim.id} is missing a datasource_id in its configuration."
+                    self.logger.error(error_msg, job_id=job_to_claim.id)
+                    await self.db.fail_job(job_to_claim.id, error_msg)
+                    return False
+
+                # --- FIX IS HERE ---
+                # Build a full, valid WorkPacket dictionary
+                header = WorkPacketHeader(task_id=0, job_id=job_to_claim.id) # task_id will be populated by DB
+                config = TaskConfig() # Use default config
+                payload = {
+                     "task_type": TaskType.DISCOVERY_ENUMERATE,
+                     "paths": [],
+                     "datasource_id": datasource_id,
+                     "staging_table_name": f"staging_discovered_objects_job_{job_to_claim.id}"
                 }
+                
+                # Create the final dictionary to be stored as JSON
+                full_work_packet_model = WorkPacket(
+                    header=header,
+                    config=config,
+                    payload=payload
+                )
+                # Use Pydantic's model_dump method to get a clean JSON string,
+                
+                import json
+                work_packet_dict = full_work_packet_model.model_dump(mode='json')
                 await self.db.create_task(
                     job_id=job_to_claim.id,
                     task_type=TaskType.DISCOVERY_ENUMERATE,
-                    work_packet={"payload": initial_payload}
+                    work_packet=work_packet_dict, # Pass the complete structure
+                    datasource_id=datasource_id
                 )
-            
+                # --- FIX ENDS HERE ---            
             elif job_to_claim.template_type == JobType.POLICY:
                 # Create the initial task for a POLICY job
                 # The first step in a policy workflow is to plan the selection.
@@ -164,88 +193,63 @@ class TaskAssigner:
         return False
 
 
+
+
     async def _find_and_approve_task(self):
         """
-        Finds a runnable job, verifies its lease, gets a pending task, 
+        Finds a runnable job, gets a pending task from its cache, 
         and reserves resources for it.
         """
-        
-        # 1. Select the best job to work on from the currently owned jobs.
+        # This function now correctly identifies a job and ensures its cache is full.
         job_to_run = await self._select_next_job_to_process()
         
         if not job_to_run: 
-            return None # No runnable jobs with pending tasks are owned by this orchestrator
+            return None # No runnable jobs were found or could be initialized.
 
-        # 2. VERIFY LEASE: Check the in-memory lease before proceeding.
-        async with self.orchestrator._state_lock:
-            job_state_info = self.orchestrator.job_states.get(job_to_run.id)
-            # FIXED: Access lease_expiry from the unified state dictionary
-            if not job_state_info or job_state_info.get('lease_expiry') < datetime.now(timezone.utc):
-                self.logger.warning(
-                    f"In-memory lease expired for job {job_to_run.id}. Triggering renewal process.", 
-                    job_id=job_to_run.id
-                )
-                # Abort this attempt. The heartbeat/renewal process will handle re-acquiring the lease.
-                return None
-
-        # 3. Get a task from that job's cache (using orchestrator's unified cache).
+        # --- FIX STARTS HERE ---
+        # The cache for job_to_run should have been refilled by the selection logic.
+        # Now, we simply get a task from it.
         task = self._get_task_from_cache(job_to_run.id)
         
         if not task:
-            # This is normal; it just means the cache is empty and needs to be refilled.
-            await self._refill_task_cache_for_job(job_to_run.id)
+            # This can happen if the refill found no PENDING tasks for the job.
+            # The job might be finishing up. This is a normal condition.
             return None
 
-        # 4. Reserve resources for this specific task (the final gatekeeper step).
-        # FIXED: Use task.datasource_id instead of task.DatasourceID
-        decision = await self.rc.reserve_resources_for_task(task.datasource_id)
+        # Verify the lease one last time before dispatching.
+        async with self.orchestrator._state_lock:
+            job_state_info = self.orchestrator.job_states.get(job_to_run.id)
+            if not job_state_info or job_state_info.get('lease_expiry') < datetime.now(timezone.utc):
+                self.logger.warning(f"In-memory lease expired for job {job_to_run.id} just before task dispatch.", job_id=job_to_run.id)
+                self.orchestrator.job_cache[job_to_run.id].appendleft(task) # Put task back
+                return None
+
+        # Now proceed with resource reservation as before.
+        datasource_id_to_check = task.datasource_id
+        if not datasource_id_to_check:
+            try:
+                datasource_id_to_check = task.work_packet['payload']['datasource_ids'][0]
+            except (KeyError, IndexError):
+                datasource_id_to_check = None
         
-        if decision.is_approved:
+        decision_approved = False
+        decision_reason = "No datasource-specific resources required."
+
+        if datasource_id_to_check:
+            decision = await self.rc.reserve_resources_for_task(datasource_id_to_check)
+            decision_approved = decision.is_approved
+            decision_reason = decision.reason
+        else:
+            decision_approved = True
+
+        if decision_approved:
             return task
         else:
-            # If denied, put the task back at the front of the queue and snooze the job.
-            self.orchestrator.job_cache[job_to_run.id].appendleft(task)
+            self.orchestrator.job_cache[job_to_run.id].appendleft(task) # Put task back
             async with self.orchestrator._state_lock:
-                self.orchestrator.snoozed_jobs[job_to_run.id] = time.monotonic() + decision.snooze_duration_sec
-            self.logger.info(f"Snoozing job {job_to_run.id}: {decision.reason}", job_id=job_to_run.id)
+                self.orchestrator.snoozed_jobs[job_to_run.id] = time.monotonic() + 60
+            self.logger.info(f"Snoozing job {job_to_run.id}: {decision_reason}", job_id=job_to_run.id)
             return None
-
-    async def _select_next_job_to_process(self):
-        """
-        Selects the best job to assign a task from, based on priority and fairness.
-        If no currently owned jobs have tasks, it attempts to claim and initialize a new one.
-        """
-        async with self.orchestrator._state_lock:
-            now = time.monotonic()
-            # Get a list of all job IDs this orchestrator owns that are in a runnable state and not snoozed
-            owned_job_ids = [
-                job_id for job_id, state in self.orchestrator.job_states.items()
-                if state.get('status') == JobState.RUNNING and self.orchestrator.snoozed_jobs.get(job_id, 0) < now
-            ]
-        
-        # If we don't own any runnable jobs, try to claim a new one
-        if not owned_job_ids:
-            await self._claim_and_initialize_new_job()
-            return None # Return None to allow the main loop to cycle
-
-        # Fetch the full job objects from the DB to get priority and other details
-        active_jobs = await self.db.get_jobs_by_ids(owned_job_ids)
-        
-        # Filter for jobs that currently have tasks in their in-memory cache
-        jobs_with_tasks = [job for job in active_jobs if job.id in self.orchestrator.job_cache and self.orchestrator.job_cache[job.id]] 
-        
-        #
-        # --- Main Selection Logic ---
-        #
-        if jobs_with_tasks:
-            # If we have jobs with ready tasks, use the Resource Coordinator's fairness
-            # logic to pick the best one to process next.
-            return self.rc.get_next_job_for_assignment(jobs_with_tasks) 
-        else:
-            # If none of our currently owned jobs have tasks in their cache,
-            # it's an opportune moment to check for new work.
-            await self._claim_and_initialize_new_job()
-            return None # Return None to allow the main loop to cycle
 
     def _get_task_from_cache(self, job_id: int):
         """Gets a single task from the orchestrator's unified cache for a given job."""
@@ -277,14 +281,83 @@ class TaskAssigner:
         
         if was_assigned:
             # FIXED: Use task.job_id instead of task.JobID
-            self.rc.confirm_task_assignment(task.job_id)
+            self.rc.state_manager.confirm_task_assignment(task.job_id)
             self.logger.info(f"Task {task.id} successfully assigned.", task_id=task.id)
             
             if self.orchestrator.is_single_process_mode:
+                if self.orchestrator._in_process_work_queue is None:
+                    self.logger.error("In-process work queue is None in single_process mode!")
+                    return                
                 await self.orchestrator._in_process_work_queue.put(task)
             # In EKS mode, the worker would have already received the task via the API,
             # and this DB update confirms the assignment.
         else:
             self.logger.warning(f"DB assignment for task {task.id} failed (race condition). Releasing reservation.", task_id=task.id)
-            # FIXED: Use task.datasource_id instead of task.DatasourceID
-            self.rc.release_task_reservation(task.datasource_id)
+            # In a real system, you would need to check if task.datasource_id exists
+            if hasattr(task, 'datasource_id') and task.datasource_id:
+                self.rc.state_manager.release_task_reservation(task.datasource_id)
+
+
+
+    async def _select_next_job_to_process(self):
+        """
+        Selects the best job to assign a task from using a capacity-aware,
+        pull-based model with consolidated state locking for efficiency.
+        """
+        # STEP 1: Consolidate state access into a single lock acquisition.
+        async with self.orchestrator._state_lock:
+            now = time.monotonic()
+            
+            # Get the current list of owned, runnable jobs.
+            owned_job_ids = [
+                job_id for job_id, state in self.orchestrator.job_states.items()
+                if state.get('status') == JobState.RUNNING and self.orchestrator.snoozed_jobs.get(job_id, 0) < now
+            ]
+            
+            # Calculate the current workload based on tasks already in memory.
+            current_workload = sum(len(cache) for job_id, cache in self.orchestrator.job_cache.items() if job_id in owned_job_ids)
+            
+            # Define the capacity threshold.
+            workload_threshold = self.settings.orchestrator.task_cache_size * 2
+
+        # STEP 2: Decide whether to claim a new job based on capacity.
+        job_was_claimed = False
+        if not owned_job_ids or current_workload < workload_threshold:
+            # The method returns True if a new job was successfully claimed and initialized.
+            job_was_claimed = await self._claim_and_initialize_new_job()
+
+        # STEP 3: If a new job was claimed, we must refresh our view of owned jobs.
+        if job_was_claimed:
+            async with self.orchestrator._state_lock:
+                owned_job_ids = [
+                    job_id for job_id, state in self.orchestrator.job_states.items()
+                    if state.get('status') == JobState.RUNNING
+                ]
+
+        if not owned_job_ids:
+            return None # No work to do.
+
+        active_jobs = await self.db.get_jobs_by_ids(owned_job_ids)
+        if not active_jobs:
+            return None
+            
+        # STEP 4: Refill ALL empty caches in parallel.
+        refill_coroutines = []
+        for job in active_jobs:
+            # Check if cache is missing or empty.
+            if not self.orchestrator.job_cache.get(job.id):
+                refill_coroutines.append(self._refill_task_cache_for_job(job.id))
+        
+        if refill_coroutines:
+            self.logger.info(f"Refilling task caches for {len(refill_coroutines)} jobs in parallel.")
+            await asyncio.gather(*refill_coroutines)
+
+        # STEP 5: With caches now full, select the next task fairly.
+        jobs_with_tasks_in_cache = [
+            job for job in active_jobs if self.orchestrator.job_cache.get(job.id)
+        ]
+
+        if jobs_with_tasks_in_cache:
+            return self.rc.get_next_job_for_assignment(jobs_with_tasks_in_cache)
+
+        return None    

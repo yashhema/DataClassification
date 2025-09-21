@@ -10,6 +10,7 @@ import logging
 import signal
 import sys
 import os
+import sqlalchemy
 # --- ADD THESE THREE LINES ---
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -129,7 +130,7 @@ async def create_system_components(settings, logger, error_handler, config_manag
 async def run_single_process_mode(orchestrator: Orchestrator, workers: List[Worker], logger, base_log_context):
     logger.info("Starting single-process mode...", **base_log_context)
     tasks = []
-    tasks.append(asyncio.create_task(orchestrator.start_async(queue.Queue()), name="orchestrator"))
+    tasks.append(asyncio.create_task(orchestrator.start_async(asyncio.Queue()), name="orchestrator"))
     for i, worker in enumerate(workers):
         tasks.append(asyncio.create_task(worker.start_async(), name=f"worker_{i}"))
     

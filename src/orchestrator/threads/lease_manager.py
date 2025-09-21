@@ -82,20 +82,21 @@ class LeaseManager:
                     continue
 
                 # A single atomic call to renew the lease AND process any command.
+                self.logger.info(f"[DEBUG] LeaseManager about to renew lease for job {job_id}")
                 result: LeaseRenewalResult = await self.db.renew_lease_and_process_command(
                     job_id=job_id,
                     orchestrator_id=self.orchestrator.instance_id,
                     current_version=current_version,
                     lease_duration_sec=self.lease_duration_sec
                 )
-
+                self.logger.info(f"[DEBUG] LeaseManager result: {result.outcome if result else 'None'}")
                 # Process the structured result
                 if result.outcome == "SUCCESS":
                     new_expiry = datetime.now(timezone.utc) + timedelta(seconds=self.lease_duration_sec)
                     
                     # Use the safe mapping function to convert the DB status to the in-memory state
                     new_in_memory_state = map_db_status_to_memory_state(result.new_status)
-                    
+                    self.logger.info(f"[DEBUG] lease_manager about to call _update_job_in_memory_state")
                     await self.orchestrator._update_job_in_memory_state(
                         job_id=job_id,
                         new_status=new_in_memory_state,

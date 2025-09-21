@@ -18,7 +18,7 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List, NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
+import asyncio
 from core.logging.system_logger import SystemLogger
 from core.config.configuration_manager import SystemConfig
 from core.db.database_interface import DatabaseInterface
@@ -240,14 +240,14 @@ class ResourceCoordinator:
     def get_next_job_for_assignment(self, active_jobs: List[Job]) -> Optional[Job]:
         if not active_jobs: return None
         highest_priority = min(j.priority for j in active_jobs)
-        top_priority_jobs = sorted([j for j in active_jobs if j.priority == highest_priority], key=lambda j: j.name)
+        top_priority_jobs = sorted([j for j in active_jobs if j.priority == highest_priority], key=lambda j: j.execution_id)
         job_ids_str = [str(j.id) for j in top_priority_jobs]
         counts_map = self.state_manager.get_worker_counts_for_jobs(job_ids_str)
         chosen_job = min(top_priority_jobs, key=lambda j: counts_map.get(str(j.id), 0))
         return chosen_job
 
-    def reserve_resources_for_task(self, datasource_id: str) -> ResourceDecision:
-        datasource = self.db.get_datasource_with_schedule(datasource_id)
+    async def reserve_resources_for_task(self, datasource_id: str) -> ResourceDecision:
+        datasource = await self.db.get_datasource_with_schedule(datasource_id)
         if not datasource:
             return ResourceDecision(False, f"Datasource {datasource_id} not found.")
         

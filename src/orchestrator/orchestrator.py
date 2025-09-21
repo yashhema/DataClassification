@@ -27,9 +27,20 @@ from .healthcheck import HealthCheck
 from .threads.master_job_monitor import MasterJobMonitor
 from queue import Empty
 from .threads.summary_reconciler import SummaryReconciler
+from orchestrator.orchestrator_state import map_db_status_to_memory_state
 class Orchestrator:
     """Manages the lifecycle of jobs and tasks for a specific NodeGroup."""
+    @property
+    def _in_process_work_queue(self):
+        return self.__in_process_work_queue
 
+    @_in_process_work_queue.setter  
+    def _in_process_work_queue(self, value):
+        if value is None and hasattr(self, '__in_process_work_queue') and self.__in_process_work_queue is not None:
+            self.logger.warning("QUEUE SET TO NONE - this shouldn't happen!")
+            import traceback
+            traceback.print_stack()
+        self.__in_process_work_queue = value
     VALID_TRANSITIONS = {
         JobState.QUEUED: [JobState.RUNNING, JobState.CANCELLED],
         JobState.RUNNING: [JobState.PAUSING, JobState.CANCELLING, JobState.COMPLETED, JobState.FAILED],
@@ -116,22 +127,12 @@ class Orchestrator:
             
             await self._recover_owned_jobs_on_startup_async()
 
-            coroutines_to_start = [
-                self.task_assigner.run_async(),
-                self.reaper.run_async(),
-                self.job_reaper.run_async(),
-                self.lease_manager.run_async(),
-                self.pipeliner.run_async(),
-                self.job_monitor.run_async(),
-            ]
+            
             
             # Conditionally add central coroutines to the startup list
-            if self.master_job_monitor:
-                coroutines_to_start.append(self.master_job_monitor.run_async())
-            if self.summary_reconciler:
-                coroutines_to_start.append(self.summary_reconciler.run_async())
+
             
-            self._background_tasks = [asyncio.create_task(coro) for coro in coroutines_to_start]
+
             
             self.logger.log_component_lifecycle("Orchestrator", "ALL_ASYNC_COROUTINES_STARTED")
             self.logger.log_component_lifecycle("Orchestrator", "VALIDATING AND STARTING SUPERVISED COROUTINES")
@@ -151,6 +152,16 @@ class Orchestrator:
                 await self.task_manager.start_supervised_task("Pipeliner", self.pipeliner.run_async, is_essential=False)
                 await self.task_manager.start_supervised_task("JobMonitor", self.job_monitor.run_async, is_essential=False)
                 await self.task_manager.start_supervised_task("HealthCheck", self.health_check.run_async, is_essential=True)
+                # ---  BLOCK TO CORRECTLY START CENTRAL COMPONENTS ---
+                if self.master_job_monitor:
+                    self.logger.info("Starting central manager task: MasterJobMonitor")
+                    await self.task_manager.start_supervised_task("MasterJobMonitor", self.master_job_monitor.run_async, is_essential=False)
+                if self.summary_reconciler:
+                    self.logger.info("Starting central manager task: SummaryReconciler")
+                    await self.task_manager.start_supervised_task("SummaryReconciler", self.summary_reconciler.run_async, is_essential=False)
+                # ----------------------------------------------------------------
+
+
             except RuntimeError as e:
                 self.logger.critical(f"A critical component failed its startup validation: {e}", exc_info=True)
                 await self.emergency_shutdown(f"Critical component startup failure: {e}")
@@ -210,23 +221,62 @@ class Orchestrator:
 
 
     async def handle_job_command_async(self, job, command: str):
-        """Dispatches a command from the CLI to the appropriate handler."""
-        command = command.upper()
-        self.logger.info(f"Orchestrator received command '{command}' for job {job.id}", job_id=job.id)
-        
-        if command == "PAUSE":
-            await self._handle_pause_command_async(job)
-        elif command == "CANCEL":
-            await self._handle_cancel_command_async(job)
-        elif command == "RESUME":
-            await self._handle_resume_command_async(job)
-        elif command == "START":
-            # If we see a START command, the job is already running.
-            # We just need to acknowledge and clear the command from the database.
-            # This call will clear the command field while keeping the status the same.
-            await self.db.acknowledge_and_update_job_status(job.id, job.status)        
-        else:
-            self.logger.warning(f"Unknown command '{command}' received for job {job.id}", job_id=job.id)
+            """
+            Dispatches a command from the CLI to the appropriate handler, now with
+            idempotent logic to prevent race conditions from stale commands.
+            """
+            command = command.upper()
+            self.logger.info(f"Orchestrator received command '{command}' for job {job.id} in state '{job.status.value}'", job_id=job.id)
+            
+            # --- Idempotent Command Handling Logic ---
+
+            if command == "PAUSE":
+                # Only pause a running job. If it's already pausing, paused, or cancelled, just clear the command.
+                if job.status == JobStatus.RUNNING:
+                    await self.db.acknowledge_and_update_job_status(job.id, JobStatus.PAUSING)
+                    self.logger.info(f"[DEBUG] handle_job_command_async:pause about to call _update_job_in_memory_state")
+                    await self._update_job_in_memory_state(job.id, JobState.PAUSING)
+                else:
+                    self.logger.info(f"Ignoring stale PAUSE command for job {job.id}; status is '{job.status.value}'. Clearing command.", job_id=job.id)
+                    await self.db.update_job_command(job.id, None)
+
+            elif command == "CANCEL":
+                # A job can be cancelled from almost any state, unless it's already terminal.
+                if job.status not in [JobStatus.CANCELLED, JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.COMPLETED_WITH_FAILURES]:
+                    cancelled_count = await self.db.cancel_pending_tasks_for_job(job.id)
+                    self.logger.info(f"Cancelled {cancelled_count} pending tasks for job {job.id}.", job_id=job.id)
+                    await self.db.acknowledge_and_update_job_status(job.id, JobStatus.CANCELLING)
+                    self.logger.info(f"[DEBUG] handle_job_command_async:CANCEL about to call _update_job_in_memory_state")
+
+                    await self._update_job_in_memory_state(job.id, JobState.CANCELLING)
+                else:
+                    self.logger.info(f"Ignoring stale CANCEL command for job {job.id}; status is '{job.status.value}'. Clearing command.", job_id=job.id)
+                    await self.db.update_job_command(job.id, None)
+
+            elif command == "RESUME":
+                # Only resume a paused job.
+                if job.status == JobStatus.PAUSED:
+                    await self.db.acknowledge_and_update_job_status(job.id, JobStatus.RUNNING)
+                    self.logger.info(f"[DEBUG] handle_job_command_async:RESUME about to call _update_job_in_memory_state")
+
+                    await self._update_job_in_memory_state(job.id, JobState.RUNNING)
+                else:
+                    self.logger.info(f"Ignoring stale RESUME command for job {job.id}; status is '{job.status.value}'. Clearing command.", job_id=job.id)
+                    await self.db.update_job_command(job.id, None)
+
+            elif command == "START":
+                # The job has been seen. The command has served its purpose.
+                # We can always safely clear it, regardless of the job's current state.
+                # This prevents the RUNNING -> RUNNING transition and resolves the race condition.
+                self.logger.info(f"Acknowledging and clearing START command for job {job.id}.", job_id=job.id)
+                await self.db.update_job_command(job.id, None)
+
+            
+            else:
+                self.logger.warning(f"Unknown command '{command}' received for job {job.id}", job_id=job.id)
+                # Safely clear the unknown command as well
+                await self.db.update_job_command(job.id, None)
+
 
     async def _handle_pause_command_async(self, job):
         """Transitions a job to the PAUSING state."""
@@ -261,10 +311,26 @@ class Orchestrator:
         await self._update_job_in_memory_state(job.id, JobState.RUNNING)
 
 
-
-
-
     async def get_task_async(self, worker_id: str) -> Optional[Dict[str, Any]]:
+        # Change from:
+        self.logger.info(f"In get_task_async")
+        if self._in_process_work_queue.qsize() == 0:
+            return None
+
+        try:
+            self.logger.info(f"Queue has task, get_task_async")
+            task = await asyncio.wait_for(self._in_process_work_queue.get(), timeout=0.1)
+            work_packet_dict = task.work_packet
+            self.logger.info(f"Dequeued task {task.id} for worker {worker_id}")
+            return work_packet_dict            
+        except asyncio.TimeoutError:
+            self.logger.info(f"Queue gave timeout error")
+            return None
+        except Exception as e:
+            self.error_handler.handle_error(e, "get_task_async")
+            return None
+
+    async def get_task_async_NotToUseForNow(self, worker_id: str) -> Optional[Dict[str, Any]]:
         if not self.is_single_process_mode:
             return None
         
@@ -275,7 +341,7 @@ class Orchestrator:
         try:
             task = self._in_process_work_queue.get_nowait()
             work_packet_dict = task.work_packet
-            self.logger.info(f"Dequeued task {work_packet_dict['header']['task_id']} for worker {worker_id}")
+            self.logger.info(f"Dequeued task {task.id} for worker {worker_id}")
             return work_packet_dict
         except Empty:  # Handle race condition where queue became empty
             return None
@@ -306,7 +372,7 @@ class Orchestrator:
         try:
             # The session manager ensures the DB operations are atomic
             async with self.db.get_async_session() as session:
-                task = await self.db.get_task_by_id(task_id, session=session, context=context)
+                task = await self.db.get_task_by_id(task_id, context=context)
                 if not task:
                     self.logger.warning("Received result for an unknown or already processed task.", task_id=task_id)
                     return
@@ -389,12 +455,20 @@ class Orchestrator:
 
     def _validate_state_transition(self, job_id: int, from_state: JobState, to_state: JobState) -> bool:
         """Validates if a job state transition is allowed."""
+        if from_state == to_state:
+            return True # A transition to the same state is always valid.
+
         valid_targets = self.VALID_TRANSITIONS.get(from_state, [])
         if to_state not in valid_targets:
+            # DEBUGGING: Capture who is calling this
+            import traceback
+            call_stack = ''.join(traceback.format_stack())
+            
             self.logger.warning(
                 f"Invalid state transition for job {job_id}: {from_state.value} -> {to_state.value}",
                 job_id=job_id
             )
+            self.logger.warning(f"Call stack for invalid transition:\n{call_stack}")
             return False
         return True
 
@@ -404,6 +478,12 @@ class Orchestrator:
                                           is_new: bool = False):
         """The single, thread-safe method for updating a job's in-memory state."""
         async with self._state_lock:
+            # DEBUGGING: Log who is calling this method
+            import traceback
+            caller_info = traceback.format_stack()[-2].strip()
+            self.logger.debug(f"[DEBUG] _update_job_in_memory_state called by: {caller_info}")
+            self.logger.debug(f"[DEBUG] Parameters: job_id={job_id}, new_status={new_status}, is_new={is_new}")
+            
             current_state_info = self.job_states.get(job_id, {})
             current_status = current_state_info.get("status")
 
@@ -452,12 +532,15 @@ class Orchestrator:
                     lease_duration_sec=lease_duration_sec
                 )
                 if was_renewed:
+                    # FIXED: Actually map the job's current status
+                    target_memory_state = map_db_status_to_memory_state(job.status)
+                    
                     await self._update_job_in_memory_state(
                         job_id=job.id,
-                        new_status=JobState.RUNNING,
+                        new_status=target_memory_state,  # Always provide the actual status
                         version=job.version + 1,
                         lease_expiry=datetime.now(timezone.utc) + timedelta(seconds=lease_duration_sec),
-                        is_new=True
+                        is_new=True  # This should bypass state transition validation
                     )
                     self.logger.info(f"Successfully reclaimed ownership of job {job.id}.", job_id=job.id)
                 else:
