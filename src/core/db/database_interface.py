@@ -696,7 +696,6 @@ class DatabaseInterface:
             raise
 
 
-
     async def upsert_object_metadata(
         self,
         records: List[Dict[str, Any]],
@@ -704,8 +703,7 @@ class DatabaseInterface:
     ) -> None:
         """
         Performs a bulk-safe "upsert" on the ObjectMetadata table. It either inserts
-        new records or updates existing ones, atomically appending to the action history if provided.
-        This is the primary method for adding and updating object master records.
+        new records or updates existing ones using object_key_hash as the primary key.
         """
         context = context or {}
         if not records:
@@ -719,17 +717,15 @@ class DatabaseInterface:
                 # for a highly efficient and atomic bulk upsert operation.
                 stmt = pg_insert(ObjectMetadata).values(records)
                 
-                # Define what to do if the ObjectKeyHash already exists
+                # Define what to do if the object_key_hash already exists
                 update_dict = {
                     col.name: getattr(stmt.excluded, col.name)
                     for col in ObjectMetadata.__table__.columns
                     if not col.primary_key
                 }
-                # Special handling to append to the ActionHistory JSON array
-                update_dict["ActionHistory"] = ObjectMetadata.action_history.op('||')(stmt.excluded.action_history)
 
                 stmt = stmt.on_conflict_do_update(
-                    index_elements=['ObjectKeyHash'],
+                    index_elements=['object_key_hash'],  # Changed: Use hash-based primary key
                     set_=update_dict
                 )
                 
@@ -742,10 +738,12 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, "upsert_object_metadata", record_count=len(records), **context)
             raise
 
+
     async def reconcile_remediation_updates(self, updates: List[Dict[str, Any]], context: Optional[Dict[str, Any]] = None) -> None:
         """
         Performs a bulk update on the ObjectMetadata table to reflect the
-        outcome of a remediation action (e.g., updating paths after a move).
+        outcome of a remediation action (e.g., updating paths after a move)
+        using object_key_hash as the primary key identifier.
         """
         context = context or {}
         if not updates:
@@ -754,9 +752,9 @@ class DatabaseInterface:
         self.logger.log_database_operation("BULK_UPDATE", "ObjectMetadata", "STARTED", operation="reconcile", update_count=len(updates), **context)
         try:
             async with self.get_async_session() as session:
-                # bulk_update_mappings is perfect for this.
+                # bulk_update_mappings using object_key_hash as the primary key identifier
                 # 'updates' should be a list of dicts, e.g.:
-                # [{"ObjectKeyHash": b'...', "MovedPath": "/new/path/file.txt", "IsAvailable": True}]
+                # [{"object_key_hash": b'...', "detailed_metadata": {...}, "metadata_fetch_timestamp": datetime}]
                 await session.run_sync(lambda sync_session: sync_session.bulk_update_mappings(ObjectMetadata, updates))
                 await session.commit()
             
@@ -765,7 +763,6 @@ class DatabaseInterface:
         except Exception as e:
             self.error_handler.handle_error(e, "reconcile_remediation_updates", update_count=len(updates), **context)
             raise
-
 
 # To be added to: src/core/db/database_interface.py
 
@@ -1045,9 +1042,8 @@ class DatabaseInterface:
                                           connector_type=connector_type, **context)
             raise
 
-
     async def insert_scan_findings(self, findings: List[Dict[str, Any]], context: Optional[Dict[str, Any]] = None) -> int:
-        """Insert scan findings into the findings tables."""
+        """Insert scan findings into the findings tables using hash-based primary keys."""
         context = context or {}
         if not findings:
             return 0
@@ -1056,23 +1052,27 @@ class DatabaseInterface:
                                          record_count=len(findings), **context)
         try:
             async with self.get_async_session() as session:
-                # Convert findings to ORM format
+                # Convert findings to ORM format with hash-based primary keys
                 summaries = []
                 for finding in findings:
-                    # Create finding key hash
+                    # Create finding key hash - this becomes the primary key
                     import hashlib
                     key_components = [
                         finding.get('scan_job_id', ''),
                         finding.get('datasource_id', ''),
                         finding.get('classifier_id', ''),
-                        finding.get('object_path', ''),
-                        finding.get('field_name', '')
+                        finding.get('entity_type', ''),
+                        finding.get('schema_name', '') or '',
+                        finding.get('table_name', '') or '',
+                        finding.get('field_name', '') or '',
+                        finding.get('file_path', '') or '',
+                        finding.get('file_name', '') or ''
                     ]
                     key_string = '|'.join(str(comp) for comp in key_components)
                     finding_key_hash = hashlib.sha256(key_string.encode()).digest()
                     
                     summary = {
-                        'finding_key_hash': finding_key_hash,
+                        'finding_key_hash': finding_key_hash,  # Primary key
                         'scan_job_id': finding.get('scan_job_id'),
                         'data_source_id': finding.get('datasource_id'),
                         'classifier_id': finding.get('classifier_id'),
@@ -1092,7 +1092,7 @@ class DatabaseInterface:
                     }
                     summaries.append(summary)
                 
-                # Bulk insert summaries
+                # Bulk insert summaries using hash-based primary keys
                 await session.run_sync(lambda sync_session: sync_session.bulk_insert_mappings(ScanFindingSummary, summaries))
                 await session.commit()
                 
@@ -1105,18 +1105,19 @@ class DatabaseInterface:
                                           finding_count=len(findings), **context)
             raise
 
-    async def get_objects_for_classification(self, object_ids: List[str], context: Optional[Dict[str, Any]] = None) -> List[OrmDiscoveredObject]:
-        """Get discovered objects by their IDs for classification."""
+
+    async def get_objects_for_classification(self, object_key_hashes: List[bytes], context: Optional[Dict[str, Any]] = None) -> List[OrmDiscoveredObject]:
+        """Get discovered objects by their key hashes for classification."""
         context = context or {}
-        if not object_ids:
+        if not object_key_hashes:
             return []
             
         self.logger.log_database_operation("SELECT", "DiscoveredObjects", "STARTED", 
                                          operation="get_for_classification", 
-                                         object_count=len(object_ids), **context)
+                                         object_count=len(object_key_hashes), **context)
         try:
             async with self.get_async_session() as session:
-                stmt = select(OrmDiscoveredObject).where(OrmDiscoveredObject.id.in_(object_ids))
+                stmt = select(OrmDiscoveredObject).where(OrmDiscoveredObject.object_key_hash.in_(object_key_hashes))
                 result = await session.scalars(stmt)
                 results = list(result.all())
                 
@@ -1126,25 +1127,25 @@ class DatabaseInterface:
                 return results
         except Exception as e:
             self.error_handler.handle_error(e, context="get_objects_for_classification", 
-                                          object_count=len(object_ids), **context)
+                                          object_count=len(object_key_hashes), **context)
             raise
 
-    async def update_classification_timestamps(self, object_ids: List[int], context: Optional[Dict[str, Any]] = None) -> None:
-        """Update classification timestamps for objects."""
+    async def update_classification_timestamps(self, object_key_hashes: List[bytes], context: Optional[Dict[str, Any]] = None) -> None:
+        """Update classification timestamps for objects using their key hashes."""
         context = context or {}
-        if not object_ids:
+        if not object_key_hashes:
             return
             
         self.logger.log_database_operation("UPDATE", "DiscoveredObjectClassificationDateInfo", "STARTED", 
                                          operation="update_timestamps", 
-                                         object_count=len(object_ids), **context)
+                                         object_count=len(object_key_hashes), **context)
         try:
             async with self.get_async_session() as session:
                 current_time = datetime.now(timezone.utc)
                 
-                # Update existing records
+                # Update existing records using object_key_hash as primary key
                 stmt = update(DiscoveredObjectClassificationDateInfo).where(
-                    DiscoveredObjectClassificationDateInfo.object_id.in_(object_ids)
+                    DiscoveredObjectClassificationDateInfo.object_key_hash.in_(object_key_hashes)
                 ).values(last_classification_date=current_time)
                 
                 result = await session.execute(stmt)
@@ -1152,19 +1153,19 @@ class DatabaseInterface:
                 
                 # Insert records for objects that don't have classification info yet
                 existing_result = await session.scalars(
-                    select(DiscoveredObjectClassificationDateInfo.object_id)
-                    .where(DiscoveredObjectClassificationDateInfo.object_id.in_(object_ids))
+                    select(DiscoveredObjectClassificationDateInfo.object_key_hash)
+                    .where(DiscoveredObjectClassificationDateInfo.object_key_hash.in_(object_key_hashes))
                 )
-                existing_ids = list(existing_result.all())
+                existing_hashes = set(existing_result.all())
                 
-                new_ids = set(object_ids) - set(existing_ids)
-                if new_ids:
+                new_hashes = set(object_key_hashes) - existing_hashes
+                if new_hashes:
                     new_records = [
                         {
-                            'object_id': obj_id,
+                            'object_key_hash': obj_hash,
                             'last_classification_date': current_time
                         }
-                        for obj_id in new_ids
+                        for obj_hash in new_hashes
                     ]
                     await session.run_sync(lambda sync_session: sync_session.bulk_insert_mappings(DiscoveredObjectClassificationDateInfo, new_records))
                 
@@ -1173,13 +1174,12 @@ class DatabaseInterface:
                 self.logger.log_database_operation("UPDATE", "DiscoveredObjectClassificationDateInfo", "SUCCESS", 
                                                  operation="update_timestamps", 
                                                  updated_count=updated_count,
-                                                 inserted_count=len(new_ids) if new_ids else 0, **context)
+                                                 inserted_count=len(new_hashes) if new_hashes else 0, **context)
                 
         except Exception as e:
             self.error_handler.handle_error(e, context="update_classification_timestamps", 
-                                          object_count=len(object_ids), **context)
+                                          object_count=len(object_key_hashes), **context)
             raise
-
 
     async def get_objects_by_datasource(self, datasource_id: str, limit: int = 1000, 
                                 context: Optional[Dict[str, Any]] = None) -> List[OrmDiscoveredObject]:
@@ -1210,22 +1210,21 @@ class DatabaseInterface:
             raise
 
     async def insert_discovered_object_batch(self, objects: List[Dict[str, Any]], 
-                                     staging_table_name: str,
-                                     context: Optional[Dict[str, Any]] = None) -> int:
-        """Insert batch of discovered objects into staging table."""
+                                         staging_table_name: str,
+                                         context: Optional[Dict[str, Any]] = None) -> int:
+        """Upsert batch of discovered objects into staging table using SQL Server MERGE."""
         context = context or {}
         if not objects:
             return 0
             
         self._validate_table_name(staging_table_name)
-        self.logger.log_database_operation("BULK INSERT", staging_table_name, "STARTED", 
+        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "STARTED", 
                                          record_count=len(objects), **context)
         try:
             async with self.get_async_session() as session:
-                # Convert objects to proper format with hash calculation
+                # Process objects same as before
                 processed_objects = []
                 for obj in objects:
-                    # Calculate object key hash
                     import hashlib
                     key_components = [
                         obj.get('data_source_id', ''),
@@ -1248,20 +1247,57 @@ class DatabaseInterface:
                     }
                     processed_objects.append(processed_obj)
                 
-                # Insert into staging table using raw SQL for performance
-                def sync_insert(sync_session):
-                    staging_table = Table(staging_table_name, Base.metadata, autoload_with=sync_session.bind)
-                    sync_session.execute(staging_table.insert(), processed_objects)
+                # Use MERGE statement for upsert
+                def sync_upsert(sync_session):
+                    # Create temp table
+                    temp_table_sql = f"""
+                    CREATE TABLE #temp_{staging_table_name} (
+                        object_key_hash VARBINARY(32) PRIMARY KEY,
+                        data_source_id NVARCHAR(255),
+                        object_type NVARCHAR(50),
+                        object_path NVARCHAR(4000),
+                        size_bytes INT,
+                        created_date DATETIME2,
+                        last_modified DATETIME2,
+                        last_accessed DATETIME2,
+                        discovery_timestamp DATETIME2
+                    )
+                    """
+                    sync_session.execute(text(temp_table_sql))
+                    
+                    # Insert into temp table
+                    temp_table = Table(f"#temp_{staging_table_name}", Base.metadata, autoload_with=sync_session.bind)
+                    sync_session.execute(temp_table.insert(), processed_objects)
+                    
+                    # MERGE operation
+                    merge_sql = f"""
+                    MERGE {staging_table_name} AS target
+                    USING #temp_{staging_table_name} AS source
+                    ON target.object_key_hash = source.object_key_hash
+                    WHEN MATCHED THEN
+                        UPDATE SET
+                            last_modified = source.last_modified,
+                            last_accessed = source.last_accessed,
+                            size_bytes = source.size_bytes,
+                            discovery_timestamp = source.discovery_timestamp
+                    WHEN NOT MATCHED THEN
+                        INSERT (object_key_hash, data_source_id, object_type, object_path, 
+                               size_bytes, created_date, last_modified, last_accessed, discovery_timestamp)
+                        VALUES (source.object_key_hash, source.data_source_id, source.object_type, 
+                               source.object_path, source.size_bytes, source.created_date, 
+                               source.last_modified, source.last_accessed, source.discovery_timestamp);
+                    """
+                    sync_session.execute(text(merge_sql))
                 
-                await session.run_sync(sync_insert)
+                await session.run_sync(sync_upsert)
                 await session.commit()
                 
-                self.logger.log_database_operation("BULK INSERT", staging_table_name, "SUCCESS", 
+                self.logger.log_database_operation("BULK UPSERT", staging_table_name, "SUCCESS", 
                                                  record_count=len(processed_objects), **context)
                 return len(processed_objects)
             
         except Exception as e:
-            self.error_handler.handle_error(e, context="insert_discovered_object_batch", 
+            self.error_handler.handle_error(e, context="upsert_discovered_object_batch", 
                                           staging_table=staging_table_name,
                                           object_count=len(objects), **context)
             raise
@@ -1650,40 +1686,41 @@ class DatabaseInterface:
     # =================================================================
 
     async def create_staging_table_for_job(self, job_id: int, table_type: str, context: Optional[Dict[str, Any]] = None) -> str:
-            context = context or {}
-            staging_table_name = f"staging_{table_type}_job_{job_id}"
-            self._validate_table_name(staging_table_name)
-            
-            if table_type != "DiscoveredObjects":
-                raise ValueError(f"Unknown staging table type: {table_type}")
+        context = context or {}
+        staging_table_name = f"staging_{table_type}_job_{job_id}"
+        self._validate_table_name(staging_table_name)
+        
+        if table_type != "DiscoveredObjects":
+            raise ValueError(f"Unknown staging table type: {table_type}")
 
-            self.logger.log_database_operation("CREATE TABLE", staging_table_name, "STARTED", **context)
-            try:
-                # Explicitly define columns for the staging table to avoid initialization errors
-                staging_table = Table(
-                    staging_table_name,
-                    Base.metadata,
-                    Column('ID', Integer, primary_key=True, autoincrement=True),
-                    Column('ObjectKeyHash', LargeBinary(32), nullable=False),
-                    Column('DataSourceID', String(255), nullable=False),
-                    Column('ObjectType', String(50), nullable=False),
-                    Column('ObjectPath', String(4000), nullable=False),
-                    Column('SizeBytes', Integer, nullable=True),
-                    Column('CreatedDate', DateTime, nullable=True),
-                    Column('LastModified', DateTime, nullable=True),
-                    Column('LastAccessed', DateTime, nullable=True),
-                    Column('DiscoveryTimestamp', DateTime(timezone=True), nullable=False),
-                    extend_existing=True # Keep this for validation script robustness
-                )
-                
-                async with self.async_engine.begin() as conn:
-                    await conn.run_sync(lambda sync_conn: staging_table.create(sync_conn, checkfirst=True))
-                
-                self.logger.log_database_operation("CREATE TABLE", staging_table_name, "SUCCESS", **context)
-                return staging_table_name
-            except Exception as e:
-                self.error_handler.handle_error(e, context="create_staging_table_for_job", table_name=staging_table_name, **context)
-                raise
+        self.logger.log_database_operation("CREATE TABLE", staging_table_name, "STARTED", **context)
+        try:
+            # Updated table definition to match new hash-based schema
+            staging_table = Table(
+                staging_table_name,
+                Base.metadata,
+                Column('object_key_hash', LargeBinary(32), primary_key=True),  # Changed: Now primary key
+                Column('data_source_id', String(255), nullable=False),         # Changed: Renamed from DataSourceID
+                Column('object_type', String(50), nullable=False),             # Changed: Renamed from ObjectType  
+                Column('object_path', String(4000), nullable=False),           # Changed: Renamed from ObjectPath
+                Column('size_bytes', Integer, nullable=True),                  # Changed: Renamed from SizeBytes
+                Column('created_date', DateTime, nullable=True),               # Changed: Renamed from CreatedDate
+                Column('last_modified', DateTime, nullable=True),              # Changed: Renamed from LastModified
+                Column('last_accessed', DateTime, nullable=True),              # Changed: Renamed from LastAccessed
+                Column('discovery_timestamp', DateTime(timezone=True), nullable=False), # Changed: Renamed from DiscoveryTimestamp
+                extend_existing=True
+            )
+            
+            async with self.async_engine.begin() as conn:
+                await conn.run_sync(lambda sync_conn: staging_table.create(sync_conn, checkfirst=True))
+            
+            self.logger.log_database_operation("CREATE TABLE", staging_table_name, "SUCCESS", **context)
+            return staging_table_name
+        except Exception as e:
+            self.error_handler.handle_error(e, context="create_staging_table_for_job", table_name=staging_table_name, **context)
+            raise
+
+
     async def cleanup_staging_tables_for_job(self, job_id: int, context: Optional[Dict[str, Any]] = None) -> None:
         context = context or {}
         pattern = f"staging_%_job_{job_id}"
@@ -1743,8 +1780,8 @@ class DatabaseInterface:
 
     async def execute_delta_comparison(self, staging_table_name: str, datasource_id: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
         """
-        Compares a staging table against the ObjectMetadata master table to find
-        new, modified, and deleted objects.
+        Compares a staging table against the discovered_objects master table to find
+        new, modified, and deleted objects using hash-based primary keys.
         """
         context = context or {}
         self._validate_table_name(staging_table_name)
@@ -1756,10 +1793,9 @@ class DatabaseInterface:
                 staging_result = await session.execute(staging_hashes_query)
                 staging_hashes = set(staging_result.scalars().all())
 
-                # 2. Get existing hashes for this datasource from the master metadata table
-                main_hashes_query = select(ObjectMetadata.object_key_hash).where(
-                    ObjectMetadata.data_source_id == datasource_id,
-                    ObjectMetadata.is_available == True
+                # 2. Get existing hashes for this datasource from the master discovered_objects table
+                main_hashes_query = select(OrmDiscoveredObject.object_key_hash).where(
+                    OrmDiscoveredObject.data_source_id == datasource_id
                 )
                 main_result = await session.execute(main_hashes_query)
                 main_hashes = set(main_result.scalars().all())
@@ -1768,27 +1804,26 @@ class DatabaseInterface:
                 new_hashes = staging_hashes - main_hashes
                 deleted_hashes = main_hashes - staging_hashes
                 
-                # 4. Handle deleted objects: Mark them as unavailable in the master table.
+                # 4. Handle deleted objects: Remove them from the master table
                 if deleted_hashes:
                     delete_stmt = (
-                        update(ObjectMetadata)
-                        .where(ObjectMetadata.object_key_hash.in_(deleted_hashes))
-                        .values(is_available=False, removed_date=datetime.now(timezone.utc))
+                        delete(OrmDiscoveredObject)
+                        .where(OrmDiscoveredObject.object_key_hash.in_(deleted_hashes))
                     )
                     await session.execute(delete_stmt)
 
-                # 5. Handle new objects: Insert them from the staging table into the master table.
+                # 5. Handle new objects: Insert them from the staging table into the master table
                 if new_hashes:
-                    target_columns = [c.name for c in DiscoveredObject.__table__.columns if c.name != 'id']
+                    target_columns = [c.name for c in OrmDiscoveredObject.__table__.columns]
                     target_cols_str = ", ".join([f'"{c}"' for c in target_columns])
                     
-                    # This efficiently copies the new records from staging to the master table
+                    # Efficiently copy new records from staging to the master table
                     insert_sql = text(
                         f'INSERT INTO "discovered_objects" ({target_cols_str}) '
                         f'SELECT {target_cols_str} FROM {staging_table_name} '
-                        f'WHERE "object_key_hash" IN :hashes'
+                        f'WHERE "object_key_hash" = ANY(:hashes)'
                     )
-                    await session.execute(insert_sql, {"hashes": tuple(new_hashes)})
+                    await session.execute(insert_sql, {"hashes": list(new_hashes)})
 
                 await session.commit()
                 
@@ -1798,6 +1833,8 @@ class DatabaseInterface:
         except Exception as e:
             self.error_handler.handle_error(e, context="execute_delta_comparison", staging_table=staging_table_name, **context)
             raise
+
+
 
     async def get_objects_needing_classification_rescan(self, cutoff_date: datetime, context: Optional[Dict[str, Any]] = None) -> List[int]:
         context = context or {}

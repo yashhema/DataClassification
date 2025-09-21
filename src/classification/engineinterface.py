@@ -20,6 +20,7 @@ from core.config.configuration_manager import ConfigurationManager, Classificati
 from core.logging.system_logger import SystemLogger
 from core.errors import ErrorHandler, ClassificationError, ErrorType
 from core.models.models import PIIFinding
+from core.utils.hash_utils import generate_finding_key_hash
 
 # =============================================================================
 # Helper Class: Configuration Loader (Internal to the Interface)
@@ -185,23 +186,36 @@ class EngineInterface:
 
                     samples = [{"text": f.text, "confidence": f.confidence_score} for f in findings_list[:self.config.max_samples_per_finding]]
 
+                    finding_context = {
+                        "data_source_id": self.job_context.get("datasource_id"),
+                        "classifier_id": classifier_id,
+                        "entity_type": first_finding.entity_type,
+                        "schema_name": context.get("table_metadata", {}).get("schema_name"),
+                        "table_name": None,
+                        "field_name": None,
+                        "file_path": context.get("file_path"),
+                        "file_name": context.get("file_name")
+                    } 
+                    finding_key_hash = generate_finding_key_hash(finding_context)
+                    
                     record = {
-                        "ScanJobID": self.job_context.get("job_id"),
-                        "DataSourceID": self.job_context.get("datasource_id"),
-                        "ClassifierID": classifier_id,
-                        "EntityType": first_finding.entity_type,
-                        "SchemaName": None,
-                        "TableName": None,
-                        "FieldName": None,  # Set to NULL for file-level summary
-                        "FilePath": context.get("file_path"),
-                        "FileName": context.get("file_name"),
-                        "FindingCount": len(findings_list),
-                        "AverageConfidence": avg_confidence,
-                        "MaxConfidence": max(scores) if scores else 0,
-                        "SampleFindings": json.dumps(samples),
-                        "TotalRowsInSource": total_rows_scanned, # Represents component count for files
-                        "AggregatedConfidence": agg_conf
-                    }
+                        'finding_key_hash': finding_key_hash,
+                        "scan_job_id": self.job_context.get("job_id"),
+                        "data_source_id": self.job_context.get("datasource_id"),
+                        "classifier_id": classifier_id,
+                        "entity_type": first_finding.entity_type,
+                        "schema_name": None,
+                        "table_name": None,
+                        "field_name": None,
+                        "file_path": context.get("file_path"),
+                        "file_name": context.get("file_name"),
+                        "finding_count": len(findings_list),
+                        "average_confidence": avg_confidence,
+                        "max_confidence": max(scores) if scores else 0,
+                        "sample_findings": json.dumps(samples),
+                        "total_rows_in_source": total_rows_scanned,
+                        "aggregated_confidence": agg_conf
+                    }                    
                     db_records.append(record)
                 return db_records
 
@@ -241,23 +255,37 @@ class EngineInterface:
                         agg_conf = "MEDIUM"
 
                     samples = [{"text": f.text, "confidence": f.confidence_score, "row": f.context_data.get("row_identifier")} for f in findings_list[:self.config.max_samples_per_finding]]
+                    finding_context = {
+                        "data_source_id": self.job_context.get("datasource_id"),
+                        "classifier_id": classifier_id,
+                        "entity_type": first_finding.entity_type,
+                        "schema_name": context.get("table_metadata", {}).get("schema_name"),
+                        "table_name": context.get("table_name"),
+                        "field_name": field_name,
+                        "file_path": None,
+                        "file_name": None
+                    } 
+                    finding_key_hash = generate_finding_key_hash(finding_context)                    
                     
                     record = {
-                        "ScanJobID": self.job_context.get("job_id"),
-                        "DataSourceID": self.job_context.get("datasource_id"),
-                        "ClassifierID": classifier_id,
-                        "EntityType": first_finding.entity_type,
-                        "SchemaName": context.get("table_metadata", {}).get("schema_name"),
-                        "TableName": context.get("table_name"),
-                        "FieldName": field_name,
-                        "FilePath": None, "FileName": None,
-                        "FindingCount": len(findings_list),
-                        "AverageConfidence": sum(scores) / len(scores) if scores else 0,
-                        "MaxConfidence": max(scores) if scores else 0,
-                        "SampleFindings": json.dumps(samples),
-                        "TotalRowsInSource": total_rows_scanned,
-                        "AggregatedConfidence": agg_conf 
-                    }
+                        'finding_key_hash': finding_key_hash,
+                        "scan_job_id": self.job_context.get("job_id"),
+                        "data_source_id": self.job_context.get("datasource_id"),
+                        "classifier_id": classifier_id,
+                        "entity_type": first_finding.entity_type,
+                        "schema_name": context.get("table_metadata", {}).get("schema_name"),
+                        "table_name": context.get("table_name"),
+                        "field_name": field_name,
+                        "file_path": None,
+                        "file_name": None,
+                        "finding_count": len(findings_list),
+                        "average_confidence": sum(scores) / len(scores) if scores else 0,
+                        "max_confidence": max(scores) if scores else 0,
+                        "sample_findings": json.dumps(samples),
+                        "total_rows_in_source": total_rows_scanned,
+                        # Note: "AggregatedConfidence" is not a column in the ScanFindingSummary table
+                        # and has been omitted to prevent insertion errors.
+                    }                    
                     db_records.append(record)
             return db_records
 

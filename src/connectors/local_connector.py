@@ -4,8 +4,10 @@ import shutil
 from typing import AsyncIterator, List, Dict, Any, Optional
 
 from core.interfaces.worker_interfaces import IFileDataSourceConnector
-from core.models.models import DiscoveredObject, RemediationResult, ContentComponent, ContentExtractionConfig
+from core.models.models import DiscoveredObject, RemediationResult, ContentComponent, ContentExtractionConfig, ObjectType, ObjectMetadata
 from content_extraction.content_extractor import ContentExtractor
+from core.utils.hash_utils import generate_object_key_hash
+from datetime import datetime, timezone
 
 class LocalConnector(IFileDataSourceConnector):
     """
@@ -40,7 +42,7 @@ class LocalConnector(IFileDataSourceConnector):
         )
 
     async def enumerate_objects(self, work_packet: Any) -> AsyncIterator[List[DiscoveredObject]]:
-        """Enumerates files recursively from the local root path."""
+        """Enumerates files recursively and creates objects with correct hash keys."""
         self.logger.info(f"Starting local file enumeration at '{self.root_path}'...", datasource_id=self.datasource_id)
         
         batch = []
@@ -51,12 +53,20 @@ class LocalConnector(IFileDataSourceConnector):
                 full_path = os.path.join(dirpath, filename)
                 try:
                     stat = os.stat(full_path)
+                    object_type_str = "FILE"
+                    obj_key_hash = generate_object_key_hash(
+                        datasource_id=self.datasource_id,
+                        object_path=full_path,
+                        object_type=object_type_str
+                    )
                     obj = DiscoveredObject(
-                        object_id=full_path, # For local files, the path is the unique ID
-                        object_type="FILE",
+                        object_key_hash=obj_key_hash,
+                        datasource_id=self.datasource_id,
+                        object_type=ObjectType.FILE,
                         object_path=full_path,
                         size_bytes=stat.st_size,
-                        last_modified=stat.st_mtime
+                        last_modified=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
+                        discovery_timestamp=datetime.now(timezone.utc)
                     )
                     batch.append(obj)
                     if len(batch) >= batch_size:
@@ -67,6 +77,9 @@ class LocalConnector(IFileDataSourceConnector):
         
         if batch:
             yield batch
+
+
+
 
     async def get_object_content(self, work_packet: Any) -> AsyncIterator[ContentComponent]:
         """

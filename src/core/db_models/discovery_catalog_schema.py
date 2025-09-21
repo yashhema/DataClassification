@@ -8,16 +8,15 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
 from sqlalchemy import (
-    String, Integer, LargeBinary, DateTime, JSON, Index, ForeignKey
+    String, Integer, LargeBinary, DateTime, JSON, Index
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
 
 class DiscoveredObject(Base):
     __tablename__ = 'discovered_objects'
     __table_args__ = (
-        Index('uq_object_key_hash', 'object_key_hash', unique=True),
         Index('ix_discovered_objects_data_source_id', 'data_source_id'),
         Index('ix_discovered_objects_object_type', 'object_type'),
         {'extend_existing': True}
@@ -27,10 +26,9 @@ class DiscoveredObject(Base):
     Uniqueness is enforced by a SHA-256 hash of the object's core identity
     (e.g., datasource + path + name) to ensure efficiency and avoid key length limits.
     """
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
-    # A SHA-256 hash (32 bytes) of the object's unique identifying fields.
-    object_key_hash: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    # A SHA-256 hash (32 bytes) of the object's unique identifying fields - now PRIMARY KEY
+    object_key_hash: Mapped[bytes] = mapped_column(LargeBinary(32), primary_key=True)
 
     # Core identity and location fields
     data_source_id: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -49,10 +47,6 @@ class DiscoveredObject(Base):
         nullable=False, 
         default=lambda: datetime.now(timezone.utc)
     )
-    
-    # FIXED: Corrected relationship names to match back_populates
-    object_metadata: Mapped[Optional["ObjectMetadata"]] = relationship(back_populates="discovered_object")
-    classification_info: Mapped[Optional["DiscoveredObjectClassificationDateInfo"]] = relationship(back_populates="discovered_object")
 
 
 class ObjectMetadata(Base):
@@ -62,9 +56,8 @@ class ObjectMetadata(Base):
     the second phase of discovery. This table has a one-to-one relationship
     with the DiscoveredObjects table.
     """
-    # This column is both the Primary Key and the Foreign Key,
-    # enforcing a strict one-to-one relationship with a DiscoveredObject.
-    object_id: Mapped[int] = mapped_column(ForeignKey('discovered_objects.id', ondelete="CASCADE"), primary_key=True)
+    # Using object_key_hash as primary key instead of foreign key relationship
+    object_key_hash: Mapped[bytes] = mapped_column(LargeBinary(32), primary_key=True)
 
     # A single JSON column to flexibly store type-specific metadata
     # (e.g., file permissions, table schema, field statistics).
@@ -77,20 +70,15 @@ class ObjectMetadata(Base):
         default=lambda: datetime.now(timezone.utc)
     )
 
-    # FIXED: Changed back_populates to match the relationship name on DiscoveredObject
-    discovered_object: Mapped["DiscoveredObject"] = relationship(back_populates="object_metadata")
-
 
 class DiscoveredObjectClassificationDateInfo(Base):
     __tablename__ = 'discovered_object_classification_date_info'
     __doc__ = """
     Stores the last classification timestamp for a discovered object.
     This allows the system to track which objects need to be re-classified.
-    It has a one-to-one relationship with the DiscoveredObjects table.
     """
-    # This column is both the Primary Key and the Foreign Key,
-    # enforcing a strict one-to-one relationship with a DiscoveredObject.
-    object_id: Mapped[int] = mapped_column(ForeignKey('discovered_objects.id', ondelete="CASCADE"), primary_key=True)
+    # Using object_key_hash as primary key instead of foreign key relationship
+    object_key_hash: Mapped[bytes] = mapped_column(LargeBinary(32), primary_key=True)
 
     # The timestamp of the last successful classification scan for this object.
     last_classification_date: Mapped[datetime] = mapped_column(
@@ -98,6 +86,3 @@ class DiscoveredObjectClassificationDateInfo(Base):
         nullable=False, 
         default=lambda: datetime.now(timezone.utc)
     )
-
-    # Establishes the back-reference for the one-to-one relationship
-    discovered_object: Mapped["DiscoveredObject"] = relationship(back_populates="classification_info")

@@ -25,7 +25,6 @@ from .base import Base
 class ScanFindingSummary(Base):
     __tablename__ = 'scan_finding_summaries'
     __table_args__ = (
-        Index('uq_finding_key_hash', 'finding_key_hash', unique=True),
         Index('ix_scan_finding_summaries_scan_job_id', 'scan_job_id'),
         Index('ix_scan_finding_summaries_data_source_id', 'data_source_id'),
         {'extend_existing': True}
@@ -35,10 +34,9 @@ class ScanFindingSummary(Base):
     context fields (finding_key_hash) is used to uniquely identify a finding
     for a specific object and classifier, avoiding index length issues.
     """
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
-    # A SHA-256 hash (32 bytes) of the core context fields.
-    finding_key_hash: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    # A SHA-256 hash (32 bytes) of the core context fields - now PRIMARY KEY
+    finding_key_hash: Mapped[bytes] = mapped_column(LargeBinary(32), primary_key=True)
 
     # === Core Context Fields ===
     scan_job_id: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -71,17 +69,18 @@ class ScanFindingSummary(Base):
 class ScanFindingOccurrence(Base):
     __tablename__ = 'scan_finding_occurrences'
     __table_args__ = (
-        Index('ix_scan_finding_occurrences_summary_id', 'summary_id'),
+        Index('ix_scan_finding_occurrences_finding_key_hash', 'finding_key_hash'),
     )
     __doc__ = """
     Stores the detailed information for every single PII finding occurrence.
     This is a high-volume table that is only populated if configured to do so.
     The link to the summary table is managed at the application level.
     """
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-
-    # This ID links back to the parent record in the scan_finding_summaries table.
-    summary_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Using finding_key_hash to link to summaries instead of foreign key
+    finding_key_hash: Mapped[bytes] = mapped_column(LargeBinary(32), primary_key=True)
+    
+    # Adding a sequence number to make each occurrence unique within a finding
+    occurrence_sequence: Mapped[int] = mapped_column(Integer, primary_key=True)
 
     # === Finding Details ===
     text: Mapped[str] = mapped_column(Text, nullable=False)
@@ -90,3 +89,9 @@ class ScanFindingOccurrence(Base):
     end_position: Mapped[int] = mapped_column(Integer, nullable=False)
     # Stores a JSON string of extra context
     context_data: Mapped[Optional[str]] = mapped_column(Text)
+
+    # Composite primary key
+    __table_args__ = (
+        Index('ix_scan_finding_occurrences_finding_key_hash', 'finding_key_hash'),
+        {'extend_existing': True}
+    )

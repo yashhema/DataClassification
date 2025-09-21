@@ -21,7 +21,7 @@ from core.models.models import (
     QueryDefinition,
     Pagination,
     ActionDefinition,
-    TaskType
+    TaskType,ClassificationPayload, DiscoveryGetDetailsPayload, TaskType, DiscoveredObject
     
 )
 from core.errors import ErrorCategory
@@ -191,58 +191,58 @@ class Pipeliner:
 
     async def _create_next_stage_scan_task(self, parent_task, record):
         """
-        Creates the correct next-stage task by reading the discovery_workflow
-        flag from the job's underlying data source configuration.
+        Creates the next stage tasks in parallel by using the complete DiscoveredObject
+        models provided directly in the output record from the enumeration task.
         """
         context = {"parent_task_id": parent_task.id, "record_id": record.id}
-
-        # Step 1: Get the parent job to find the datasource ID
-        job_result = await self.db.get_jobs_by_ids([parent_task.job_id], context=context)
-        if not job_result:
-            self.logger.error(f"Cannot pipeline task for missing job {parent_task.job_id}", job_id=parent_task.job_id, **context)
+        job = (await self.db.get_jobs_by_ids([parent_task.job_id], context=context))[0]
+        if not job:
+            self.logger.error(f"Cannot pipeline task for missing job {parent_task.job_id}", **context)
             return
-        job = job_result[0]
 
-        # Step 2: Get the datasource ID from the job's configuration
-        datasource_targets = job.configuration.get('datasource_targets', [])
-        if not datasource_targets:
-            self.logger.error(f"Job {job.id} has no datasource targets in its configuration.", job_id=job.id, **context)
+        output_payload = record.output_payload
+        discovered_object_dicts = output_payload.get("discovered_objects", [])
+        if not discovered_object_dicts:
             return
-        # A child job is scoped to a single node group, so we can safely use the first datasource
-        datasource_id = datasource_targets[0]['datasource_id']
 
-        # Step 3: Fetch the full datasource object from the database
-        datasources = await self.db.get_datasources_by_ids([datasource_id], context=context)
-        if not datasources:
-            self.logger.error(f"Could not find datasource '{datasource_id}' for job {job.id}", job_id=job.id, datasource_id=datasource_id, **context)
-            return
+        # 1. Re-instantiate the Pydantic models from the dictionaries in the payload
+        discovered_objects = [DiscoveredObject(**data) for data in discovered_object_dicts]
+
+        # 2. Get the workflow type from the job's configuration
+        # (This assumes the datasource config is copied to the job config)
+        workflow = job.configuration.get("discovery_workflow", "single-phase")
         
-        # Step 4: Read the workflow flag from the datasource's configuration.
-        # Default to 'two-phase' for safety and backward compatibility if the flag isn't set.
-        workflow = datasources[0].configuration.get("discovery_workflow", "single-phase")
-        
-        next_task_type_str = None
-        if record.output_type == "DISCOVERED_OBJECTS":
-            if workflow == "single-phase":
-                # For databases, enumeration is the only discovery step. The next step is classification.
-                next_task_type_str = "CLASSIFICATION"
-            else: # "two-phase"
-                # For files, the next step is to get detailed metadata (like permissions).
-                next_task_type_str = "DISCOVERY_GET_DETAILS"
+        tasks_to_create = []
 
-        elif record.output_type == "OBJECT_DETAILS_FETCHED":
-            # This record only comes from a two-phase workflow; the next step is always classification.
-            next_task_type_str = "CLASSIFICATION"
-
-        if next_task_type_str:
-            self.logger.info(
-                f"Pipelining job {job.id}: Creating next stage task '{next_task_type_str}' from output '{record.output_type}'.",
-                job_id=job.id, next_task=next_task_type_str, **context
-            )
-            await self.db.create_task(
+        # 3. Create the CLASSIFICATION task payload
+        classification_payload = ClassificationPayload(
+            classifier_template_id=job.configuration.get("classifier_template_id"),
+            discovered_objects=discovered_objects
+        )
+        tasks_to_create.append(
+            self.db.create_task(
                 job_id=parent_task.job_id,
-                task_type=TaskType(next_task_type_str),
-                work_packet={"payload": record.output_payload},
-                datasource_id=parent_task.datasource_id,
+                task_type=TaskType.CLASSIFICATION,
+                work_packet={"payload": classification_payload.dict()},
                 parent_task_id=parent_task.id
             )
+        )
+
+        # 4. Create the GET_DETAILS task payload ONLY for two-phase workflows
+        if workflow == "two-phase":
+            details_payload = DiscoveryGetDetailsPayload(
+                discovered_objects=discovered_objects
+            )
+            tasks_to_create.append(
+                self.db.create_task(
+                    job_id=parent_task.job_id,
+                    task_type=TaskType.DISCOVERY_GET_DETAILS,
+                    work_packet={"payload": details_payload.dict()},
+                    parent_task_id=parent_task.id
+                )
+            )
+
+        # 5. Execute all task creation coroutines concurrently
+        if tasks_to_create:
+            self.logger.info(f"Pipeliner creating {len(tasks_to_create)} next-stage tasks in parallel for job {job.id}", **context)
+            await asyncio.gather(*tasks_to_create)

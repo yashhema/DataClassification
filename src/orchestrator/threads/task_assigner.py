@@ -134,6 +134,13 @@ class TaskAssigner:
                     self.logger.error(error_msg, job_id=job_to_claim.id)
                     await self.db.fail_job(job_to_claim.id, error_msg)
                     return False
+                discovery_mode = job_to_claim.configuration.get("discovery_mode", "FULL").upper()
+                staging_table_name = "discovered_objects" #this field is required , even if its not delta processing 
+                if discovery_mode == "DELTA":
+                    staging_table_name = f"staging_discovered_objects_job_{job_to_claim.id}"
+                    # The logic to actually create this table should be called here
+                    await self.db.create_staging_table_for_job(job_to_claim.id, "DiscoveredObjects")
+
 
                 # --- FIX IS HERE ---
                 # Build a full, valid WorkPacket dictionary
@@ -143,7 +150,7 @@ class TaskAssigner:
                      "task_type": TaskType.DISCOVERY_ENUMERATE,
                      "paths": [],
                      "datasource_id": datasource_id,
-                     "staging_table_name": f"staging_discovered_objects_job_{job_to_claim.id}"
+                     "staging_table_name": staging_table_name
                 }
                 
                 # Create the final dictionary to be stored as JSON

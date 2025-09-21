@@ -13,6 +13,7 @@ This worker implements the contracts defined in:
 """
 
 import asyncio
+import base64
 import time
 from typing import Optional, Dict, Any, List, Union
 from datetime import datetime, timezone
@@ -35,7 +36,7 @@ from core.models.models import (
     PolicySelectorExecutePayload,
     PolicyActionExecutePayload,
     PolicyCommitPlanPayload,
-    PolicyReconcilePayload,RemediationResult
+    PolicyReconcilePayload,RemediationResult,ClassificationPayload
 )
 from .search_provider import create_search_provider
 from core.db_models.remediation_ledger_schema import LedgerStatus
@@ -578,40 +579,42 @@ class Worker:
             self.status = WorkerStatus.IDLE
 
     async def _process_discovery_enumerate_async(self, work_packet: WorkPacket):
-        """Process DISCOVERY_ENUMERATE task (async)."""
+        """
+        Process a DISCOVERY_ENUMERATE task and includes the complete list of discovered
+        objects in the TaskOutputRecord for the Pipeliner.
+        """
         payload = work_packet.payload
-        
-        # Get appropriate connector
         connector = await self.connector_factory.create_connector(payload.datasource_id)
         
-        # Process enumeration with progress reporting (async iteration)
         total_objects = 0
         batch_count = 0
         
+        # [cite_start]The connector yields batches of DiscoveredObject Pydantic models [cite: 1525]
         async for batch in connector.enumerate_objects(work_packet):
             batch_count += 1
             batch_size = len(batch)
             total_objects += batch_size
             
-            # Report progress to orchestrator
+            # The payload now contains the full DiscoveredObject models, serialized to dictionaries.
+            # The model's json_encoder for bytes will automatically convert the hash to a Base64 string.
             progress = TaskOutputRecord(
                 output_type="DISCOVERED_OBJECTS",
                 output_payload={
                     "staging_table": payload.staging_table_name,
                     "batch_id": f"batch_{batch_count}",
-                    "count": batch_size
+                    "count": batch_size,
+                    "discovered_objects": [obj.model_dump(mode='json') for obj in batch]
                 }
             )
             await self._report_task_progress_async(work_packet.header.task_id, progress)
             
-            # Send heartbeat for long-running tasks
+            # Heartbeat logic for long-running enumerations
             if batch_count % 10 == 0:
                 await self._send_heartbeat_async(work_packet.header.task_id)
 
         self.logger.info(f"Discovery enumeration completed: {total_objects} objects found", 
                         task_id=work_packet.header.task_id, 
                         total_objects=total_objects)
-
     async def _process_discovery_get_details_async(self, work_packet: WorkPacket):
         """Process DISCOVERY_GET_DETAILS task (async).""" 
         payload = work_packet.payload
@@ -632,53 +635,31 @@ class Worker:
         )
         await self._report_task_progress_async(work_packet.header.task_id, progress)
 
+
     async def _process_classification_async(self, work_packet: WorkPacket):
-        """Process CLASSIFICATION task with async interface detection."""
-        payload = work_packet.payload
+        """Processes a CLASSIFICATION task using the unified identity system."""
+        payload: ClassificationPayload = work_packet.payload
+        job_context = self.job_context(work_packet)
         
-        # Get appropriate connector
-        connector = await self.connector_factory.create_connector(payload.datasource_id)
-        
-        # Create EngineInterface for this specific work packet
-        job_context = {
-            "job_id": work_packet.header.trace_id,
-            "task_id": work_packet.header.task_id,
-            "datasource_id": work_packet.payload.datasource_id,
-            "trace_id": work_packet.header.trace_id,
-            "worker_id": self.worker_id
-        }
-        
-        # Create fresh EngineInterface for this task
         engine_interface = EngineInterface(
             db_interface=self.db_interface,
-            config_manager=self.config_manager,  
+            config_manager=self.config_manager,
             system_logger=self.logger,
             error_handler=self.error_handler,
             job_context=job_context
-            
         )
+        # The async method name was a typo in the original code, correcting it here
+        engine_interface.initialize_for_template(payload.classifier_template_id)
         
-        # Initialize engine interface for this template
-        try:
-            await engine_interface.initialize_for_template_async(payload.classifier_template_id)
-        except Exception as e:
-            error = self.error_handler.handle_error(
-                e, "initialize_engine_interface",
-                operation="engine_initialization",
-                template_id=payload.classifier_template_id,
-                trace_id=work_packet.header.trace_id
-            )
-            self.logger.error("Failed to initialize EngineInterface", error_id=error.error_id)
-            raise
+        connector = await self.connector_factory.create_connector(payload.datasource_id)
         
-        # Detect connector type and route appropriately
         if isinstance(connector, IFileDataSourceConnector):
             await self._process_file_based_classification_async(connector, engine_interface, work_packet)
         elif isinstance(connector, IDatabaseDataSourceConnector):
             await self._process_database_classification_async(connector, engine_interface, work_packet)
         else:
-            # Fallback to database classification for existing connectors
-            await self._process_database_classification_async(connector, engine_interface, work_packet)
+            raise TypeError(f"Connector for datasource {payload.datasource_id} has an unknown type.")
+
 
     async def _process_file_based_classification_async(self, connector: IFileDataSourceConnector, 
                                                      engine_interface: EngineInterface, work_packet: WorkPacket):

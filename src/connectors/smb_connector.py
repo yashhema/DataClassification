@@ -50,6 +50,9 @@ from core.errors import (
 )
 from core.logging.system_logger import SystemLogger
 from content_extraction.content_extractor import ContentExtractor
+from core.utils.hash_utils import generate_object_key_hash
+
+
 
 # Utility functions (implement locally to avoid base dependency)
 def create_object_id(datasource_id: str, object_path: str) -> str:
@@ -919,46 +922,29 @@ class SMBConnector(IFileDataSourceConnector):
     # =============================================================================
 
     async def _create_discovered_object_async(self, entry: Dict[str, Any], full_path: str) -> Optional[DiscoveredObject]:
-        """Create DiscoveredObject from SMB directory entry (async)"""
-        
+        """Create DiscoveredObject from SMB directory entry with a correct hash key."""
         try:
-            file_name = entry['file_name']
-            file_size = entry['end_of_file']
-            
-            # Extract file extension
-            file_extension = Path(file_name).suffix
-            
-            # Convert FILETIME to datetime
-            created_date = self._filetime_to_datetime(entry.get('creation_time', 0))
-            last_modified = self._filetime_to_datetime(entry.get('last_write_time', 0))
-            last_accessed = self._filetime_to_datetime(entry.get('last_access_time', 0))
-            
-            # Create metadata
-            metadata = ObjectMetadata(
-                size_bytes=file_size,
-                created_date=created_date,
-                last_modified=last_modified,
-                last_accessed=last_accessed,
-                file_extension=file_extension,
-                content_type=self._get_content_type(file_extension)
+            object_type_str = "FILE"
+            obj_key_hash = generate_object_key_hash(
+                datasource_id=self.datasource_id,
+                object_path=full_path,
+                object_type=object_type_str
             )
-            
-            # Create discovered object
-            discovered_obj = DiscoveredObject(
-                object_id=create_object_id(self.datasource_id, full_path),
+            return DiscoveredObject(
+                object_key_hash=obj_key_hash,
                 datasource_id=self.datasource_id,
                 object_type=ObjectType.FILE,
                 object_path=full_path,
-                object_metadata=metadata,
-                estimated_content_size=estimate_content_size(file_size, 'file')
+                size_bytes=entry['end_of_file'],
+                last_modified=self._filetime_to_datetime(entry.get('last_write_time', 0)),
+                created_date=self._filetime_to_datetime(entry.get('creation_time', 0)),
+                last_accessed=self._filetime_to_datetime(entry.get('last_access_time', 0)),
+                discovery_timestamp=datetime.now(timezone.utc)
             )
-            
-            return discovered_obj
-            
         except Exception as e:
-            self.logger.warning("Failed to create discovered object",
-                               file_path=full_path, error=str(e))
+            self.logger.warning("Failed to create discovered object", file_path=full_path, error=str(e))
             return None
+
 
     # =============================================================================
     # Async Detailed Metadata Collection
