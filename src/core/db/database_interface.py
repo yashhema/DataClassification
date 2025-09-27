@@ -9,13 +9,15 @@ UPDATED: Converted to async/await pattern with configuration caching.
 """
 
 import re
+from contextlib import asynccontextmanager
 from typing import List, Dict, Any, Optional,Union,NamedTuple
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import joinedload
-
+import hashlib
+import time
 from sqlalchemy import (
     select, update, text, inspect, Table, func, Column, Integer, String,
-    DateTime, LargeBinary, case
+    DateTime, LargeBinary, case,delete
 )
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy import and_
@@ -45,6 +47,10 @@ from ..db_models.remediation_ledger_schema import RemediationLedger, LedgerStatu
 from ..logging.system_logger import SystemLogger
 from ..errors import ErrorHandler
 from ..db_models.job_schema import MasterJob
+
+
+
+
 
 class LeaseRenewalResult(NamedTuple):
     """Structured result for the lease renewal and command processing operation."""
@@ -175,6 +181,80 @@ class DatabaseInterface:
     # =================================================================
     # NEW: Master Job and Summary Management Methods
     # =================================================================
+
+
+    async def start_job_transactional(self, job_details: dict) -> None:
+            """
+            Creates the master job, summary, and all child jobs in a single, atomic transaction.
+            If any part of the process fails, the entire transaction is rolled back.
+            """
+            context = job_details.get("context", {})
+            master_job_id = job_details.get("master_job_id")
+            self.logger.log_database_operation(
+                "TRANSACTION", "Jobs", "STARTED",
+                operation_name="start_job_transactional",
+                master_job_id=master_job_id,
+                **context
+            )
+            
+            # Start a single session that will manage the entire transaction
+            async with self.get_async_session() as session:
+                try:
+                    # 1. Create the MasterJob record
+                    await self.create_master_job(
+                        master_job_id=master_job_id,
+                        name=job_details.get("master_job_name"),
+                        configuration=job_details.get("master_job_config"),
+                        context=context,
+                        session=session  # Participate in the transaction
+                    )
+
+                    # 2. Create the MasterJobStateSummary record
+                    child_jobs_to_create = job_details.get("child_jobs", [])
+                    await self.create_master_job_summary(
+                        master_job_id=master_job_id,
+                        total_children=len(child_jobs_to_create),
+                        context=context,
+                        session=session  # Participate in the transaction
+                    )
+
+                    # 3. Create all child Job records
+                    for child_job in child_jobs_to_create:
+                        await self.create_job_execution(
+                            master_job_id=master_job_id,
+                            template_table_id=child_job.get("template_table_id"),
+                            template_type=child_job.get("template_type"),
+                            execution_id=child_job.get("execution_id"),
+                            trigger_type=child_job.get("trigger_type"),
+                            nodegroup=child_job.get("nodegroup"),
+                            configuration=child_job.get("configuration"),
+                            priority=child_job.get("priority"),
+                            master_pending_commands=child_job.get("master_pending_commands"),
+                            context=context,
+                            session=session  # Participate in the transaction
+                        )
+
+                    # 4. If all steps succeed, commit the single transaction
+                    await session.commit()
+                    self.logger.log_database_operation(
+                        "TRANSACTION", "Jobs", "SUCCESS",
+                        operation_name="start_job_transactional",
+                        master_job_id=master_job_id,
+                        **context
+                    )
+
+                except Exception as e:
+                    # If any step fails, roll back the entire transaction
+                    self.logger.error(
+                        "Transactional job creation failed. Rolling back all changes.",
+                        master_job_id=master_job_id,
+                        error=str(e),
+                        exc_info=True
+                    )
+                    await session.rollback()
+                    # Re-raise the exception to be handled by the caller
+                    raise
+
     
     async def get_master_job_summary(self, master_job_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[MasterJobStateSummary]:
         """Fetches the state summary record for a master job."""
@@ -191,28 +271,28 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, "get_master_job_summary", master_id=master_job_id, **context)
             raise
 
-    async def create_master_job_summary(self, master_job_id: str, total_children: int, context: Optional[Dict[str, Any]] = None) -> None:
+    async def create_master_job_summary(self, master_job_id: str, total_children: int, context: Optional[Dict[str, Any]] = None,session: Optional[AsyncSession] = None) -> None:
         """Creates the initial summary record for a new Master Job."""
         context = context or {}
         self.logger.log_database_operation("INSERT", "MasterJobStateSummary", "STARTED", master_job_id=master_job_id, **context)
         try:
-            async with self.get_async_session() as session:
+            async with self._get_session_context() as session:
                 summary = MasterJobStateSummary(
                     master_job_id=master_job_id,
                     total_children=total_children,
                     queued_children=total_children
                 )
                 session.add(summary)
-                await session.commit()
-                self.logger.log_database_operation("INSERT", "MasterJobStateSummary", "SUCCESS", master_job_id=master_job_id, **context)
+            self.logger.log_database_operation("INSERT", "MasterJobStateSummary", "SUCCESS", master_job_id=master_job_id, **context)
         except Exception as e:
             self.error_handler.handle_error(e, "create_master_job_summary", master_job_id=master_job_id, **context)
             raise
 
+
     async def update_master_job_summary_counters(self, master_job_id: str, from_status: JobStatus, to_status: JobStatus, current_version: int, context: Optional[Dict[str, Any]] = None) -> bool:
         """Atomically updates summary counters using optimistic locking."""
         context = context or {}
-        self.logger.log_database_operation("UPDATE", "MasterJobStateSummary", "STARTED", operation="update_counters", master_job_id=master_job_id, **context)
+        self.logger.log_database_operation("UPDATE", "MasterJobStateSummary", "STARTED", operation="update_counters",  **context)
         try:
             async with self.get_async_session() as session:
                 from_field = f"{from_status.value.lower()}_children"
@@ -239,7 +319,7 @@ class DatabaseInterface:
                 self.logger.log_database_operation("UPDATE", "MasterJobStateSummary", "SUCCESS" if was_successful else "FAILURE_OPTIMISTIC_LOCK", operation="update_counters", **context)
                 return was_successful
         except Exception as e:
-            self.error_handler.handle_error(e, "update_master_job_summary_counters", master_job_id=master_job_id, **context)
+            self.error_handler.handle_error(e, "update_master_job_summary_counters",  **context)
             raise
 
     async def get_active_master_jobs_for_monitoring(self, context: Optional[Dict[str, Any]] = None) -> List[MasterJob]:
@@ -323,7 +403,7 @@ class DatabaseInterface:
     # =================================================================
     # Lease atomic methods
     # =================================================================
-    # NEW: Atomic method for combined lease renewal and command processing.
+    # NEW: Atomic method for combined lease renewal and command processing, without version check
     async def renew_lease_and_process_command(
         self,
         job_id: int,
@@ -348,7 +428,7 @@ class DatabaseInterface:
                     .where(
                         Job.id == job_id,
                         Job.orchestrator_id == orchestrator_id,
-                        Job.version == current_version  # Optimistic lock
+                        #Job.version == current_version  # Optimistic lock
                     )
                     .values(
                         orchestrator_lease_expiry=new_expiry,
@@ -453,25 +533,45 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, "acknowledge_and_update_job_status", job_id=job_id, **context)
             raise
 
-    async def create_master_job(self, master_job_id: str, name: str, configuration: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> MasterJob:
-        """Creates a new record in the MasterJobs table."""
+    async def create_master_job(
+        self,
+        master_job_id: str,
+        name: str,
+        configuration: Dict[str, Any],
+        context: Optional[Dict[str, Any]] = None,
+        session: Optional[AsyncSession] = None
+    ) -> MasterJob:
+        """
+        Creates a new record in the MasterJobs table. If a session is provided,
+        it participates in that transaction. Otherwise, it creates its own.
+        It always returns the refreshed object.
+        """
         context = context or {}
         self.logger.log_database_operation("INSERT", "MasterJobs", "STARTED", master_job_id=master_job_id, **context)
+        
         try:
-            async with self.get_async_session() as session:
+            async with self._get_session_context(session=session) as inner_session:
                 new_master_job = MasterJob(
                     master_job_id=master_job_id,
                     name=name,
                     configuration=configuration
                 )
-                session.add(new_master_job)
-                await session.commit()
-                await session.refresh(new_master_job)
-                self.logger.log_database_operation("INSERT", "MasterJobs", "SUCCESS", master_job_id=new_master_job.master_job_id, **context)
-                return new_master_job
+                inner_session.add(new_master_job)
+                
+                # Flush is sufficient to get the object into the transaction queue.
+                await inner_session.flush()
+                
+                # REMOVED: The refresh call that causes the "connection is busy" error.
+                # await inner_session.refresh(new_master_job)
+
+            self.logger.log_database_operation("INSERT", "MasterJobs", "SUCCESS", master_job_id=new_master_job.master_job_id, **context)
+            return new_master_job
+            
         except Exception as e:
             self.error_handler.handle_error(e, "create_master_job", master_job_id=master_job_id, **context)
             raise
+
+
 
     async def get_master_job_by_id(self, master_job_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[MasterJob]:
         """Fetches a master job's configuration by its ID."""
@@ -990,12 +1090,12 @@ class DatabaseInterface:
                     )
                 )
                 result = await session.scalars(stmt)
-                result = result.one_or_none()
+                unique_result = result.unique().one_or_none()
                 
                 self.logger.log_database_operation("SELECT", "ClassifierTemplates", "SUCCESS", 
                                                  operation="get_full", 
                                                  found=(result is not None), **context)
-                return result
+                return unique_result
         except Exception as e:
             self.error_handler.handle_error(e, context="get_classifier_template_full", 
                                           template_id=template_id, **context)
@@ -1209,23 +1309,36 @@ class DatabaseInterface:
                                           datasource_id=datasource_id, **context)
             raise
 
+
     async def insert_discovered_object_batch(self, objects: List[Dict[str, Any]], 
                                          staging_table_name: str,
                                          context: Optional[Dict[str, Any]] = None) -> int:
         """Upsert batch of discovered objects into staging table using SQL Server MERGE."""
         context = context or {}
         if not objects:
+            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "NO_OBJECTS_TO_PROCESS", **context)
             return 0
             
+        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "VALIDATING_TABLE_NAME", **context)
         self._validate_table_name(staging_table_name)
+        
         self.logger.log_database_operation("BULK UPSERT", staging_table_name, "STARTED", 
                                          record_count=len(objects), **context)
         try:
+            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "GETTING_ASYNC_SESSION", **context)
             async with self.get_async_session() as session:
-                # Process objects same as before
+                self.logger.log_database_operation("BULK UPSERT", staging_table_name, "SESSION_ACQUIRED", **context)
+                
+                # Process objects - FIXED: hashlib import moved outside loop
+                self.logger.log_database_operation("BULK UPSERT", staging_table_name, "STARTING_OBJECT_PROCESSING", 
+                                                 input_count=len(objects), **context)
+                
                 processed_objects = []
-                for obj in objects:
-                    import hashlib
+                for i, obj in enumerate(objects):
+                    if i % 100 == 0:  # Log every 100 objects
+                        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "PROCESSING_PROGRESS", 
+                                                         processed=i, total=len(objects), **context)
+                    
                     key_components = [
                         obj.get('data_source_id', ''),
                         obj.get('object_path', ''),
@@ -1247,56 +1360,122 @@ class DatabaseInterface:
                     }
                     processed_objects.append(processed_obj)
                 
-                # Use MERGE statement for upsert
+                self.logger.log_database_operation("BULK UPSERT", staging_table_name, "OBJECTS_PROCESSED", 
+                                                 record_count=len(processed_objects), **context)
+
                 def sync_upsert(sync_session):
-                    # Create temp table
-                    temp_table_sql = f"""
-                    CREATE TABLE #temp_{staging_table_name} (
-                        object_key_hash VARBINARY(32) PRIMARY KEY,
-                        data_source_id NVARCHAR(255),
-                        object_type NVARCHAR(50),
-                        object_path NVARCHAR(4000),
-                        size_bytes INT,
-                        created_date DATETIME2,
-                        last_modified DATETIME2,
-                        last_accessed DATETIME2,
-                        discovery_timestamp DATETIME2
-                    )
-                    """
-                    sync_session.execute(text(temp_table_sql))
-                    
-                    # Insert into temp table
-                    temp_table = Table(f"#temp_{staging_table_name}", Base.metadata, autoload_with=sync_session.bind)
-                    sync_session.execute(temp_table.insert(), processed_objects)
-                    
-                    # MERGE operation
-                    merge_sql = f"""
-                    MERGE {staging_table_name} AS target
-                    USING #temp_{staging_table_name} AS source
-                    ON target.object_key_hash = source.object_key_hash
-                    WHEN MATCHED THEN
-                        UPDATE SET
-                            last_modified = source.last_modified,
-                            last_accessed = source.last_accessed,
-                            size_bytes = source.size_bytes,
-                            discovery_timestamp = source.discovery_timestamp
-                    WHEN NOT MATCHED THEN
-                        INSERT (object_key_hash, data_source_id, object_type, object_path, 
-                               size_bytes, created_date, last_modified, last_accessed, discovery_timestamp)
-                        VALUES (source.object_key_hash, source.data_source_id, source.object_type, 
-                               source.object_path, source.size_bytes, source.created_date, 
-                               source.last_modified, source.last_accessed, source.discovery_timestamp);
-                    """
-                    sync_session.execute(text(merge_sql))
+                    try:
+                        # FIXED: Use session-local temporary table (single #) with timestamp for uniqueness
+                        temp_table_name = f"#temp_{staging_table_name}_{int(time.time() * 1000)}"
+                        
+                        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "STARTING_TEMP_OPERATIONS", 
+                                                         temp_table=temp_table_name, **context)
+                        
+                        # Create session-local temporary table (automatically cleaned up when session ends)
+                        create_temp_sql = f"""
+                        CREATE TABLE {temp_table_name} (
+                            object_key_hash VARBINARY(32) PRIMARY KEY,
+                            data_source_id NVARCHAR(255),
+                            object_type NVARCHAR(50),
+                            object_path NVARCHAR(4000),
+                            size_bytes BIGINT,
+                            created_date DATETIME2,
+                            last_modified DATETIME2,
+                            last_accessed DATETIME2,
+                            discovery_timestamp DATETIME2
+                        )
+                        """
+                        
+                        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "CREATING_SESSION_LOCAL_TEMP_TABLE", 
+                                                         sql=create_temp_sql.replace('\n', ' ').strip(), 
+                                                         temp_table=temp_table_name, **context)
+                        sync_session.execute(text(create_temp_sql))
+                        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "TEMP_TABLE_CREATED", 
+                                                         temp_table=temp_table_name, **context)
+                        
+                        # Insert data into temp table - FIXED: Avoid autoload, use direct SQL insert
+                        if processed_objects:
+                            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "STARTING_BULK_INSERT", 
+                                                             record_count=len(processed_objects), 
+                                                             temp_table=temp_table_name, **context)
+                            
+                            # Use direct SQL bulk insert to avoid autoload issues with temp tables
+                            insert_sql = f"""
+                            INSERT INTO {temp_table_name} 
+                            (object_key_hash, data_source_id, object_type, object_path, 
+                             size_bytes, created_date, last_modified, last_accessed, discovery_timestamp)
+                            VALUES 
+                            (:object_key_hash, :data_source_id, :object_type, :object_path, 
+                             :size_bytes, :created_date, :last_modified, :last_accessed, :discovery_timestamp)
+                            """
+                            
+                            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "EXECUTING_BULK_INSERT", 
+                                                             sql=insert_sql.replace('\n', ' ').strip(),
+                                                             param_count=len(processed_objects), 
+                                                             temp_table=temp_table_name, **context)
+                            
+                            # Execute the bulk insert
+                            sync_session.execute(text(insert_sql), processed_objects)
+                            
+                            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "BULK_INSERT_COMPLETE", 
+                                                             record_count=len(processed_objects), 
+                                                             temp_table=temp_table_name, **context)
+                        
+                        # MERGE from session-local temp table to permanent staging table
+                        merge_sql = f"""
+                        MERGE {staging_table_name} AS target
+                        USING {temp_table_name} AS source
+                        ON target.object_key_hash = source.object_key_hash
+                        WHEN MATCHED THEN
+                            UPDATE SET
+                                last_modified = source.last_modified,
+                                last_accessed = source.last_accessed,
+                                size_bytes = source.size_bytes,
+                                discovery_timestamp = source.discovery_timestamp
+                        WHEN NOT MATCHED THEN
+                            INSERT (object_key_hash, data_source_id, object_type, object_path, 
+                                   size_bytes, created_date, last_modified, last_accessed, discovery_timestamp)
+                            VALUES (source.object_key_hash, source.data_source_id, source.object_type, 
+                                   source.object_path, source.size_bytes, source.created_date, 
+                                   source.last_modified, source.last_accessed, source.discovery_timestamp);
+                        """
+
+                        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "EXECUTING_MERGE", 
+                                                         sql=merge_sql.replace('\n', ' ').strip(), 
+                                                         from_temp=temp_table_name, 
+                                                         to_staging=staging_table_name, **context)
+
+                        result = sync_session.execute(text(merge_sql))
+                        affected_rows = result.rowcount if hasattr(result, 'rowcount') else len(processed_objects)
+                        
+                        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "MERGE_COMPLETE", 
+                                                         rows_affected=affected_rows, 
+                                                         temp_table=temp_table_name, **context)
+                        
+                        # Session-local temp table will be automatically dropped when session ends
+                        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "TEMP_TABLE_AUTO_CLEANUP", 
+                                                         temp_table=temp_table_name, **context)
+                        
+                    except Exception as e:
+                        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "SYNC_ERROR", 
+                                                         error=str(e), **context)
+                        raise
                 
+                self.logger.log_database_operation("BULK UPSERT", staging_table_name, "CALLING_RUN_SYNC", **context)
                 await session.run_sync(sync_upsert)
+                
+                self.logger.log_database_operation("BULK UPSERT", staging_table_name, "RUN_SYNC_COMPLETE", **context)
                 await session.commit()
+                
+                self.logger.log_database_operation("BULK UPSERT", staging_table_name, "COMMIT_COMPLETE", **context)
                 
                 self.logger.log_database_operation("BULK UPSERT", staging_table_name, "SUCCESS", 
                                                  record_count=len(processed_objects), **context)
                 return len(processed_objects)
             
         except Exception as e:
+            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "FAILED", 
+                                             error=str(e), object_count=len(objects), **context)
             self.error_handler.handle_error(e, context="upsert_discovered_object_batch", 
                                           staging_table=staging_table_name,
                                           object_count=len(objects), **context)
@@ -1491,7 +1670,8 @@ class DatabaseInterface:
         priority: int,
         master_job_id: str,
         master_pending_commands: Optional[str] = None,
-        context: Optional[Dict[str, Any]] = None
+        context: Optional[Dict[str, Any]] = None,
+        session: Optional[AsyncSession] = None
     ) -> Job:
         """
         Creates a new 'Child Job' record in the database with all required fields.
@@ -1499,12 +1679,12 @@ class DatabaseInterface:
         context = context or {}
         self.logger.log_database_operation("INSERT", "Jobs", "STARTED", execution_id=execution_id, **context)
         try:
-            async with self.get_async_session() as session:
+            async with self._get_session_context(session=session) as inner_session:
                 new_job = Job(
                     execution_id=execution_id,
                     template_table_id=template_table_id,
                     template_type=template_type,
-                    status=JobStatus.QUEUED, # Jobs are created in the QUEUED state
+                    status=JobStatus.QUEUED,
                     trigger_type=trigger_type,
                     priority=priority,
                     node_group=nodegroup,
@@ -1513,9 +1693,11 @@ class DatabaseInterface:
                     master_pending_commands=master_pending_commands
                 )
                 
-                session.add(new_job)
-                await session.commit()
-                await session.refresh(new_job)
+                inner_session.add(new_job)
+                await inner_session.flush()
+                
+                # REMOVED: The refresh call that would cause the same "connection is busy" error.
+                # await inner_session.refresh(new_job)
                 
                 self.logger.log_database_operation("INSERT", "Jobs", "SUCCESS", job_id=new_job.id, **context)
                 return new_job
@@ -1524,12 +1706,124 @@ class DatabaseInterface:
             raise
 
 
-    async def create_task(self, job_id: int, task_type: str, work_packet: Dict[str, Any], datasource_id: Optional[str] = None, parent_task_id: Optional[int] = None, context: Optional[Dict[str, Any]] = None) -> Task:
+
+    async def create_task_batch(
+        self,
+        tasks_to_create: List[Dict[str, Any]],
+        context: Optional[Dict[str, Any]] = None,
+        session: Optional[AsyncSession] = None
+    ) -> None:
+        """
+        Creates a batch of new task records in the database efficiently using a bulk insert.
+        This method is designed to participate in an existing transaction if a session is provided.
+        """
         context = context or {}
-        self.logger.log_database_operation("INSERT", "Tasks", "STARTED", job_id=job_id, task_type=task_type, **context)
+        if not tasks_to_create:
+            return
+
+        self.logger.log_database_operation(
+            "BULK INSERT", "Tasks", "STARTED",
+            task_count=len(tasks_to_create),
+            **context
+        )
+        try:
+            # Use the session manager to either participate in an existing transaction or create a new one.
+            async with self._get_session_context(session=session) as inner_session:
+                
+                # Convert the list of dictionaries into a list of ORM objects
+                new_task_objects = [
+                    Task(
+                        id=task_params['task_id'],
+                        job_id=task_params['job_id'],
+                        task_type=task_params['task_type'],
+                        work_packet=task_params['work_packet'],
+                        datasource_id=task_params.get('datasource_id'),
+                        parent_task_id=task_params.get('parent_task_id'),
+                        status=TaskStatus.PENDING
+                    ) for task_params in tasks_to_create
+                ]
+                
+                # Use add_all for an efficient bulk insert operation.
+                inner_session.add_all(new_task_objects)
+                # The commit is handled by the context manager if it's the transaction "owner".
+
+            self.logger.log_database_operation(
+                "BULK INSERT", "Tasks", "SUCCESS",
+                task_count=len(tasks_to_create),
+                **context
+            )
+        except Exception as e:
+            self.error_handler.handle_error(e, context="create_task_batch", **context)
+            raise
+
+    async def update_output_record_status_batch(
+        self,
+        record_ids: List[int],
+        status: str,
+        context: Optional[Dict[str, Any]] = None,
+        session: Optional[AsyncSession] = None
+    ) -> None:
+        """
+        Updates the status for a batch of TaskOutputRecords in a single, efficient operation.
+        This method is designed to participate in an existing transaction if a session is provided.
+        """
+        context = context or {}
+        if not record_ids:
+            return
+
+        self.logger.log_database_operation(
+            "BULK UPDATE", "TaskOutputRecords", "STARTED",
+            operation="update_status_batch",
+            record_count=len(record_ids),
+            **context
+        )
+        try:
+            # Use the session manager to handle the transaction.
+            async with self._get_session_context(session=session) as inner_session:
+                stmt = update(TaskOutputRecord).where(
+                    TaskOutputRecord.id.in_(record_ids)
+                ).values(status=status)
+                
+                await inner_session.execute(stmt)
+                # The commit is handled by the context manager.
+
+            self.logger.log_database_operation(
+                "BULK UPDATE", "TaskOutputRecords", "SUCCESS",
+                operation="update_status_batch",
+                record_count=len(record_ids),
+                **context
+            )
+        except Exception as e:
+            self.error_handler.handle_error(e, context="update_output_record_status_batch", **context)
+            raise
+
+
+
+    async def create_task(
+        self, 
+        job_id: int, 
+        task_id: bytes,  # FIXED: Now accepts the pre-generated hash ID
+        task_type: str, 
+        work_packet: Dict[str, Any], 
+        datasource_id: Optional[str] = None, 
+        parent_task_id: Optional[bytes] = None,  # FIXED: Now accepts the parent's hash ID
+        context: Optional[Dict[str, Any]] = None
+    ) -> Task:
+        """
+        Creates a new task record in the database using a pre-generated,
+        application-side hash as the primary key.
+        """
+        context = context or {}
+        self.logger.log_database_operation(
+            "INSERT", "Tasks", "STARTED", 
+            job_id=job_id, 
+            task_type=task_type, 
+            **context
+        )
         try:
             async with self.get_async_session() as session:
                 new_task = Task(
+                    id=task_id,  # FIXED: Assigns the pre-generated hash to the id field
                     job_id=job_id, 
                     task_type=task_type, 
                     work_packet=work_packet, 
@@ -1539,20 +1833,46 @@ class DatabaseInterface:
                 )
                 session.add(new_task)
                 await session.commit()
-                await session.refresh(new_task)
-                self.logger.log_database_operation("INSERT", "Tasks", "SUCCESS", task_id=new_task.id, **context)
+                
+                # Refresh is still good practice to confirm the object state matches the DB
+                await session.refresh(new_task) 
+                
+                self.logger.log_database_operation(
+                    "INSERT", "Tasks", "SUCCESS", 
+                    task_id=new_task.id.hex(),  # Log the hex version for readability
+                    **context
+                )
                 return new_task
         except Exception as e:
             self.error_handler.handle_error(e, context="create_task", **context)
             raise
 
 
-    async def assign_task_to_worker(self, task_id: int, worker_id: str, lease_duration_seconds: int, context: Optional[Dict[str, Any]] = None) -> bool:
+
+    async def assign_task_to_worker(
+        self, 
+        task_id: bytes,  # FIXED: Changed from int to bytes
+        worker_id: str, 
+        lease_duration_seconds: int, 
+        context: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Atomically assigns a PENDING task to a worker using its hash-based ID.
+        """
         context = context or {}
-        self.logger.log_database_operation("UPDATE", "Tasks", "STARTED", task_id=task_id, worker_id=worker_id, **context)
+        log_task_id = task_id.hex() # Log the hex version for readability
+        self.logger.log_database_operation(
+            "UPDATE", "Tasks", "STARTED", 
+            task_id=log_task_id, 
+            worker_id=worker_id, 
+            **context
+        )
         try:
             async with self.get_async_session() as session:
-                stmt = update(Task).where(Task.id == task_id, Task.status == TaskStatus.PENDING).values(
+                stmt = update(Task).where(
+                    Task.id == task_id, 
+                    Task.status == TaskStatus.PENDING
+                ).values(
                     status=TaskStatus.ASSIGNED,
                     worker_id=worker_id,
                     lease_expiry=datetime.now(timezone.utc) + timedelta(seconds=lease_duration_seconds),
@@ -1560,42 +1880,97 @@ class DatabaseInterface:
                 )
                 result = await session.execute(stmt)
                 await session.commit()
+                
                 was_successful = result.rowcount > 0
                 status = "SUCCESS" if was_successful else "FAILURE_RACE_CONDITION"
-                self.logger.log_database_operation("UPDATE", "Tasks", status, task_id=task_id, **context)
+                self.logger.log_database_operation(
+                    "UPDATE", "Tasks", status, 
+                    task_id=log_task_id, 
+                    **context
+                )
                 return was_successful
         except Exception as e:
-            self.error_handler.handle_error(e, context="assign_task_to_worker", **context)
+            self.error_handler.handle_error(
+                e, 
+                context="assign_task_to_worker", 
+                task_id=log_task_id,
+                **context
+            )
             raise
 
-    async def complete_task(self, task_id: int, context: Optional[Dict[str, Any]] = None) -> None:
+
+    async def complete_task(
+        self,
+        
+        task_id: bytes,  # FIXED: Changed from int to bytes
+        context: Optional[Dict[str, Any]] = None,
+		session: Optional[AsyncSession] = None
+		        
+        
+    ) -> None:
+        """
+        Marks a task as COMPLETED using its hash-based ID.
+        """
         context = context or {}
-        # CORRECTED LINE:
-        self.logger.log_database_operation("UPDATE", "Tasks", "STARTED", operation_name="complete_task", task_id=task_id, **context)
+        log_task_id = task_id.hex() # Log the hex version for readability
+        self.logger.log_database_operation(
+            "UPDATE", "Tasks", "STARTED",
+            operation_name="complete_task",
+            task_id=log_task_id,
+            **context
+        )
         try:
-            async with self.get_async_session() as session:
+            async with self._get_session_context(session) as session:
                 stmt = update(Task).where(Task.id == task_id).values(status=TaskStatus.COMPLETED)
                 await session.execute(stmt)
-                await session.commit()
-                # CORRECTED LINE:
-                self.logger.log_database_operation("UPDATE", "Tasks", "SUCCESS", operation_name="complete_task", task_id=task_id, **context)
+
+                
+                self.logger.log_database_operation(
+                    "UPDATE", "Tasks", "SUCCESS",
+                    operation_name="complete_task",
+                    task_id=log_task_id,
+                    **context
+                )
         except Exception as e:
-            self.error_handler.handle_error(e, context="complete_task", task_id=task_id, **context)
+            self.error_handler.handle_error(
+                e,
+                context="complete_task",
+                task_id=log_task_id,
+                **context
+            )
             raise
 
 
 
-    async def fail_task(self, task_id: int, is_retryable: bool, max_retries: int = 3, context: Optional[Dict[str, Any]] = None) -> None:
+    async def fail_task(
+        self,
+        task_id: bytes,  # FIXED: Changed from int to bytes
+        is_retryable: bool,
+        max_retries: int = 3,
+        context: Optional[Dict[str, Any]] = None,
+		session: Optional[AsyncSession] = None
+		       
+        
+    ) -> None:
+        """
+        Marks a task as FAILED or PENDING (for retry) using its hash-based ID.
+        """
         context = context or {}
-        self.logger.log_database_operation("UPDATE", "Tasks", "STARTED", operation="fail_task", task_id=task_id, **context)
+        log_task_id = task_id.hex() # Log the hex version for readability
+        self.logger.log_database_operation(
+            "UPDATE", "Tasks", "STARTED",
+            operation="fail_task",
+            task_id=log_task_id,
+            **context
+        )
         try:
-            async with self.get_async_session() as session:
+            async with self._get_session_context(session) as session:
                 # Eagerly fetch the task again within this session to prevent lazy-loading errors.
                 result = await session.execute(select(Task).where(Task.id == task_id))
                 task = result.scalar_one_or_none()
                 
                 if not task:
-                    self.logger.warning(f"Task {task_id} not found, cannot fail it.", task_id=task_id, **context)
+                    self.logger.warning(f"Task {log_task_id} not found, cannot fail it.", task_id=log_task_id, **context)
                     return
                 
                 if is_retryable and task.retry_count < max_retries:
@@ -1607,10 +1982,23 @@ class DatabaseInterface:
                 
                 final_status = task.status # Capture status before commit
                 await session.commit()
-                self.logger.log_database_operation("UPDATE", "Tasks", "SUCCESS", operation="fail_task", new_status=final_status.value, **context)
+                
+                self.logger.log_database_operation(
+                    "UPDATE", "Tasks", "SUCCESS",
+                    operation="fail_task",
+                    new_status=final_status.value,
+                    task_id=log_task_id,
+                    **context
+                )
         except Exception as e:
-            self.error_handler.handle_error(e, context="fail_task", task_id=task_id, **context)
+            self.error_handler.handle_error(
+                e,
+                context="fail_task",
+                task_id=log_task_id,
+                **context
+            )
             raise
+
 
     async def get_pending_tasks_batch(self, job_id: int, batch_size: int, context: Optional[Dict[str, Any]] = None) -> List[Task]:
         context = context or {}
@@ -1646,24 +2034,54 @@ class DatabaseInterface:
     # =================================================================
 
 
-    async def write_task_output_record(self, task_id: int, output_type: str, payload: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> TaskOutputRecord:
+    async def write_task_output_record(
+        self,
+        job_id: int,          # NEW: Added job_id for context and integrity
+        task_id: bytes,       # FIXED: Changed from int to bytes
+        output_type: str,
+        payload: Dict[str, Any],
+        context: Optional[Dict[str, Any]] = None
+    ) -> TaskOutputRecord:
+        """
+        Creates a TaskOutputRecord, linking it to its parent job and task
+        using the new hash-based task ID.
+        """
         context = context or {}
-        self.logger.log_database_operation("INSERT", "TaskOutputRecords", "STARTED", task_id=task_id, **context)
+        log_task_id = task_id.hex() # Log the hex version for readability
+        self.logger.log_database_operation(
+            "INSERT", "TaskOutputRecords", "STARTED",
+            
+            
+            **context
+        )
         try:
             async with self.get_async_session() as session:
                 record = TaskOutputRecord(
-                    task_id=task_id, 
-                    output_type=output_type, 
-                    output_payload=payload, 
+                    job_id=job_id,        # NEW: Populating the new field
+                    task_id=task_id,      # FIXED: Using the bytes hash
+                    output_type=output_type,
+                    output_payload=payload,
                     status='PENDING_PROCESSING'
                 )
                 session.add(record)
                 await session.commit()
                 await session.refresh(record)
-                self.logger.log_database_operation("INSERT", "TaskOutputRecords", "SUCCESS", record_id=record.id, **context)
+                
+                self.logger.log_database_operation(
+                    "INSERT", "TaskOutputRecords", "SUCCESS",
+                    record_id=record.id,
+
+                    **context
+                )
                 return record
         except Exception as e:
-            self.error_handler.handle_error(e, context="write_task_output_record", **context)
+            self.error_handler.handle_error(
+                e,
+                context="write_task_output_record",
+                task_id=log_task_id,
+                job_id=job_id,
+                **context
+            )
             raise
 
 
@@ -1912,18 +2330,55 @@ class DatabaseInterface:
                 raise
 
 
-    async def get_task_by_id(self, task_id: int, context: Optional[Dict[str, Any]] = None) -> Optional[Task]:
-        """Fetches a single task by its primary key."""
+    @asynccontextmanager
+    async def _get_session_context(self, session: Optional[AsyncSession] = None):
+        """
+        Provides a database session with optional commit control.
+        - If session provided: yields it without commit/close
+        - If no session: creates new one, optionally commits based on should_commit flag
+        """
+        if session:
+            # Use existing session - caller controls transaction
+            yield session
+        else:
+            # Create new session
+            async with self.get_async_session() as new_session:
+                try:
+                    yield new_session
+                    
+                    await new_session.commit()
+                except Exception:
+                    await new_session.rollback()
+                    raise
+
+
+   
+    async def get_task_by_id(
+        self,
+        task_id: bytes,
+         
+        context: Optional[Dict[str, Any]] = None,
+		session: Optional[AsyncSession] = None
+		       
+    ) -> Optional[Task]:
+        """Fetches a single task by its hash-based primary key."""
         context = context or {}
-        self.logger.log_database_operation("SELECT", "Tasks", "STARTED", operation="get_by_id", task_id=task_id, **context)
+        log_task_id = task_id.hex()
+        
         try:
-            async with self.get_async_session() as session:
-                result = await session.get(Task, task_id)
-                self.logger.log_database_operation("SELECT", "Tasks", "SUCCESS", operation="get_by_id", found=(result is not None), **context)
+            # Use the new context manager to handle the session
+            async with self._get_session_context(session) as sess:
+                result = await sess.get(Task, task_id)
                 return result
         except Exception as e:
-            self.error_handler.handle_error(e, context="get_task_by_id", task_id=task_id, **context)
+            self.error_handler.handle_error(
+                e,
+                context="get_task_by_id",
+                task_id=log_task_id,
+                **context
+            )
             raise
+
 
     async def update_job_status(self, job_id: int, status: JobStatus, context: Optional[Dict[str, Any]] = None) -> None:
         """Updates the status of a specific job."""
@@ -1939,41 +2394,79 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, context="update_job_status", job_id=job_id, **context)
             raise
 
-    async def update_output_record_status(self, record_id: int, status: str, context: Optional[Dict[str, Any]] = None) -> None:
-        """Updates the status of a specific TaskOutputRecord."""
-        context = context or {}
-        self.logger.log_database_operation("UPDATE", "TaskOutputRecords", "STARTED", operation="update_status", record_id=record_id, **context)
-        try:
-            async with self.get_async_session() as session:
-                stmt = update(TaskOutputRecord).where(TaskOutputRecord.id == record_id).values(status=status)
-                await session.execute(stmt)
-                await session.commit()
+    async def update_output_record_status(
+            self,
+            record_id: int,
+            status: str,
+            context: Optional[Dict[str, Any]] = None,
+            session: Optional[AsyncSession] = None
+        ) -> None:
+            """Updates the status of a specific TaskOutputRecord."""
+            context = context or {}
+            self.logger.log_database_operation("UPDATE", "TaskOutputRecords", "STARTED", operation="update_status", record_id=record_id, **context)
+            try:
+                # Use the session context manager to handle the transaction
+                async with self._get_session_context(session=session) as inner_session:
+                    stmt = update(TaskOutputRecord).where(TaskOutputRecord.id == record_id).values(status=status)
+                    await inner_session.execute(stmt)
+                    # The commit is handled by the context manager if it's the "owner"
+                    
                 self.logger.log_database_operation("UPDATE", "TaskOutputRecords", "SUCCESS", operation="update_status", **context)
-        except Exception as e:
-            self.error_handler.handle_error(e, context="update_output_record_status", record_id=record_id, **context)
-            raise
+            except Exception as e:
+                self.error_handler.handle_error(e, context="update_output_record_status", record_id=record_id, **context)
+                raise
 
 
-    async def extend_task_lease(self, task_id: int, duration_seconds: int, context: Optional[Dict[str, Any]] = None) -> bool:
-        """Extends the lease of an ASSIGNED task, preventing it from timing out."""
+
+    async def extend_task_lease(
+        self,
+        task_id: bytes,  # FIXED: Changed from int to bytes
+        duration_seconds: int,
+        context: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Extends the lease of an ASSIGNED task using its hash-based ID,
+        preventing it from timing out.
+        """
         context = context or {}
-        self.logger.log_database_operation("UPDATE", "Tasks", "STARTED", operation="extend_lease", task_id=task_id, **context)
+        log_task_id = task_id.hex() # Log the hex version for readability
+        self.logger.log_database_operation(
+            "UPDATE", "Tasks", "STARTED",
+            operation="extend_lease",
+            task_id=log_task_id,
+            **context
+        )
         try:
             async with self.get_async_session() as session:
                 new_expiry = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
+                
                 # The WHERE clause ensures we only update an active, assigned task (optimistic locking).
                 stmt = update(Task).where(
                     Task.id == task_id,
                     Task.status == TaskStatus.ASSIGNED
                 ).values(lease_expiry=new_expiry)
+                
                 result = await session.execute(stmt)
                 await session.commit()
+                
                 was_successful = result.rowcount > 0
-                self.logger.log_database_operation("UPDATE", "Tasks", "SUCCESS" if was_successful else "FAILURE", operation="extend_lease", **context)
+                self.logger.log_database_operation(
+                    "UPDATE", "Tasks",
+                    "SUCCESS" if was_successful else "FAILURE_NO_ACTIVE_TASK",
+                    operation="extend_lease",
+                    task_id=log_task_id,
+                    **context
+                )
                 return was_successful
         except Exception as e:
-            self.error_handler.handle_error(e, context="extend_task_lease", task_id=task_id, **context)
+            self.error_handler.handle_error(
+                e,
+                context="extend_task_lease",
+                task_id=log_task_id,
+                **context
+            )
             raise
+
 
     async def cancel_pending_tasks_for_job(self, job_id: int, context: Optional[Dict[str, Any]] = None) -> int:
         """

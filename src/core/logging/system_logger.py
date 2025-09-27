@@ -22,6 +22,15 @@ import copy
 # Assuming errors.py is in a sibling directory
 from ..errors import ClassificationError
 
+def custom_json_serializer(obj):
+    """Custom JSON serializer for objects not serializable by default json code"""
+    if isinstance(obj, bytes):
+        return obj.hex()
+    if isinstance(obj, (datetime, timedelta)):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 class JsonFormatter(logging.Formatter):
     """
     Custom formatter to output log records as a single JSON string.
@@ -35,7 +44,13 @@ class JsonFormatter(logging.Formatter):
         }
         if hasattr(record, 'extra_context'):
             log_record.update(record.extra_context)
-        return json.dumps(log_record)
+
+        # ⬇️ STEP 2: Modify this line to use the new serializer ⬇️
+        return json.dumps(log_record, default=custom_json_serializer)
+
+
+
+
 
 class SystemLogger:
     """

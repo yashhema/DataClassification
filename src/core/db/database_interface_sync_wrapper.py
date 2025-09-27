@@ -78,3 +78,23 @@ class DatabaseInterfaceSyncWrapper:
     def get_jobs_by_ids(self, job_ids: list):
         print(f"CLI THREAD: Getting jobs by IDs: {job_ids}")
         return self._run_coro_in_main_loop(self.db.get_jobs_by_ids(job_ids))
+        
+    def create_master_job(self, **kwargs):
+        """Synchronous wrapper to create the MasterJob record."""
+        print(f"CLI THREAD: Creating master job")
+        return self._run_coro_in_main_loop(self.db.create_master_job(**kwargs))
+
+    def create_master_job_summary(self, **kwargs):
+        """Synchronous wrapper to create the MasterJobStateSummary record."""
+        print(f"CLI THREAD: Creating master job summary")
+        return self._run_coro_in_main_loop(self.db.create_master_job_summary(**kwargs))
+        
+    def start_job_transactional(self, job_details: dict):
+        """
+        Synchronous wrapper for a new, single async method that creates the master job,
+        summary, and all child jobs in one atomic transaction.
+        NOTE: This requires a corresponding `start_job_transactional` method to be added
+        to the async `DatabaseInterface` class.
+        """
+        print(f"CLI THREAD: Starting transactional job creation...")
+        return self._run_coro_in_main_loop(self.db.start_job_transactional(job_details))

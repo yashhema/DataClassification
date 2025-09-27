@@ -47,7 +47,7 @@ class Reaper:
                 expired_tasks = await self.db.get_expired_task_leases(self.task_timeout)
                 
                 if expired_tasks:
-                    self.logger.warning(f"Reaper found {len(expired_tasks)} expired tasks.", count=len(expired_tasks))
+                    self.logger.warning("Reaper found  expired tasks.", count=len(expired_tasks))
                     for task in expired_tasks:
                         # FIXED: Use task.job_id instead of task.JobID
                         self.logger.log_lease_expiry(task.id, task.worker_id, job_id=task.job_id)

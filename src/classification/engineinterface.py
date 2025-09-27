@@ -35,12 +35,12 @@ class _ConfigurationLoader:
         self.db_interface = db_interface
         self.job_context = job_context
 
-    def load_and_assemble(self, template_id: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        orm_template = self.db_interface.get_classifier_template_full(template_id, context=self.job_context)
+    async def load_and_assemble(self, template_id: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        orm_template =await self.db_interface.get_classifier_template_full(template_id, context=self.job_context)
         if not orm_template:
             raise ClassificationError(f"Template '{template_id}' not found.", ErrorType.CONFIGURATION_MISSING)
 
-        nested_config = json.loads(orm_template.configuration or '{}')
+        nested_config = orm_template.configuration or '{}'
         template_config = {
             "template_id": orm_template.template_id,
             "name": orm_template.name,
@@ -79,7 +79,7 @@ class EngineInterface:
         self._engine: Optional[ClassificationEngine] = None
         self._row_processor: Optional[RowProcessor] = None
 
-    def initialize_for_template(self, template_id: str):
+    async def initialize_for_template(self, template_id: str):
         """
         Initializes the internal engine and processor for a specific template.
         Must be called before any classification methods.
@@ -87,7 +87,7 @@ class EngineInterface:
         try:
             self.logger.info(f"Initializing EngineInterface for template '{template_id}'", **self.job_context)
             loader = _ConfigurationLoader(self.db_interface, self.job_context)
-            template_config, classifier_configs = loader.load_and_assemble(template_id)
+            template_config, classifier_configs =await loader.load_and_assemble(template_id)
             
             self._engine = ClassificationEngine(template_config, classifier_configs, self.error_handler)
             self._row_processor = RowProcessor()

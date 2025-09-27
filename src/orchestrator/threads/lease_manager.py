@@ -81,7 +81,7 @@ class LeaseManager:
                     self.logger.warning(f"Cannot renew lease for job {job_id}: version missing from in-memory state.", job_id=job_id)
                     continue
 
-                # A single atomic call to renew the lease AND process any command.
+                # A single atomic call to renew the lease AND process any command,for now we are not using version as check.
                 self.logger.info(f"[DEBUG] LeaseManager about to renew lease for job {job_id}")
                 result: LeaseRenewalResult = await self.db.renew_lease_and_process_command(
                     job_id=job_id,

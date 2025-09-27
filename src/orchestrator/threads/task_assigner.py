@@ -13,6 +13,7 @@ FIXES APPLIED:
 
 import asyncio
 import time
+import base64
 from collections import deque
 from datetime import datetime, timezone,timedelta
 
@@ -25,8 +26,10 @@ if TYPE_CHECKING:
 from orchestrator.orchestrator_state import JobState
 
 from core.db_models.job_schema import JobType
-from core.models.models import TaskType, PolicySelectorPlanPayload, PolicyConfiguration, WorkPacketHeader, TaskConfig,WorkPacket
+from core.models.models import TaskType, PolicySelectorPlanPayload, PolicyConfiguration, WorkPacketHeader, TaskConfig, WorkPacket, DiscoveryEnumeratePayload
 from core.errors import ErrorCategory
+from core.utils.hash_utils import generate_task_id
+
 class TaskAssigner:
     """Finds, approves, and dispatches tasks, respecting all system constraints."""
     
@@ -85,121 +88,97 @@ class TaskAssigner:
 
         self.logger.log_component_lifecycle("TaskAssigner", "STOPPED")
 
+
     async def _claim_and_initialize_new_job(self) -> bool:
         """
         Finds a single QUEUED job, claims it, and creates the correct first task
-        based on the job's template_type.
-        Returns True if a job was successfully initialized, otherwise False.
+        with an application-generated hash ID.
         """
         nodegroup = self.settings.system.node_group
-        # Find one available job, prioritizing by the 'priority' and then 'id' column
         queued_jobs = await self.db.get_queued_jobs_for_nodegroup(nodegroup, limit=1)
         if not queued_jobs:
             return False
 
         job_to_claim = queued_jobs[0]
+        job_id = job_to_claim.id
         
-        lease_duration = 300 # seconds
+        lease_duration = 300
         was_claimed = await self.db.claim_queued_job(
-            job_to_claim.id, self.orchestrator.instance_id, lease_duration
+            job_id, self.orchestrator.instance_id, lease_duration
         )
 
         if was_claimed:
             self.logger.info(
-                f"Successfully claimed new '{job_to_claim.template_type.value}' job {job_to_claim.id}.",
-                job_id=job_to_claim.id
+                f"Successfully claimed new '{job_to_claim.template_type.value}' job {job_id}.",
+                job_id=job_id
             )
-            # Update in-memory state
-            self.logger.info(f"[DEBUG] taskassigner about to call _update_job_in_memory_state")
             await self.orchestrator._update_job_in_memory_state(
-                job_id=job_to_claim.id,
+                job_id=job_id,
                 new_status=JobState.RUNNING,
                 version=job_to_claim.version + 1,
                 lease_expiry=datetime.now(timezone.utc) + timedelta(seconds=lease_duration),
                 is_new=True
             )
             
-            #
-            # --- Type-Aware First Task Creation Logic ---
-            #
+            # --- FIXED: Application-Side Task ID Generation ---
+            
+            # 1. Generate the unique task ID first.
+            new_task_id_bytes = generate_task_id()
+            new_task_id_hex = new_task_id_bytes.hex() # For the WorkPacket
+
+            # 2. Create the WorkPacket with the new ID in the header.
+            header = WorkPacketHeader(
+                task_id=new_task_id_hex, # Use the hex string for the packet
+                job_id=job_id
+            )
+            config = TaskConfig()
+            
+            # 3. Build the appropriate payload based on job type.
             if job_to_claim.template_type == JobType.SCANNING:
-                # --- FIX STARTS HERE ---
-                datasource_targets = job_to_claim.configuration.get('datasource_targets', [])
-                
-                # A child job is scoped to a single datasource, so we can safely use the first one.
-                datasource_id = datasource_targets[0]['datasource_id'] if datasource_targets else None
+                datasource_id = job_to_claim.configuration.get('datasource_targets', [{}])[0].get('datasource_id')
                 if not datasource_id:
-                    # If a scanning job has no datasource, it's an unrecoverable configuration error.
-                    error_msg = f"Scanning Job {job_to_claim.id} is missing a datasource_id in its configuration."
-                    self.logger.error(error_msg, job_id=job_to_claim.id)
-                    await self.db.fail_job(job_to_claim.id, error_msg)
+                    await self.db.fail_job(job_id, "Job is missing a datasource_id.")
                     return False
+
+                # FIXED: Staging table logic now respects discovery_mode
                 discovery_mode = job_to_claim.configuration.get("discovery_mode", "FULL").upper()
-                staging_table_name = "discovered_objects" #this field is required , even if its not delta processing 
+                staging_table = "discovered_objects"
                 if discovery_mode == "DELTA":
-                    staging_table_name = f"staging_discovered_objects_job_{job_to_claim.id}"
-                    # The logic to actually create this table should be called here
+                    staging_table = f"staging_discovered_objects_job_{job_id}"
                     await self.db.create_staging_table_for_job(job_to_claim.id, "DiscoveredObjects")
-
-
-                # --- FIX IS HERE ---
-                # Build a full, valid WorkPacket dictionary
-                header = WorkPacketHeader(task_id=0, job_id=job_to_claim.id) # task_id will be populated by DB
-                config = TaskConfig() # Use default config
-                payload = {
-                     "task_type": TaskType.DISCOVERY_ENUMERATE,
-                     "paths": [],
-                     "datasource_id": datasource_id,
-                     "staging_table_name": staging_table_name
-                }
-                
-                # Create the final dictionary to be stored as JSON
-                full_work_packet_model = WorkPacket(
-                    header=header,
-                    config=config,
-                    payload=payload
+                    
+                payload = DiscoveryEnumeratePayload(
+                    datasource_id=datasource_id,
+                    paths=[],
+                    staging_table_name=staging_table
                 )
-                # Use Pydantic's model_dump method to get a clean JSON string,
+                task_type = TaskType.DISCOVERY_ENUMERATE
                 
-                import json
-                work_packet_dict = full_work_packet_model.model_dump(mode='json')
-                await self.db.create_task(
-                    job_id=job_to_claim.id,
-                    task_type=TaskType.DISCOVERY_ENUMERATE,
-                    work_packet=work_packet_dict, # Pass the complete structure
-                    datasource_id=datasource_id
-                )
-                # --- FIX ENDS HERE ---            
             elif job_to_claim.template_type == JobType.POLICY:
-                # Create the initial task for a POLICY job
-                # The first step in a policy workflow is to plan the selection.
                 plan_id = f"plan_{job_to_claim.execution_id}"
                 policy_config = PolicyConfiguration(**job_to_claim.configuration.get("policy_definition", {}))
-                
-                payload = PolicySelectorPlanPayload(
-                    plan_id=plan_id,
-                    policy_config=policy_config
-                )
-                await self.db.create_task(
-                    job_id=job_to_claim.id,
-                    task_type=TaskType.POLICY_SELECTOR_PLAN,
-                    work_packet={"payload": payload.dict()}
-                )
+                payload = PolicySelectorPlanPayload(plan_id=plan_id, policy_config=policy_config)
+                task_type = TaskType.POLICY_SELECTOR_PLAN
             
             else:
-                # Fail the job if we don't know how to start it.
-                error_msg = f"Unknown job type '{job_to_claim.template_type.value}'. Cannot create initial task."
-                self.logger.error(error_msg, job_id=job_to_claim.id)
-                await self.db.fail_job(job_to_claim.id, error_msg)
+                await self.db.fail_job(job_id, f"Unknown job type '{job_to_claim.template_type.value}'")
                 return False
 
-            # Refill the cache so the newly created task is available immediately
-            await self._refill_task_cache_for_job(job_to_claim.id)
+            full_work_packet = WorkPacket(header=header, config=config, payload=payload)
+
+            # 4. Call the updated create_task method with the bytes hash.
+            await self.db.create_task(
+                job_id=job_id,
+                task_id=new_task_id_bytes, # Pass the raw bytes to the DB method
+                task_type=task_type,
+                work_packet=full_work_packet.model_dump(mode='json'),
+                datasource_id=getattr(payload, 'datasource_id', None)
+            )
+            
+            await self._refill_task_cache_for_job(job_id)
             return True
             
         return False
-
-
 
 
     async def _find_and_approve_task(self):
@@ -274,36 +253,34 @@ class TaskAssigner:
                     self.orchestrator.job_cache[job_id] = deque(tasks)
                     self.logger.info(f"Refilled task cache for job {job_id} with {len(tasks)} tasks.", job_id=job_id)
 
+
     async def _dispatch_task(self, task):
         """Assigns a task in the DB and dispatches it."""
-        # This assignment is for a worker process in a real deployment.
-        # For single_process mode, the "worker" is a coroutine in the same process.
-        worker_id = f"worker_for_task_{task.id}" 
+        # Handle both bytes and string task_id
+        task_id_str = task.id.hex() if isinstance(task.id, bytes) else task.id
+        task_id_bytes = task.id if isinstance(task.id, bytes) else bytes.fromhex(task.id)
+        
+        worker_id = f"worker_for_task_{task_id_str}"
         
         was_assigned = await self.db.assign_task_to_worker(
-            task.id, 
+            task_id_bytes,
             worker_id,
             self.settings.worker.task_timeout_seconds
         )
         
         if was_assigned:
-            # FIXED: Use task.job_id instead of task.JobID
             self.rc.state_manager.confirm_task_assignment(task.job_id)
-            self.logger.info(f"Task {task.id} successfully assigned.", task_id=task.id)
+            self.logger.info(f"Task {task_id_str} successfully assigned.", task_id=task_id_str)
             
             if self.orchestrator.is_single_process_mode:
                 if self.orchestrator._in_process_work_queue is None:
-                    self.logger.error("In-process work queue is None in single_process mode!")
+                    self.logger.error("In-process work queue is None!")
                     return                
                 await self.orchestrator._in_process_work_queue.put(task)
-            # In EKS mode, the worker would have already received the task via the API,
-            # and this DB update confirms the assignment.
         else:
-            self.logger.warning(f"DB assignment for task {task.id} failed (race condition). Releasing reservation.", task_id=task.id)
-            # In a real system, you would need to check if task.datasource_id exists
+            self.logger.warning(f"DB assignment for task {task_id_str} failed (race condition).", task_id=task_id_str)
             if hasattr(task, 'datasource_id') and task.datasource_id:
-                self.rc.state_manager.release_task_reservation(task.datasource_id)
-
+                self.rc.state_manager.release_datasource_connection(task.datasource_id)
 
 
     async def _select_next_job_to_process(self):

@@ -154,7 +154,7 @@ class Worker:
                 "action_definition": payload.policy_config.action_definition.dict()
             }
 
-            await self._report_task_progress_async(
+            await self._report_task_progress_async(work_packet.header.job_id,
                 work_packet.header.task_id,
                 TaskOutputRecord(output_type="SELECTION_PLAN_CREATED", output_payload=blueprint)
             )
@@ -212,7 +212,7 @@ class Worker:
             "action_definition": payload.get("action_definition")
         }
 
-        await self._report_task_progress_async(
+        await self._report_task_progress_async(work_packet.header.job_id,
             work_packet.header.task_id,
             TaskOutputRecord(output_type="ACTION_PLAN_CREATED", output_payload=action_blueprint)
         )
@@ -300,7 +300,7 @@ class Worker:
                         updates_for_catalog.append(update)
             
             if updates_for_catalog:
-                await self._report_task_progress_async(
+                await self._report_task_progress_async(work_packet.header.job_id,
                     work_packet.header.task_id,
                     TaskOutputRecord(
                         output_type="METADATA_RECONCILE_UPDATES",
@@ -345,6 +345,7 @@ class Worker:
             }
 
             await self._report_task_progress_async(
+                work_packet.header.job_id,
                 work_packet.header.task_id,
                 TaskOutputRecord(output_type="ACTION_PLAN_CREATED", output_payload=action_blueprint)
             )
@@ -606,7 +607,7 @@ class Worker:
                     "discovered_objects": [obj.model_dump(mode='json') for obj in batch]
                 }
             )
-            await self._report_task_progress_async(work_packet.header.task_id, progress)
+            await self._report_task_progress_async(work_packet.header.job_id,work_packet.header.task_id, progress)
             
             # Heartbeat logic for long-running enumerations
             if batch_count % 10 == 0:
@@ -633,7 +634,7 @@ class Worker:
                 "success_count": len(metadata_results)
             }
         )
-        await self._report_task_progress_async(work_packet.header.task_id, progress)
+        await self._report_task_progress_async(work_packet.header.job_id,work_packet.header.task_id, progress)
 
 
     async def _process_classification_async(self, work_packet: WorkPacket):
@@ -649,7 +650,7 @@ class Worker:
             job_context=job_context
         )
         # The async method name was a typo in the original code, correcting it here
-        engine_interface.initialize_for_template(payload.classifier_template_id)
+        await engine_interface.initialize_for_template(payload.classifier_template_id)
         
         connector = await self.connector_factory.create_connector(payload.datasource_id)
         
@@ -1001,43 +1002,52 @@ class Worker:
         # Simulate delta calculation work
         await asyncio.sleep(2)
 
-    async def _report_task_progress_async(self, task_id: int, progress_record: TaskOutputRecord):
-        """Report intermediate progress to orchestrator (async)."""
+
+
+
+
+    async def _report_task_progress_async(self, job_id: int, task_id: str, progress_record: TaskOutputRecord):
+        """
+        Saves the TaskOutputRecord directly to the database.
+        This is a critical step for the Pipeliner to create the next task.
+        """
         self.status = WorkerStatus.REPORTING_PROGRESS
+        context = {"worker_id": self.worker_id, "job_id": job_id, "task_id": task_id}
         
         try:
-            if self.is_single_process_mode:
-                await self.orchestrator.update_task_progress_async(
-                    task_id, 
-                    progress_record.dict(), 
-                    {"worker_id": self.worker_id}
-                )
-            else:
-                import aiohttp
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        f"{self.orchestrator_url}/api/update_task_progress",
-                        json={
-                            "task_id": task_id,
-                            "progress_record": progress_record.dict(),
-                            "worker_id": self.worker_id
-                        },
-                        timeout=aiohttp.ClientTimeout(total=30)
-                    ) as response:
-                        response.raise_for_status()
-                
+            self.logger.info(
+                f"Worker saving TaskOutputRecord of type '{progress_record.output_type}' to database.",
+                **context
+            )
+            # Convert the hex string task_id back to bytes for the database call
+            task_id_bytes = bytes.fromhex(task_id)
+
+            # Call the database interface directly to write the record
+            await self.db_interface.write_task_output_record(
+                job_id=job_id,
+                task_id=task_id_bytes,
+                output_type=progress_record.output_type,
+                payload=progress_record.output_payload,
+                context=context
+            )
+            self.logger.info("Successfully saved TaskOutputRecord.", **context)
+
         except Exception as e:
             error = self.error_handler.handle_error(
-                e, "report_task_progress_async",
-                operation="progress_reporting",
-                task_id=task_id,
-                worker_id=self.worker_id
+                e, "worker_report_task_progress",
+                operation="save_task_output_record",
+                **context
             )
-            self.logger.warning("Failed to report task progress", error_id=error.error_id)
+            self.logger.error(f"FATAL: Failed to save task output record. This will break the job pipeline.", error_id=error.error_id, **context)
+            # Re-raise the exception to ensure the main task loop fails the entire task.
+            # This prevents silent failures where the workflow gets stuck.
+            raise
         finally:
             self.status = WorkerStatus.PROCESSING_TASK
 
-    async def _report_task_completion_async(self, task_id: int, status: str, result_payload: Dict[str, Any]):
+
+
+    async def _report_task_completion_async(self, task_id: str, status: str, result_payload: Dict[str, Any]):
         """Report task completion to orchestrator (async)."""
         try:
             if self.is_single_process_mode:
@@ -1072,7 +1082,7 @@ class Worker:
             )
             self.logger.error("Failed to report task completion", error_id=error.error_id)
 
-    async def _send_heartbeat_async(self, task_id: int):
+    async def _send_heartbeat_async(self, task_id: str):
         """Send heartbeat to orchestrator for long-running tasks (async)."""
         self.last_heartbeat = datetime.now(timezone.utc)
         

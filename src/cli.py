@@ -38,49 +38,52 @@ def run_cli(db_sync: DatabaseInterfaceSyncWrapper, settings):
                         print(f"Error: No valid datasources found for the IDs in template '{template_id}'.")
                         continue
 
+                    # --- REFACTORED FOR TRANSACTIONAL CREATION ---
                     master_job_id = f"master-{template_id}-{int(time.time())}"
                     
-                    print(f"DEBUG: Starting loop to create {len(datasources)} jobs...")
-                    for i, ds in enumerate(datasources):
-                        print(f"DEBUG: Creating job {i+1}/{len(datasources)} for datasource '{ds.datasource_id}'...")
+                    print(f"DEBUG: Preparing details for transactional job creation...")
+                    
+                    # Prepare the list of child jobs to be created
+                    child_job_details = []
+                    for ds in datasources:
                         child_config = scan_template.configuration.copy()
                         child_config["datasource_targets"] = [{"datasource_id": ds.datasource_id}]
                         child_config["failure_threshold_percent"] = settings.job.failure_threshold_percent
+                        child_config['classifier_template_id'] = scan_template.classifier_template_id
+                        child_config['discovery_workflow'] = scan_template.configuration.get("discovery_workflow", "single-phase")
+                        
                         nodegroup_name = ds.node_group.name if ds.node_group else 'default'
-
-                        db_sync.create_job_execution(
-                            master_job_id=master_job_id,
-                            template_table_id=scan_template.id,
-                            template_type=scan_template.job_type,
-                            execution_id=f"run-{master_job_id}-{ds.datasource_id}",
-                            trigger_type="cli",
-                            nodegroup=nodegroup_name,
-                            configuration=child_config,
-                            priority=scan_template.priority,
-                            master_pending_commands="START"
-                        )
-                        print(f"DEBUG: Job for datasource '{ds.datasource_id}' created.")
+                        child_job_details.append({
+                            "template_table_id": scan_template.id,
+                            "template_type": scan_template.job_type,
+                            "execution_id": f"run-{master_job_id}-{ds.datasource_id}",
+                            "trigger_type": "cli",
+                            "nodegroup": nodegroup_name,
+                            "configuration": child_config,
+                            "priority": scan_template.priority,
+                            "master_pending_commands": "START"
+                        })
                     
+                    # Package everything into a single dictionary for the transactional call
+                    transaction_details = {
+                        "master_job_id": master_job_id,
+                        "master_job_name": f"Master for {scan_template.name}",
+                        "master_job_config": scan_template.configuration,
+                        "child_jobs": child_job_details
+                    }
+                    
+                    # Make a single, atomic call to the database
+                    db_sync.start_job_transactional(transaction_details)
+                    # --- END OF REFACTOR ---
+
                     print(f"\nSuccessfully created {len(datasources)} jobs under master_job_id: {master_job_id}")
+
                 except Exception as e:
                     print(f"AN EXCEPTION OCCURRED IN 'start_job': {e}")
-                    traceback.print_exc() # Also print the full traceback to the console            elif command == "list_jobs":
-                print("Fetching all active jobs (Queued, Running, Pausing, Cancelling)...")
-                active_jobs = db_sync.get_active_jobs()
-                if not active_jobs:
-                    print("No active jobs found.")
-                    continue
-                
-                print(f"{'Job ID':<10} {'Status':<12} {'Template Name':<25} {'Start Time (UTC)':<22}")
-                print(f"{'-'*10} {'-'*12} {'-'*25} {'-'*22}")
-                
-                for job in active_jobs:
-                    template = db_sync.get_template_for_job(job)
-                    template_name = template.name if template else "N/A"
-                    start_time = job.created_timestamp.strftime('%Y-%m-%d %H:%M:%S')
-                    print(f"{job.id:<10} {job.status.value:<12} {template_name:<25} {start_time:<22}")
+                    traceback.print_exc()	
 
-# Replace the entire 'pause, resume, cancel, status' block with this new version
+
+
             elif command in ["pause", "resume", "cancel"]:
                 master_id = parts[1]
                 child_jobs = db_sync.get_all_child_jobs_for_master(master_id)

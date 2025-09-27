@@ -1,5 +1,21 @@
 import hashlib
 from typing import Dict, Any
+import uuid
+
+# This new function should be added to the hash_utils.py file
+def generate_task_id() -> bytes:
+    """
+    Generates a new, unique, random task ID using UUIDv4.
+
+    Returns:
+        A 16-byte UUID, which is compatible with the VARBINARY(32) database
+        column (as it's less than 32 bytes). This provides a simple and
+        highly reliable method for generating unique task identifiers on the
+        application side.
+    """
+    # uuid.uuid4() creates a random UUID.
+    # .bytes returns the 16-byte representation of the UUID.
+    return uuid.uuid4().bytes
 
 def generate_object_key_hash(datasource_id: str, object_path: str, object_type: str) -> bytes:
     """

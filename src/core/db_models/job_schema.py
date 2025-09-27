@@ -10,7 +10,7 @@ from typing import List, Optional, Dict, Any
 
 from sqlalchemy import (
     String, Integer, ForeignKey, DateTime, JSON, Boolean, func, Index, Enum as SQLAlchemyEnum, and_,
-    text, BigInteger
+    text, BigInteger,LargeBinary
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship, foreign, remote
 
@@ -176,16 +176,29 @@ class Job(Base):
 # =================================================================
 # Task Models
 # =================================================================
+
+
+
+
+
+# This class definition replaces the original Task class
 class Task(Base):
     __tablename__ = 'tasks'
     __table_args__ = (
         Index('ix_tasks_status_job_id', 'status', 'job_id'),
         Index('ix_tasks_lease_expiry', 'lease_expiry'),
     )
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    
+    # FIXED: Changed the primary key from an Integer to a 32-byte hash (binary).
+    # This will store the application-generated SHA-256 hash.
+    id: Mapped[bytes] = mapped_column(LargeBinary(32), primary_key=True)
+    
     job_id: Mapped[int] = mapped_column(ForeignKey('jobs.id', ondelete="CASCADE"), nullable=False)
     datasource_id: Mapped[Optional[str]] = mapped_column(String(255))
-    parent_task_id: Mapped[Optional[int]] = mapped_column(Integer)
+    
+    # FIXED: Changed the parent_task_id to also be a 32-byte hash to match the new primary key.
+    parent_task_id: Mapped[Optional[bytes]] = mapped_column(LargeBinary(32))
+    
     task_type: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[TaskStatus] = mapped_column(SQLAlchemyEnum(TaskStatus), nullable=False, default=TaskStatus.PENDING, index=True)
     work_packet: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
@@ -193,14 +206,27 @@ class Task(Base):
     lease_expiry: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
 
+
+
+
 class TaskOutputRecord(Base):
     __tablename__ = 'task_output_records'
     __table_args__ = (
+        # Indexes are still important for query performance
         Index('ix_task_output_records_status_task_id', 'status', 'task_id'),
+        Index('ix_task_output_records_job_id', 'job_id'), # Index for the new job_id
     )
+    
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    task_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    # UPDATED: Added status column for pipeline integrity
+    
+    # NEW: Added a job_id for context and easier lookups.
+    # It is indexed but does not have a foreign key constraint.
+    job_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    
+    # FIXED: Changed task_id to a 32-byte hash to match the Task primary key.
+    # It does not have a foreign key constraint.
+    task_id: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    
     status: Mapped[str] = mapped_column(String(50), nullable=False, default='PENDING_PROCESSING')
     output_type: Mapped[str] = mapped_column(String(100), nullable=False)
     output_payload: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)

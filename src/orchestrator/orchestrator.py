@@ -28,6 +28,7 @@ from .threads.master_job_monitor import MasterJobMonitor
 from queue import Empty
 from .threads.summary_reconciler import SummaryReconciler
 from orchestrator.orchestrator_state import map_db_status_to_memory_state
+import traceback # Add this import at the top of the file
 class Orchestrator:
     """Manages the lifecycle of jobs and tasks for a specific NodeGroup."""
     @property
@@ -311,24 +312,34 @@ class Orchestrator:
         await self._update_job_in_memory_state(job.id, JobState.RUNNING)
 
 
-    async def get_task_async(self, worker_id: str) -> Optional[Dict[str, Any]]:
-        # Change from:
-        self.logger.info(f"In get_task_async")
-        if self._in_process_work_queue.qsize() == 0:
-            return None
 
+    async def get_task_async(self, worker_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Dequeues a task for a worker in single-process mode, ensuring the
+        WorkPacket header contains the correct hex-formatted task ID.
+        """
+        if not self.is_single_process_mode or self._in_process_work_queue.qsize() == 0:
+            return None
         try:
-            self.logger.info(f"Queue has task, get_task_async")
             task = await asyncio.wait_for(self._in_process_work_queue.get(), timeout=0.1)
+            
+            # Handle both bytes and string task_id
+            task_id_str = task.id.hex() if isinstance(task.id, bytes) else task.id
+            
             work_packet_dict = task.work_packet
-            self.logger.info(f"Dequeued task {task.id} for worker {worker_id}")
-            return work_packet_dict            
+            
+            # Ensure the header's task_id is the correct hex string
+            work_packet_dict["header"]["task_id"] = task_id_str
+            
+            self.logger.info(f"Dequeued task {task_id_str} for worker {worker_id}", task_id=task_id_str)
+            return work_packet_dict
+            
         except asyncio.TimeoutError:
-            self.logger.info(f"Queue gave timeout error")
             return None
         except Exception as e:
             self.error_handler.handle_error(e, "get_task_async")
             return None
+
 
     async def get_task_async_NotToUseForNow(self, worker_id: str) -> Optional[Dict[str, Any]]:
         if not self.is_single_process_mode:
@@ -349,53 +360,118 @@ class Orchestrator:
             self.error_handler.handle_error(e, "get_task_async")
             return None
 
-    def _release_resources_for_task(self, task, context: Optional[Dict] = None):
+    def _release_resources_for_task(self, job_id: int, datasource_id: Optional[str], context: Optional[Dict] = None):
         """Centralized method to release all resources held by a task."""
         context = context or {}
         try:
             # Release the datasource connection slot if one was used
-            if task.datasource_id:
-                self.resource_coordinator.release_task_reservation(task.datasource_id)
+            if datasource_id:
+                self.resource_coordinator.release_task_reservation(datasource_id)
 
             # Release the fair-sharing worker slot for the job
-            self.resource_coordinator.state_manager.release_job_worker_slot(task.job_id)
+            self.resource_coordinator.state_manager.release_job_worker_slot(job_id)
             
-            self.logger.info("Resources released successfully", task_id=task.id, **context)
+            # The original log used task.id, which we don't have here, so we use the context
+            self.logger.info("Resources released successfully", **context)
         except Exception as e:
-            self.error_handler.handle_error(e, "release_resources_for_task", task_id=task.id, **context)
+            self.error_handler.handle_error(e, "release_resources_for_task", **context)
 
-    async def report_task_result_async(self, task_id: int, status: str, is_retryable: bool, 
-                                       result_payload: Optional[Dict] = None, context: Optional[Dict] = None):
-        """Reports the final result of a task within a single database transaction."""
+    async def report_task_result_async(
+            self,
+            task_id_hex: str,
+            status: str,
+            is_retryable: bool,
+            result_payload: Optional[Dict],
+            context: Optional[Dict] = None
+        ):
+            """
+            Reports the final result of a task within a single, atomic database transaction.
+            """
+            context = context or {}
+            job_id_for_release = None
+            datasource_id_for_release = None
+            
+            try:
+                task_id_bytes = bytes.fromhex(task_id_hex)
+                
+                # Open ONE session that will be used for the entire operation.
+                async with self.db.get_async_session() as session:
+                
+                    # 1. Fetch the task using the active session.
+                    task = await self.db.get_task_by_id(task_id_bytes, session=session, context=context)
+                    if not task:
+                        self.logger.warning("Received result for an unknown or already processed task.", task_id=task_id_hex)
+                        return
+
+                    # 2. Eagerly read attributes into local variables while the task is "attached".
+                    job_id_for_release = task.job_id
+                    datasource_id_for_release = task.datasource_id
+                    
+                    # 3. Perform the database update using the SAME session.
+                    if status.upper() == "COMPLETED":
+                        await self.db.complete_task(task_id_bytes, session=session, context=context)
+                    else:
+                        await self.db.fail_task(
+                            task_id_bytes,
+                            is_retryable,
+                            self.settings.worker.max_retries,
+                            session=session,
+                            context=context
+                        )
+                    
+                    # 4. Commit the single transaction.
+                    await session.commit()
+
+            except (ValueError, TypeError) as e:
+                self.logger.error(f"Invalid task_id format received: {task_id_hex}. Error: {e}", task_id=task_id_hex)
+            except Exception as e:
+                self.error_handler.handle_error(e, "report_task_result_async", operation="task_db_update", task_id=task_id_hex)
+                # Do not re-raise; allow the finally block to run for resource cleanup.
+            finally:
+                # 5. The release method is now safe because it uses simple, copied variables.
+                if job_id_for_release is not None:
+                    self._release_resources_for_task(job_id_for_release, datasource_id_for_release, context)
+
+
+    async def update_task_progress_async(
+        self, 
+        task_id_hex: str, 
+        progress_record: Dict, 
+        context: Optional[Dict] = None
+    ) -> None:
+        """
+        Reports intermediate progress from a running task, converting the hex
+        task_id to bytes and including the job_id for the output record.
+        """
         context = context or {}
-        task = None
         try:
-            # The session manager ensures the DB operations are atomic
-            async with self.db.get_async_session() as session:
-                task = await self.db.get_task_by_id(task_id, context=context)
-                if not task:
-                    self.logger.warning("Received result for an unknown or already processed task.", task_id=task_id)
+            task_id_bytes = bytes.fromhex(task_id_hex)
+            
+            job_id = context.get("job_id")
+            if not job_id:
+                # --- DEVELOPER FIX REQUIRED ---
+                # This block is a fallback for call sites that are not correctly
+                # passing the job_id in the context from the worker.
+                call_stack = "".join(traceback.format_stack())
+                self.logger.warning(
+                    "DEV_FIX: job_id was not found in the context for a progress update. "
+                    "This requires a database fallback and should be fixed at the call site.",
+                    task_id=task_id_hex,
+                    call_stack=call_stack
+                )
+                # --- End of fix block ---
+
+                # Fallback: Fetch the task to get the job_id
+                task = await self.db.get_task_by_id(task_id_bytes)
+                if task:
+                    job_id = task.job_id
+                else:
+                    self.logger.error(f"Cannot report progress for unknown task: {task_id_hex}")
                     return
 
-                if status.upper() == "COMPLETED":
-                    await self.db.complete_task(task_id, session=session, context=context)
-                else:
-                    await self.db.fail_task(task_id, is_retryable, self.settings.worker.max_retries, session=session, context=context)
-
-        except Exception as e:
-            self.error_handler.handle_error(e, "report_task_result_async", operation="task_db_update", task_id=task_id)
-            # We still need to try and release resources even if the DB update fails
-        finally:
-            if task:
-                self._release_resources_for_task(task, context)
-
-    async def update_task_progress_async(self, task_id: int, progress_record: Dict, 
-                                         context: Optional[Dict] = None) -> None:
-        """Reports intermediate progress from a running task."""
-        context = context or {}
-        try:
             await self.db.write_task_output_record(
-                task_id=task_id,
+                job_id=job_id,
+                task_id=task_id_bytes,
                 output_type=progress_record.get("output_type", "UNKNOWN"),
                 payload=progress_record.get("output_payload", {}),
                 context=context
@@ -403,12 +479,14 @@ class Orchestrator:
             
             self.logger.log_progress_batch(
                 progress_record.get("output_payload", {}),
-                task_id,
+                task_id_hex,
                 sampling_rate=self.settings.logging.progress_sampling_rate
             )
             
+        except (ValueError, TypeError) as e:
+            self.logger.error(f"Invalid task_id format received in progress update: {task_id_hex}. Error: {e}", task_id=task_id_hex)
         except Exception as e:
-            self.error_handler.handle_error(e, "update_task_progress_async", operation="progress_update", task_id=task_id)
+            self.error_handler.handle_error(e, "update_task_progress_async", task_id=task_id_hex)
 
 
     async def get_job_state_safely(self, job_id: int) -> Optional[Dict[str, Any]]:
