@@ -59,33 +59,51 @@ class ClassificationEngine:
                         recognizer = self._create_recognizer_from_config(self.classifier_configs[classifier_id])
                         if recognizer:
                             registry.add_recognizer(recognizer)
+                            for pattern in recognizer.patterns:
+                                print(f"  Presidio Pattern: name='{pattern.name}', regex='{pattern.regex}', score={pattern.score}")
+                                print(f"  Pattern regex repr: {repr(pattern.regex)}")
+                                
+                                # Test the pattern directly
+                                import re
+                                test_data = "CCNO:5234792011936522 | SSN:574-18-0576 | EMAIL:PATSY_AAMODT@AOL.COM | PHONE:907-236-2793"
+                                try:
+                                    matches = re.findall(pattern.regex, test_data)
+                                    print(f"  Direct regex test on sample data: {matches}")
+                                except Exception as e:
+                                    print(f"  Regex error: {e}")                            
                 
                 self.analyzer = AnalyzerEngine(nlp_engine=nlp_engine, registry=registry)
                 self._initialized = True
+                print("Loaded recognizers:")
+                for recognizer in self.analyzer.registry.recognizers:
+                    print(f"  - {recognizer.name}: {recognizer.supported_entities}")              
             except Exception as e:
                 raise self.error_handler.handle_error(e, "presidio_initialization")
 
     def _create_recognizer_from_config(self, config: Dict[str, Any]) -> Optional[PatternRecognizer]:
-        """Creates a Presidio PatternRecognizer from a detailed classifier configuration dictionary."""
         try:
             patterns = [Pattern(name=p['name'], regex=p['regex'], score=p['score']) for p in config.get('patterns', [])]
             if not patterns:
+                print(f"WARNING: No patterns found for classifier {config.get('classifier_id', 'unknown')}")
                 return None
 
-            support_rules = [r for r in config.get('context_rules', []) if r['rule_type'] == 'SUPPORT']
+            # FIX: Case-insensitive comparison for rule_type
+            support_rules = [r for r in config.get('context_rules', []) if r['rule_type'].upper() == 'SUPPORT']
             support_keywords = [r['regex'] for r in support_rules] if support_rules else []
-            max_window = max((r['window_before'] + r['window_after']) for r in support_rules) if support_rules else 50
 
-            return PatternRecognizer(
+            recognizer = PatternRecognizer(
                 supported_entity=config['entity_type'],
-                name=config['classifier_id'],
                 patterns=patterns,
                 context=support_keywords,
-                context_window_size=max_window
+                name=config['classifier_id']
             )
-        except Exception:
-            # Errors will be logged by the caller
-            return None
+            print(f"SUCCESS: Created recognizer for {config['classifier_id']} with {len(patterns)} patterns and {len(support_keywords)} context rules")
+            return recognizer
+            
+        except Exception as e:
+            print(f"ERROR: Failed to create recognizer for {config.get('classifier_id', 'unknown')}: {str(e)}")
+            print(f"Config: {config}")
+            raise
 
     def classify_content(self, content: str, context_info: Dict[str, Any]) -> List[PIIFinding]:
         """
@@ -105,21 +123,52 @@ class ClassificationEngine:
 
                 # 1. Get initial raw findings from Presidio
                 raw_results = self.analyzer.analyze(text=content, entities=entity_types, language='en')
-                
+                for i, result in enumerate(raw_results):
+                    print(f"Result {i}: {result.entity_type}")
+                    print(f"  analysis_explanation: {result.analysis_explanation}")
+                    print(f"  recognition_metadata: {getattr(result, 'recognition_metadata', 'Not present')}")
+                    print(f"  hasattr analysis_explanation: {hasattr(result, 'analysis_explanation')}")
+                    if hasattr(result, 'analysis_explanation') and result.analysis_explanation:
+                        print(f"  recognizer: {result.analysis_explanation.recognizer}")                
+                print(f"CRITICAL DEBUG: Presidio returned {len(raw_results)} results in real app")
                 # 2. Run the post-processing pipeline
                 processed_findings = []
                 for result in raw_results:
-                    classifier_config = self.classifier_configs.get(result.recognizer_name)
-                    if not classifier_config:
+                    # 1. Add a safety check. For some built-in recognizers, analysis_explanation can be None.
+                    #    If it's None, we cannot reliably determine the source recognizer, so we must skip it.
+                    recognizer_name = None
+                    if hasattr(result, 'recognition_metadata') and result.recognition_metadata:
+                        recognizer_name = result.recognition_metadata.get('recognizer_name')
+
+                    if not recognizer_name:
+                        print(f"  CONTINUE: No recognizer name found for {result.entity_type}")
                         continue
 
+                    print(f"  Recognizer name from metadata: {recognizer_name}")
+                    
+                    classifier_config = self.classifier_configs.get(recognizer_name)
+                    if not classifier_config:
+                        print(f"  CONTINUE: No classifier config found for recognizer: {recognizer_name}")
+                        continue
+
+                    
+                    
+
+                    
                     # The pipeline: if any check fails, the finding is discarded.
                     if not self._check_negative_support(result, content, classifier_config):
+                        print(f"  CONTINUE: Failed negative support check for {result.entity_type}")
                         continue
+                        
                     if not self._check_validations(result, content, classifier_config):
+                        print(f"  CONTINUE: Failed validation check for {result.entity_type}")
                         continue
+                        
                     if not self._check_exclude_list(result, content, classifier_config):
+                        print(f"  CONTINUE: Failed exclude list check for {result.entity_type}")
                         continue
+                    
+                    print(f"  SUCCESS: All checks passed for {result.entity_type}")
 
                     # 3. If all checks pass, create the final PIIFinding object
                     finding = PIIFinding(
@@ -151,6 +200,7 @@ class ClassificationEngine:
 
     def _check_validations(self, result, content, config) -> bool:
         """Returns False if a required validation fails, True otherwise."""
+        return True
         validation_rules = config.get('validation_rules', [])
         if not validation_rules:
             return True

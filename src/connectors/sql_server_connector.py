@@ -495,20 +495,12 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                     # NEW: Check that the object is a database table before processing
                     if discovered_obj.object_type == ObjectType.DATABASE_TABLE:
                         # FIXED: Redundant database lookup is removed. All info is in discovered_obj.
-                        content = await self._extract_content_for_classification_async(
+                        content_batch = await self._extract_content_for_classification_async(
                             discovered_obj.object_path, discovered_obj.object_type, trace_id, task_id
                         )
                         
-                        if content:
-                            yield {
-                                "object_id": discovered_obj.object_path,
-                                "content": content,
-                                "metadata": {
-                                    "object_path": discovered_obj.object_path,
-                                    "object_type": discovered_obj.object_type,
-                                    "datasource_id": self.datasource_id
-                                }
-                            }
+                        if content_batch:
+                            yield content_batch
                             objects_processed += 1
                     else:
                         self.logger.warning(f"Skipping get_content for incorrect object_type '{discovered_obj.object_type}'",
@@ -1018,22 +1010,56 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                 object_id=object_id
             )
 
+
     async def _extract_content_for_classification_async(self, object_path: str, object_type: str, 
-                                                      trace_id: str, task_id: int) -> Optional[str]:
-        """Extract content from object for classification (async)."""
+                                                      trace_id: str, task_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Extracts content from a database object for classification, now including
+        the full table schema in the metadata.
+        """
         try:
-            # Parse object path
             path_parts = object_path.split('.')
             
-            if len(path_parts) == 3:
-                # Table-level content (row processing mode)
+            if len(path_parts) == 3: # Table-level object
                 database_name, schema_name, table_name = path_parts
-                return await self._sample_table_content_async(database_name, schema_name, table_name)
                 
-            
+                # --- THIS IS THE FIX ---
+                # 1. Fetch the full schema (column names and data types) for the table.
+                table_schema_query = (
+                    self.connector_config.get('sql_server_queries', {})
+                    .get('common_queries', {})
+                    .get('column_metadata', 
+                         "SELECT COLUMN_NAME, DATA_TYPE FROM [{database_name}].INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = '{schema_name}' AND TABLE_NAME = '{table_name}'")
+                ).format(database_name=database_name, schema_name=schema_name, table_name=table_name)
+                
+                columns_result = await self.connection.execute_query_async(table_schema_query)
+                
+                # Convert the schema into the dictionary format the RowProcessor expects.
+                table_columns = {
+                    row['COLUMN_NAME']: {'data_type': row['DATA_TYPE']}
+                    for row in columns_result
+                }
+                
+                # 2. Sample the row data as before.
+                sampled_rows = await self._sample_table_content_async(database_name, schema_name, table_name)
+                
+                # 3. Combine the schema and data into a single package for the Worker.
+                return {
+                    "content": sampled_rows,
+                    "metadata": {
+                        "object_path": object_path,
+                        "object_type": object_type,
+                        "database_name": database_name,
+                        "schema_name": schema_name,
+                        "table_name": table_name,
+                        "columns": table_columns  # Include the fetched schema here
+                    }
+                }
+                # --- END OF FIX ---
+                
             else:
                 raise ProcessingError(
-                    f"Invalid object path format: {object_path}",
+                    f"Invalid object path format for database content extraction: {object_path}",
                     ErrorType.PROCESSING_LOGIC_ERROR,
                     operation="extract_content_for_classification_async"
                 )
@@ -1045,6 +1071,10 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                 operation="extract_content_for_classification_async",
                 object_path=object_path
             )
+
+
+
+
 
     async def _sample_table_content_async(self, database_name: str, schema_name: str, table_name: str) -> List[Dict[str, Any]]:
         """Samples content from a table and returns it as structured row data."""
@@ -1069,9 +1099,15 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                 table_name=table_name,
                 sample_size=sample_size
             )
-            
+
+            # --- END OF NEW LOGGING ---            
             result = await self.connection.execute_query_async(formatted_query)
-            
+            # --- THIS IS THE NEW LOGGING ---
+            self.logger.info(
+                f"Successfully sampled {len(result)} rows from table {database_name}.{schema_name}.{table_name}",
+                row_count=len(result),
+                table=f"{database_name}.{schema_name}.{table_name}"
+            )            
 
             return result
                 

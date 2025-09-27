@@ -126,7 +126,8 @@ class Worker:
         return {
             "job_id": work_packet.header.job_id,
             "task_id": work_packet.header.task_id,
-            "trace_id": work_packet.header.trace_id
+            "trace_id": work_packet.header.trace_id,
+            
         }
 
 
@@ -641,7 +642,7 @@ class Worker:
         """Processes a CLASSIFICATION task using the unified identity system."""
         payload: ClassificationPayload = work_packet.payload
         job_context = self.job_context(work_packet)
-        
+        job_context["datasource_id"]=payload.datasource_id
         engine_interface = EngineInterface(
             db_interface=self.db_interface,
             config_manager=self.config_manager,
@@ -738,13 +739,19 @@ class Worker:
             # Extract metadata and row data from the batch
             metadata = content_batch.get("metadata", {})
             rows = content_batch.get("content", []) # Expects a list of row dicts
-            
+           
             if not isinstance(rows, list):
                 self.logger.warning("Database content for classification was not a list of rows.", object_id=metadata.get("object_id"))
                 continue
             
             total_rows_scanned += len(rows)
-
+            # --- THIS IS THE NEW LOGGING ---
+            self.logger.info(
+                f"Processing batch of {len(rows)} rows for object {metadata.get('object_path')}",
+                row_count=len(rows),
+                object_path=metadata.get('object_path')
+            )
+            # --- END OF NEW LOGGING ---
             # Process each row within the batch
             for row_index, row_data in enumerate(rows):
                 try:
@@ -762,6 +769,37 @@ class Worker:
 
         self.logger.info("Converting findings to database format", task_id=work_packet.header.task_id, total_findings=len(all_findings))
         
+        # Log all findings in detail
+        if all_findings:
+            try:
+                # Convert all PIIFinding objects to dictionaries for safe JSON serialization
+                findings_as_dicts = []
+                for finding in all_findings:
+                    finding_dict = {
+                        "finding_id": finding.finding_id,
+                        "entity_type": finding.entity_type,
+                        "text": finding.text,  # This contains the actual PII text found
+                        "start_position": finding.start_position,
+                        "end_position": finding.end_position,
+                        "confidence_score": finding.confidence_score,
+                        "classifier_id": finding.classifier_id,
+                        "context_data": finding.context_data  # This is already a dict
+                    }
+                    findings_as_dicts.append(finding_dict)
+                
+                # Log all findings as JSON
+                self.logger.info("All PIIFindings from database classification:")
+                self.logger.info(json.dumps(findings_as_dicts, indent=2, default=str))
+                
+            except Exception as e:
+                # Fallback to string representation if JSON fails
+                self.logger.warning(f"Failed to serialize findings as JSON: {str(e)}")
+                for i, finding in enumerate(all_findings):
+                    self.logger.info(f"Finding {i+1}: {str(finding)}")
+        else:
+            self.logger.info("No PII findings detected in database classification", task_id=work_packet.header.task_id)
+
+
         # Convert all accumulated findings using the correct total row count
         db_records = engine_interface.convert_findings_to_db_format(
             all_findings=all_findings,

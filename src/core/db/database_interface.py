@@ -1086,7 +1086,13 @@ class DatabaseInterface:
                         joinedload(ClassifierTemplate.classifiers)
                         .joinedload(Classifier.context_rules),
                         joinedload(ClassifierTemplate.classifiers)
-                        .joinedload(Classifier.validation_rules)
+                        .joinedload(Classifier.validation_rules),
+                        # --- THIS IS THE FIX ---
+                        # Eagerly load the exclude_list relationship as well.
+                        joinedload(ClassifierTemplate.classifiers)
+                        .joinedload(Classifier.exclude_list)
+                        # --- END OF FIX ---
+                        
                     )
                 )
                 result = await session.scalars(stmt)
@@ -1141,70 +1147,6 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, context="get_connector_configuration", 
                                           connector_type=connector_type, **context)
             raise
-
-    async def insert_scan_findings(self, findings: List[Dict[str, Any]], context: Optional[Dict[str, Any]] = None) -> int:
-        """Insert scan findings into the findings tables using hash-based primary keys."""
-        context = context or {}
-        if not findings:
-            return 0
-            
-        self.logger.log_database_operation("BULK INSERT", "ScanFindingSummaries", "STARTED", 
-                                         record_count=len(findings), **context)
-        try:
-            async with self.get_async_session() as session:
-                # Convert findings to ORM format with hash-based primary keys
-                summaries = []
-                for finding in findings:
-                    # Create finding key hash - this becomes the primary key
-                    import hashlib
-                    key_components = [
-                        finding.get('scan_job_id', ''),
-                        finding.get('datasource_id', ''),
-                        finding.get('classifier_id', ''),
-                        finding.get('entity_type', ''),
-                        finding.get('schema_name', '') or '',
-                        finding.get('table_name', '') or '',
-                        finding.get('field_name', '') or '',
-                        finding.get('file_path', '') or '',
-                        finding.get('file_name', '') or ''
-                    ]
-                    key_string = '|'.join(str(comp) for comp in key_components)
-                    finding_key_hash = hashlib.sha256(key_string.encode()).digest()
-                    
-                    summary = {
-                        'finding_key_hash': finding_key_hash,  # Primary key
-                        'scan_job_id': finding.get('scan_job_id'),
-                        'data_source_id': finding.get('datasource_id'),
-                        'classifier_id': finding.get('classifier_id'),
-                        'entity_type': finding.get('entity_type'),
-                        'schema_name': finding.get('schema_name'),
-                        'table_name': finding.get('table_name'),
-                        'field_name': finding.get('field_name'),
-                        'file_path': finding.get('file_path'),
-                        'file_name': finding.get('file_name'),
-                        'file_extension': finding.get('file_extension'),
-                        'finding_count': finding.get('finding_count', 1),
-                        'average_confidence': finding.get('average_confidence', 0.0),
-                        'max_confidence': finding.get('max_confidence', 0.0),
-                        'sample_findings': finding.get('sample_findings'),
-                        'total_rows_in_source': finding.get('total_rows_in_source'),
-                        'non_null_rows_scanned': finding.get('non_null_rows_scanned')
-                    }
-                    summaries.append(summary)
-                
-                # Bulk insert summaries using hash-based primary keys
-                await session.run_sync(lambda sync_session: sync_session.bulk_insert_mappings(ScanFindingSummary, summaries))
-                await session.commit()
-                
-                self.logger.log_database_operation("BULK INSERT", "ScanFindingSummaries", "SUCCESS", 
-                                                 record_count=len(summaries), **context)
-                return len(summaries)
-            
-        except Exception as e:
-            self.error_handler.handle_error(e, context="insert_scan_findings", 
-                                          finding_count=len(findings), **context)
-            raise
-
 
     async def get_objects_for_classification(self, object_key_hashes: List[bytes], context: Optional[Dict[str, Any]] = None) -> List[OrmDiscoveredObject]:
         """Get discovered objects by their key hashes for classification."""
@@ -1480,6 +1422,177 @@ class DatabaseInterface:
                                           staging_table=staging_table_name,
                                           object_count=len(objects), **context)
             raise
+
+
+
+    async def insert_scan_findings(self, findings: List[Dict[str, Any]], context: Optional[Dict[str, Any]] = None) -> int:
+        """Insert scan findings into the findings tables using hash-based primary keys with upsert logic."""
+
+        
+        context = context or {}
+        if not findings:
+            return 0
+            
+        self.logger.log_database_operation("BULK ", "ScanFindingSummaries", "STARTED", 
+                                         record_count=len(findings), **context)
+        try:
+            async with self.get_async_session() as session:
+                # Convert findings to ORM format with hash-based primary keys
+                summaries = []
+                for i, finding in enumerate(findings):
+                        # Create finding key hash - this becomes the primary key
+                    # Debug logging to check field names and values
+                    self.logger.info(f"Processing finding {i+1}/{len(findings)}")
+                    self.logger.info(f"Keys in finding dict: {list(finding.keys())}")
+                    
+                    # Check both possible field names
+                    datasource_id_value = finding.get('datasource_id')
+                    data_source_id_value = finding.get('data_source_id') 
+                    
+                    self.logger.info(f"finding.get('datasource_id'): {datasource_id_value}")
+                    self.logger.info(f"finding.get('data_source_id'): {data_source_id_value}")
+                    
+                    # Create a safe copy of finding for logging (remove datetime objects)
+                    safe_finding = {}
+                    for key, value in finding.items():
+                        if hasattr(value, 'isoformat'):  # datetime object
+                            safe_finding[key] = str(value)
+                        else:
+                            safe_finding[key] = value
+                    
+                    self.logger.info(f"Full finding dict (safe): {safe_finding}")
+
+
+                    key_components = [
+                        finding.get('scan_job_id', ''),
+                        finding.get('data_source_id', ''),
+                        finding.get('classifier_id', ''),
+                        finding.get('entity_type', ''),
+                        finding.get('schema_name', '') or '',
+                        finding.get('table_name', '') or '',
+                        finding.get('field_name', '') or '',
+                        finding.get('file_path', '') or '',
+                        finding.get('file_name', '') or ''
+                    ]
+                    key_string = '|'.join(str(comp) for comp in key_components)
+                    finding_key_hash = hashlib.sha256(key_string.encode()).digest()
+                    
+                    summary = {
+                        'finding_key_hash': finding_key_hash,  # Primary key
+                        'scan_job_id': finding.get('scan_job_id'),
+                        'data_source_id': finding.get('data_source_id'),
+                        'classifier_id': finding.get('classifier_id'),
+                        'entity_type': finding.get('entity_type'),
+                        'schema_name': finding.get('schema_name'),
+                        'table_name': finding.get('table_name'),
+                        'field_name': finding.get('field_name'),
+                        'file_path': finding.get('file_path'),
+                        'file_name': finding.get('file_name'),
+                        'file_extension': finding.get('file_extension'),
+                        'finding_count': finding.get('finding_count', 1),
+                        'average_confidence': finding.get('average_confidence', 0.0),
+                        'max_confidence': finding.get('max_confidence', 0.0),
+                        'sample_findings': finding.get('sample_findings'),
+                        'total_rows_in_source': finding.get('total_rows_in_source'),
+                        'non_null_rows_scanned': finding.get('non_null_rows_scanned')
+                    }
+                    summaries.append(summary)
+                
+                def sync_upsert(sync_session):
+                    try:
+                        # Use session-local temporary table (single #) with timestamp for uniqueness
+                        temp_table_name = f"#temp_scan_findings_{int(time.time() * 1000)}"
+                        
+                        # Create session-local temporary table
+                        create_temp_sql = f"""
+                        CREATE TABLE {temp_table_name} (
+                            finding_key_hash VARBINARY(32) PRIMARY KEY,
+                            scan_job_id BIGINT,
+                            data_source_id NVARCHAR(255),
+                            classifier_id NVARCHAR(255),
+                            entity_type NVARCHAR(255),
+                            schema_name NVARCHAR(255),
+                            table_name NVARCHAR(255),
+                            field_name NVARCHAR(255),
+                            file_path NVARCHAR(4000),
+                            file_name NVARCHAR(255),
+                            file_extension NVARCHAR(50),
+                            finding_count INT,
+                            average_confidence FLOAT,
+                            max_confidence FLOAT,
+                            sample_findings NVARCHAR(MAX),
+                            total_rows_in_source BIGINT,
+                            non_null_rows_scanned BIGINT
+                        )
+                        """
+                        
+                        sync_session.execute(text(create_temp_sql))
+                        
+                        # Insert data into temp table using direct SQL with named parameters
+                        if summaries:
+                            insert_sql = f"""
+                            INSERT INTO {temp_table_name} 
+                            (finding_key_hash, scan_job_id, data_source_id, classifier_id, entity_type,
+                             schema_name, table_name, field_name, file_path, file_name, file_extension,
+                             finding_count, average_confidence, max_confidence, sample_findings,
+                             total_rows_in_source, non_null_rows_scanned)
+                            VALUES 
+                            (:finding_key_hash, :scan_job_id, :data_source_id, :classifier_id, :entity_type,
+                             :schema_name, :table_name, :field_name, :file_path, :file_name, :file_extension,
+                             :finding_count, :average_confidence, :max_confidence, :sample_findings,
+                             :total_rows_in_source, :non_null_rows_scanned)
+                            """
+                            
+                            # Execute the bulk insert with named parameters
+                            sync_session.execute(text(insert_sql), summaries)
+                        
+                        # MERGE from temp table to permanent table
+                        merge_sql = f"""
+                        MERGE scan_finding_summaries AS target
+                        USING {temp_table_name} AS source
+                        ON target.finding_key_hash = source.finding_key_hash
+                        WHEN MATCHED THEN
+                            UPDATE SET
+                                finding_count = source.finding_count,
+                                average_confidence = source.average_confidence,
+                                max_confidence = source.max_confidence,
+                                sample_findings = source.sample_findings,
+                                total_rows_in_source = source.total_rows_in_source,
+                                non_null_rows_scanned = source.non_null_rows_scanned
+                        WHEN NOT MATCHED THEN
+                            INSERT (finding_key_hash, scan_job_id, data_source_id, classifier_id, entity_type,
+                                    schema_name, table_name, field_name, file_path, file_name, file_extension,
+                                    finding_count, average_confidence, max_confidence, sample_findings,
+                                    total_rows_in_source, non_null_rows_scanned)
+                            VALUES (source.finding_key_hash, source.scan_job_id, source.data_source_id,
+                                    source.classifier_id, source.entity_type, source.schema_name,
+                                    source.table_name, source.field_name, source.file_path, source.file_name,
+                                    source.file_extension, source.finding_count, source.average_confidence,
+                                    source.max_confidence, source.sample_findings, source.total_rows_in_source,
+                                    source.non_null_rows_scanned);
+                        """
+                        
+                        sync_session.execute(text(merge_sql))
+                        
+                    except Exception as e:
+                        raise
+                
+                # Execute the upsert using the same pattern as your existing code
+                await session.run_sync(sync_upsert)
+                await session.commit()
+                
+                self.logger.log_database_operation("BULK UPSERT", "ScanFindingSummaries", "SUCCESS", 
+                                                 record_count=len(summaries), **context)
+                return len(summaries)
+            
+        except Exception as e:
+            self.error_handler.handle_error(e, context="insert_scan_findings", 
+                                          finding_count=len(findings), **context)
+            raise
+
+
+
+
 
     async def get_all_datasources(self, enabled_only: bool = True, context: Optional[Dict[str, Any]] = None) -> List[DataSource]:
         """Get all datasources, optionally filtered by enabled status."""

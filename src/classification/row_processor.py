@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import asyncio
 
 from .field_mapper import FieldMapper, filter_fields_for_classification
-
+from core.errors import ProcessingError, ErrorType, ErrorHandler
 
 class RowProcessor:
     """Processes database rows following Presidio best practices"""
@@ -42,7 +42,13 @@ class RowProcessor:
             combined_text, position_map = self.field_mapper.build_row_text_with_mapping(
                 row_data, filtered_fields
             )
-            
+            # --- ADD THIS LOGGING ---
+            # This will print the exact string sent to the classification engine for each row.
+            print("-" * 25, " ROW PROCESSOR DEBUG ", "-" * 25)
+            print(f"Row PK: {row_pk}")
+            print(f"Combined Text Sent to Engine: '{combined_text}'")
+            print("-" * 75)
+            # --- END OF LOGGING ---            
             # Skip empty rows
             if not combined_text.strip():
                 return {}
@@ -60,7 +66,17 @@ class RowProcessor:
             }
             
             # Run classification
-            findings = classifier.classify_content(combined_text, context_info)
+            # --- THIS IS THE FIX ---
+            # Run the synchronous, CPU-bound classification in a separate thread
+            # to prevent blocking the worker's async event loop.
+            loop = asyncio.get_running_loop()
+            findings = await loop.run_in_executor(
+                None,  # Use the default thread pool executor
+                classifier.classify_content,  # The synchronous function to run
+                combined_text,  # The first argument to the function
+                context_info    # The second argument to the function
+            )
+            # --- END OF FIX ---
             
             # Map findings back to fields
             field_findings = self.field_mapper.validate_field_mapping(findings, position_map)
@@ -86,12 +102,27 @@ class RowProcessor:
             #print(tblme_str)
 
             
-            return structured_findings
+            #return structured_findings
+            # --- START OF CHANGE ---
+            # The method now enriches and returns the original PIIFinding objects
+            # instead of converting them to a different dictionary structure.
+            all_findings = []
+            for field_name, findings_list in field_findings.items():
+                for finding in findings_list:
+                    if not hasattr(finding, 'context_data') or finding.context_data is None:
+                        finding.context_data = {}
+                    finding.context_data.update({
+                        "field_name": field_name,
+                        **context_info
+                    })
+                    all_findings.append(finding)
             
+            return all_findings
+            # --- END OF CHANGE ---            
         except Exception as e:
             # Return empty results on error, log for debugging
-            print(f"Error processing row {row_pk}: {str(e)}")
-            return {}
+            raise ProcessingError(f"Error processing row {row_pk}: {str(e)}") from e
+            
     
     async def process_document_content(self,
                                      content: str,

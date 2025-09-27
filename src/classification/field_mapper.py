@@ -143,50 +143,68 @@ class FieldMapper:
 
 def filter_fields_for_classification(table_metadata: Dict[str, Any]) -> List[str]:
     """
-    Filter table columns to include only those likely to contain PII
-    
-    Args:
-        table_metadata: Table schema information
-        
-    Returns:
-        List of field names to include in classification
+    Filter table columns to include only those likely to contain PII,
+    now with detailed logging for debugging purposes.
     """
+    print("\n" + "-"*20 + " Running Field Filter " + "-"*20)
     included_fields = []
+    excluded_count = 0
     
-    for column_name, column_info in table_metadata.get('columns', {}).items():
+    # Ensure there are columns to iterate over
+    columns = table_metadata.get('columns', {})
+    if not columns:
+        print("Warning: No columns found in table metadata.")
+    
+    for column_name, column_info in columns.items():
         data_type = column_info.get('data_type', '').upper()
         
-        # Step 1: Data type filter
+        #print(f"Evaluating column: '{column_name}' (Type: {data_type})")
+
+        # Step 1: Data type filter for non-textual types
         if data_type in ['DATE', 'TIMESTAMP', 'BOOLEAN', 'BINARY']:
-            continue  # Skip these types
-        
+            #print(f" -> EXCLUDED: Non-textual data type '{data_type}'.")
+            excluded_count += 1
+            continue
+
         # Step 2: Contextual filter for numeric types
         if data_type in ['INT', 'BIGINT', 'NUMERIC', 'DECIMAL']:
-            # Check column name for PII patterns
             column_lower = column_name.lower()
             
-            # Include if matches PII patterns
             pii_patterns = [
                 'account', 'passport', 'license', 'ssn', 'social',
                 'credit_card', 'card', 'number', 'id_number'
             ]
             
-            # Exclude if matches generic patterns
             generic_patterns = [
                 'customer_id', 'order_id', 'item_id', 'user_id',
                 'quantity', 'age', 'amount', 'price', 'count'
             ]
             
             if any(pattern in column_lower for pattern in generic_patterns):
+                #print(f" -> EXCLUDED: Numeric column name matches a generic ID pattern.")
+                excluded_count += 1
                 continue
             
             if any(pattern in column_lower for pattern in pii_patterns):
+                #print(f" -> INCLUDED: Numeric column name matches a PII pattern.")
                 included_fields.append(column_name)
-        else:
-            # Include text-based fields
-            included_fields.append(column_name)
+                continue  # Move to the next column
+            else:
+                #print(f" -> EXCLUDED: Numeric column with a non-PII name.")
+                included_fields.append(column_name)
+                continue
+        
+        # If it's not excluded by the rules above, it's included (e.g., VARCHAR, TEXT)
+        #print(f" -> INCLUDED: General text-based data type.")
+        included_fields.append(column_name)
+    
+    #print("--- Field Filter Summary ---")
+    #print(f"Included fields for scanning: {included_fields}")
+    #print(f"Excluded fields: {excluded_count}")
+    #print("-" * 62 + "\n")
     
     return included_fields
+
 
 
 # Test functions

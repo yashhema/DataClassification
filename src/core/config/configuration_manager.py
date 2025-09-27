@@ -114,6 +114,7 @@ class ClassificationConfidenceConfig(BaseModel):
     low_threshold: int = Field(30, description="Upper bound for LOW confidence score (e.g., 0-30).")
     medium_threshold: int = Field(60, description="Upper bound for MEDIUM confidence score (e.g., 31-60).")
     # Anything above medium is considered HIGH
+    high_confidence_min_score: float = Field(0.8, description="Minimum score to be considered a high-confidence finding.")
 
 class ClassificationConfig(BaseModel):
     """Expanded configuration for the classification subsystem."""

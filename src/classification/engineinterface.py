@@ -21,7 +21,7 @@ from core.logging.system_logger import SystemLogger
 from core.errors import ErrorHandler, ClassificationError, ErrorType
 from core.models.models import PIIFinding
 from core.utils.hash_utils import generate_finding_key_hash
-
+from core.errors import ProcessingError, ErrorType, ErrorHandler
 # =============================================================================
 # Helper Class: Configuration Loader (Internal to the Interface)
 # =============================================================================
@@ -35,7 +35,7 @@ class _ConfigurationLoader:
         self.db_interface = db_interface
         self.job_context = job_context
 
-    async def load_and_assemble(self, template_id: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    async def load_and_assemble(self, template_id: str, system_logger: SystemLogger, error_handler: ErrorHandler) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         orm_template =await self.db_interface.get_classifier_template_full(template_id, context=self.job_context)
         if not orm_template:
             raise ClassificationError(f"Template '{template_id}' not found.", ErrorType.CONFIGURATION_MISSING)
@@ -59,6 +59,9 @@ class _ConfigurationLoader:
                 # Assumes an 'exclude_list' relationship exists on the ORM model
                 "exclude_list": [e.term_to_exclude for e in getattr(orm_classifier, 'exclude_list', [])]
             }
+        system_logger.debug(f"Assembled template configuration: {json.dumps(template_config, indent=2)}")
+        system_logger.debug(f"Assembled classifier configurations: {json.dumps(classifier_configs, indent=2)}")
+            
         return template_config, classifier_configs
 
 # =============================================================================
@@ -87,7 +90,7 @@ class EngineInterface:
         try:
             self.logger.info(f"Initializing EngineInterface for template '{template_id}'", **self.job_context)
             loader = _ConfigurationLoader(self.db_interface, self.job_context)
-            template_config, classifier_configs =await loader.load_and_assemble(template_id)
+            template_config, classifier_configs =await loader.load_and_assemble(template_id,self.logger,self.error_handler)
             
             self._engine = ClassificationEngine(template_config, classifier_configs, self.error_handler)
             self._row_processor = RowProcessor()
@@ -149,9 +152,11 @@ class EngineInterface:
             Returns:
                 A list of dictionaries, each ready for `insert_scan_findings`.
             """
+            safe_job_context = {k: str(v) if hasattr(v, 'isoformat') else v for k, v in self.job_context.items()}; self.logger.info(f"DEBUG: job_context in convert_findings_to_db_format: {safe_job_context}")
+            
             if not all_findings:
                 return []
-
+            
             # --- Determine Source Type from the first finding's context ---
             first_finding_context = all_findings[0].context_data or {}
             is_file_source = 'file_path' in first_finding_context
