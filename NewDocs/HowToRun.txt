@@ -41,7 +41,7 @@ The system is designed to be started via `main.py`, which then provides an inter
 Navigate to your project's root directory in your terminal and run the following command to start the entire system in a single, debug-friendly process:
 
 ```bash
-python src/main.py --mode single_process
+python main.py --mode single_process
 ```
 
 The application will start, initialize all the components (Orchestrator, the single Worker, etc.), and you will see a command prompt like `(CLI) >`.
@@ -54,6 +54,7 @@ At the application's CLI prompt, type the following command and press Enter:
 
 ```
 start_job test_sql_localhost SCANNING
+start_job test_localdrive SCANNING
 ```
 
   * **`start_job`**: This is the command to the Orchestrator.

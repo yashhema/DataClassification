@@ -21,7 +21,7 @@ import uuid
 import aiofiles.os
 import tempfile
 import aiofiles
-from typing import AsyncIterator, Dict, Any, Optional
+from typing import AsyncIterator, Dict, Any, Optional,List
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -269,7 +269,35 @@ class ContentExtractor:
     async def _process_zip_archive(self, archive_path: str, object_id: str,
                                  job_id: int, task_id: str, datasource_id: str,
                                  current_depth: int) -> AsyncIterator[ContentComponent]:
-        """Process ZIP archive without recursion"""
+        """Process ZIP archive without recursion - Non-blocking version"""
+        
+        try:
+            # Run the blocking extraction in a thread pool
+            loop = asyncio.get_running_loop()
+            components = await loop.run_in_executor(
+                None, 
+                self._blocking_zip_archive_processing,
+                archive_path, object_id, job_id, task_id, datasource_id, current_depth
+            )
+            
+            # Yield each component
+            for component in components:
+                yield component
+                
+        except Exception as e:
+            error = self.error_handler.handle_error(
+                e, f"zip_processing_{object_id}",
+                operation="zip_archive_processing",
+                archive_path=archive_path
+            )
+            self.logger.error("ZIP processing failed", error_id=error.error_id)
+            yield self._create_error_component(object_id, f"ZIP processing failed: {str(e)}")
+
+    def _blocking_zip_archive_processing(self, archive_path: str, object_id: str,
+                                       job_id: int, task_id: str, datasource_id: str,
+                                       current_depth: int) -> List[ContentComponent]:
+        """Synchronous ZIP archive processing to run in thread pool"""
+        components = []
         
         try:
             import zipfile
@@ -299,8 +327,9 @@ class ContentExtractor:
                         temp_member_path = self._create_temp_path(job_id, task_id, datasource_id, 
                                                                 f"zip_member_{processed_members}")
                         
-                        async with aiofiles.open(temp_member_path, 'wb') as temp_file:
-                            await temp_file.write(member_data)
+                        # Write file synchronously since we're in thread pool
+                        with open(temp_member_path, 'wb') as temp_file:
+                            temp_file.write(member_data)
                         self.temp_files_created.append(temp_member_path)
                         
                         # Process member
@@ -309,15 +338,32 @@ class ContentExtractor:
                         
                         # Check if member is also an archive (nested archives)
                         if member_file_type in ['zip', 'tar']:
-                            async for component in self._process_archive(temp_member_path, member_object_id, 
-                                                                       member_file_type, job_id, task_id, 
-                                                                       datasource_id, current_depth + 1):
-                                yield component
+                            # For nested archives, we'll need to handle this differently in the async context
+                            # Store info for async processing later
+                            nested_archive_component = ContentComponent(
+                                object_id=member_object_id,
+                                component_type="nested_archive_placeholder",
+                                component_id=f"{self._get_base_name(temp_member_path)}_nested_archive_1",
+                                parent_path=f"{archive_path}/{member_name}",
+                                content=f"Nested archive: {member_file_type}",
+                                original_size=len(member_data),
+                                extracted_size=0,
+                                is_truncated=False,
+                                schema={"temp_path": temp_member_path, "file_type": member_file_type, "depth": current_depth + 1},
+                                metadata={
+                                    "archive_parent": archive_path,
+                                    "member_name": member_name,
+                                    "requires_async_processing": True
+                                },
+                                extraction_method="zip_nested_archive_marker",
+                                is_archive_extraction=True
+                            )
+                            components.append(nested_archive_component)
                         else:
-                            async for component in self._process_archive_member(temp_member_path, member_object_id,
-                                                                              member_file_type, archive_path, member_name,
-                                                                              job_id, task_id, datasource_id):
-                                yield component
+                            member_components = self._process_archive_member_blocking(temp_member_path, member_object_id,
+                                                                                    member_file_type, archive_path, member_name,
+                                                                                    job_id, task_id, datasource_id)
+                            components.extend(member_components)
                         
                         processed_members += 1
                         
@@ -326,20 +372,130 @@ class ContentExtractor:
                                            member_name=member_name,
                                            error=str(member_error))
                         continue
+            
+            return components
                         
         except Exception as e:
-            error = self.error_handler.handle_error(
-                e, f"zip_processing_{object_id}",
-                operation="zip_archive_processing",
-                archive_path=archive_path
+            error_component = self._create_error_component(object_id, f"ZIP processing failed: {str(e)}")
+            return [error_component]
+
+    def _process_archive_member_blocking(self, member_path: str, member_object_id: str, 
+                                       member_file_type: str, archive_path: str, member_name: str,
+                                       job_id: int, task_id: str, datasource_id: str) -> List[ContentComponent]:
+        """Process archive member directly without recursion - blocking version"""
+        
+        components = []
+        
+        # Route directly to file type extractor (synchronous versions)
+        if member_file_type in self.extractor_registry:
+            # We need to call the blocking versions of extractors here
+            if member_file_type == 'pdf':
+                member_components = self._blocking_pdf_extraction(member_path, member_object_id, job_id, task_id, datasource_id)
+            elif member_file_type == 'docx':
+                member_components = self._blocking_docx_extraction(member_path, member_object_id, job_id, task_id, datasource_id)
+            elif member_file_type == 'xlsx':
+                member_components = self._blocking_xlsx_extraction(member_path, member_object_id, job_id, task_id, datasource_id)
+            elif member_file_type == 'pptx':
+                member_components = self._blocking_pptx_extraction(member_path, member_object_id, job_id, task_id, datasource_id)
+            elif member_file_type == 'xml':
+                member_components = self._blocking_xml_extraction(member_path, member_object_id, job_id, task_id, datasource_id)
+            elif member_file_type == 'eml':
+                member_components = self._blocking_eml_extraction(member_path, member_object_id, job_id, task_id, datasource_id)
+            elif member_file_type == 'html':
+                member_components = self._blocking_html_extraction(member_path, member_object_id, job_id, task_id, datasource_id)
+            elif member_file_type == 'json':
+                member_components = self._blocking_json_extraction(member_path, member_object_id, job_id, task_id, datasource_id)
+            elif member_file_type == 'image':
+                member_components = self._blocking_image_extraction(member_path, member_object_id, job_id, task_id, datasource_id)
+            elif member_file_type == 'txt':
+                # For txt files, simple synchronous read
+                try:
+                    with open(member_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        text_content = f.read()
+                    
+                    text_component = self._create_text_component(
+                        member_object_id, f"{self._get_base_name(member_path)}_txt_text_1", member_path,
+                        text_content, {"encoding": "utf-8"}, "text_file_read"
+                    )
+                    member_components = [text_component]
+                except Exception as txt_error:
+                    error_component = self._create_error_component(member_object_id, f"Text file extraction failed: {str(txt_error)}")
+                    member_components = [error_component]
+            else:
+                # Fallback for unhandled types
+                member_components = []
+            
+            # Set component_type to 'archive_member' for all archive content
+            for component in member_components:
+                original_type = component.component_type
+                component.component_type = "archive_member"
+                component.is_archive_extraction = True
+                component.parent_path = f"{archive_path}/{member_name}"
+                
+                # Preserve original type in metadata
+                if not hasattr(component, 'metadata') or component.metadata is None:
+                    component.metadata = {}
+                component.metadata["original_component_type"] = original_type
+                component.metadata["archive_parent"] = archive_path
+                component.metadata["member_name"] = member_name
+            
+            components.extend(member_components)
+        else:
+            # Unsupported member type
+            unsupported_component = ContentComponent(
+                object_id=member_object_id,
+                component_type="archive_member",
+                component_id=f"{self._get_base_name(member_path)}_unsupported_1",
+                parent_path=f"{archive_path}/{member_name}",
+                content=f"Archive member type '{member_file_type}' not supported",
+                original_size=self._get_file_size_sync(member_path),
+                extracted_size=0,
+                is_truncated=False,
+                schema={},
+                metadata={
+                    "original_component_type": "unsupported_format",
+                    "archive_parent": archive_path,
+                    "member_name": member_name
+                },
+                extraction_method="archive_member_unsupported",
+                is_archive_extraction=True
             )
-            self.logger.error("ZIP processing failed", error_id=error.error_id)
-            yield self._create_error_component(object_id, f"ZIP processing failed: {str(e)}")
+            components.append(unsupported_component)
+        
+        return components
 
     async def _process_tar_archive(self, archive_path: str, object_id: str,
                                  job_id: int, task_id: str, datasource_id: str,
                                  current_depth: int) -> AsyncIterator[ContentComponent]:
-        """Process TAR archive without recursion"""
+        """Process TAR archive without recursion - Non-blocking version"""
+        
+        try:
+            # Run the blocking extraction in a thread pool
+            loop = asyncio.get_running_loop()
+            components = await loop.run_in_executor(
+                None, 
+                self._blocking_tar_archive_processing,
+                archive_path, object_id, job_id, task_id, datasource_id, current_depth
+            )
+            
+            # Yield each component
+            for component in components:
+                yield component
+                
+        except Exception as e:
+            error = self.error_handler.handle_error(
+                e, f"tar_processing_{object_id}",
+                operation="tar_archive_processing",
+                archive_path=archive_path
+            )
+            self.logger.error("TAR processing failed", error_id=error.error_id)
+            yield self._create_error_component(object_id, f"TAR processing failed: {str(e)}")
+
+    def _blocking_tar_archive_processing(self, archive_path: str, object_id: str,
+                                       job_id: int, task_id: str, datasource_id: str,
+                                       current_depth: int) -> List[ContentComponent]:
+        """Synchronous TAR archive processing to run in thread pool"""
+        components = []
         
         try:
             import tarfile
@@ -373,8 +529,9 @@ class ContentExtractor:
                         temp_member_path = self._create_temp_path(job_id, task_id, datasource_id,
                                                                 f"tar_member_{processed_members}")
                         
-                        async with aiofiles.open(temp_member_path, 'wb') as temp_file:
-                            await temp_file.write(member_data)
+                        # Write file synchronously since we're in thread pool
+                        with open(temp_member_path, 'wb') as temp_file:
+                            temp_file.write(member_data)
                         self.temp_files_created.append(temp_member_path)
                         
                         # Process member
@@ -383,15 +540,32 @@ class ContentExtractor:
                         
                         # Check if member is also an archive (nested archives)
                         if member_file_type in ['zip', 'tar']:
-                            async for component in self._process_archive(temp_member_path, member_object_id,
-                                                                       member_file_type, job_id, task_id,
-                                                                       datasource_id, current_depth + 1):
-                                yield component
+                            # For nested archives, we'll need to handle this differently in the async context
+                            # Store info for async processing later
+                            nested_archive_component = ContentComponent(
+                                object_id=member_object_id,
+                                component_type="nested_archive_placeholder",
+                                component_id=f"{self._get_base_name(temp_member_path)}_nested_archive_1",
+                                parent_path=f"{archive_path}/{member.name}",
+                                content=f"Nested archive: {member_file_type}",
+                                original_size=len(member_data),
+                                extracted_size=0,
+                                is_truncated=False,
+                                schema={"temp_path": temp_member_path, "file_type": member_file_type, "depth": current_depth + 1},
+                                metadata={
+                                    "archive_parent": archive_path,
+                                    "member_name": member.name,
+                                    "requires_async_processing": True
+                                },
+                                extraction_method="tar_nested_archive_marker",
+                                is_archive_extraction=True
+                            )
+                            components.append(nested_archive_component)
                         else:
-                            async for component in self._process_archive_member(temp_member_path, member_object_id,
-                                                                              member_file_type, archive_path, member.name,
-                                                                              job_id, task_id, datasource_id):
-                                yield component
+                            member_components = self._process_archive_member_blocking(temp_member_path, member_object_id,
+                                                                                    member_file_type, archive_path, member.name,
+                                                                                    job_id, task_id, datasource_id)
+                            components.extend(member_components)
                         
                         processed_members += 1
                         
@@ -400,60 +574,12 @@ class ContentExtractor:
                                            member_name=member.name,
                                            error=str(member_error))
                         continue
+            
+            return components
                         
         except Exception as e:
-            error = self.error_handler.handle_error(
-                e, f"tar_processing_{object_id}",
-                operation="tar_archive_processing",
-                archive_path=archive_path
-            )
-            self.logger.error("TAR processing failed", error_id=error.error_id)
-            yield self._create_error_component(object_id, f"TAR processing failed: {str(e)}")
-
-    async def _process_archive_member(self, member_path: str, member_object_id: str, 
-                                    member_file_type: str, archive_path: str, member_name: str,
-                                    job_id: int, task_id: str, datasource_id: str) -> AsyncIterator[ContentComponent]:
-        """
-        Process archive member directly without recursion
-        """
-        
-        # Route directly to file type extractor
-        if member_file_type in self.extractor_registry:
-            extractor = self.extractor_registry[member_file_type]
-            
-            async for component in extractor(member_path, member_object_id, job_id, task_id, datasource_id):
-                # Set component_type to 'archive_member' for all archive content
-                original_type = component.component_type
-                component.component_type = "archive_member"
-                component.is_archive_extraction = True
-                component.parent_path = f"{archive_path}/{member_name}"
-                
-                # Preserve original type in metadata
-                component.metadata["original_component_type"] = original_type
-                component.metadata["archive_parent"] = archive_path
-                component.metadata["member_name"] = member_name
-                
-                yield component
-        else:
-            # Unsupported member type
-            yield ContentComponent(
-                object_id=member_object_id,
-                component_type="archive_member",
-                component_id=f"{self._get_base_name(member_path)}_unsupported_1",
-                parent_path=f"{archive_path}/{member_name}",
-                content=f"Archive member type '{member_file_type}' not supported",
-                original_size=(await aiofiles.os.stat(member_path)).st_size,
-                extracted_size=0,
-                is_truncated=False,
-                schema={},
-                metadata={
-                    "original_component_type": "unsupported_format",
-                    "archive_parent": archive_path,
-                    "member_name": member_name
-                },
-                extraction_method="archive_member_unsupported",
-                is_archive_extraction=True
-            )
+            error_component = self._create_error_component(object_id, f"TAR processing failed: {str(e)}")
+            return [error_component]
 
     # =============================================================================
     # Memory and Resource Validation
@@ -484,10 +610,30 @@ class ContentExtractor:
     # =============================================================================
     # PDF Processing - Added Missing Table Extraction
     # =============================================================================
-
     async def extract_pdf_components(self, file_path: str, object_id: str,
                                    job_id: int, task_id: str, datasource_id: str) -> AsyncIterator[ContentComponent]:
-        """Complete PDF content extraction with PyMuPDF table support"""
+        """Complete PDF content extraction with PyMuPDF table support - Non-blocking version"""
+        
+        try:
+            # Run the blocking extraction in a thread pool
+            loop = asyncio.get_running_loop()
+            components = await loop.run_in_executor(
+                None, 
+                self._blocking_pdf_extraction,
+                file_path, object_id, job_id, task_id, datasource_id
+            )
+            
+            # Yield each component
+            for component in components:
+                yield component
+                
+        except Exception as e:
+            yield self._create_error_component(object_id, f"PDF processing system error: {str(e)}")
+
+    def _blocking_pdf_extraction(self, file_path: str, object_id: str, 
+                                job_id: int, task_id: str, datasource_id: str) -> List[ContentComponent]:
+        """Synchronous PDF extraction to run in thread pool"""
+        components = []
         
         try:
             import pymupdf as fitz
@@ -506,39 +652,40 @@ class ContentExtractor:
                         object_id, f"{base_name}_pdf_text_1", file_path,
                         text_content, {"page_count": len(doc)}, "pymupdf_text"
                     )
-                    yield text_component
+                    components.append(text_component)
                 
                 # 2. Extract tables (if enabled)
                 if self.extraction_config.features.extract_tables:
-                    async for component in self._extract_pdf_tables_pymupdf_primary(file_path, object_id, doc):
-                        yield component
+                    table_components = self._extract_pdf_tables_pymupdf_blocking(file_path, object_id, doc)
+                    components.extend(table_components)
                 
                 # 3. Extract images (if enabled and OCR available)
                 if (self.extraction_config.features.extract_pictures and 
                     self._is_ocr_enabled()):
-                    async for component in self._extract_pdf_images(file_path, object_id, doc, job_id, task_id, datasource_id):
-                        yield component
+                    image_components = self._extract_pdf_images_blocking(file_path, object_id, doc, job_id, task_id, datasource_id)
+                    components.extend(image_components)
                 
             finally:
                 doc.close()
                 
+            return components
+            
         except ImportError:
-            self.logger.warning("PyMuPDF not available", file_path=file_path)
-            yield self._create_error_component(object_id, "PyMuPDF library not available")
+            error_component = self._create_error_component(object_id, "PyMuPDF library not available")
+            return [error_component]
         except Exception as e:
-            self.logger.warning("PDF processing failed", file_path=file_path, error=str(e))
-            yield self._create_error_component(object_id, f"PDF extraction failed: {str(e)}")
+            error_component = self._create_error_component(object_id, f"PDF extraction failed: {str(e)}")
+            return [error_component]
 
-    async def _extract_pdf_tables_pymupdf_primary(self, file_path: str, object_id: str, doc) -> AsyncIterator[ContentComponent]:
-        """PyMuPDF table extraction as PRIMARY method before Camelot fallback"""
+    def _extract_pdf_tables_pymupdf_blocking(self, file_path: str, object_id: str, doc) -> List[ContentComponent]:
+        """PyMuPDF table extraction as blocking function for thread pool"""
         
+        components = []
         table_index = 1
         base_name = self._get_base_name(file_path)
         tables_found = False
         
         try:
-            pass
-            
             # PRIMARY: PyMuPDF table extraction
             for page_num in range(len(doc)):
                 page = doc.load_page(page_num)
@@ -553,7 +700,7 @@ class ContentExtractor:
                     df = table.to_pandas()
                     table_data = self._convert_pymupdf_table(df, table_index)
                     
-                    yield ContentComponent(
+                    component = ContentComponent(
                         object_id=object_id,
                         component_type="table",
                         component_id=f"{base_name}_pdf_table_{table_index}",
@@ -566,6 +713,7 @@ class ContentExtractor:
                         metadata=self._get_standard_metadata("table", {"page_number": page_num + 1}),
                         extraction_method="pymupdf_tables"
                     )
+                    components.append(component)
                     
                     table_index += 1
                     tables_found = True
@@ -576,12 +724,15 @@ class ContentExtractor:
         
         # FALLBACK: Camelot if PyMuPDF failed
         if not tables_found:
-            async for component in self._extract_pdf_tables_camelot_fallback(file_path, object_id, table_index):
-                yield component
+            camelot_components = self._extract_pdf_tables_camelot_blocking(file_path, object_id, table_index)
+            components.extend(camelot_components)
+            
+        return components
 
-    async def _extract_pdf_tables_camelot_fallback(self, file_path: str, object_id: str, table_index: int) -> AsyncIterator[ContentComponent]:
-        """Camelot fallback for PDF table extraction"""
+    def _extract_pdf_tables_camelot_blocking(self, file_path: str, object_id: str, table_index: int) -> List[ContentComponent]:
+        """Camelot fallback for PDF table extraction - blocking version"""
         
+        components = []
         base_name = self._get_base_name(file_path)
         
         try:
@@ -594,7 +745,7 @@ class ContentExtractor:
                 
                 table_data = self._convert_camelot_table(table)
                 
-                yield ContentComponent(
+                component = ContentComponent(
                     object_id=object_id,
                     component_type="table",
                     component_id=f"{base_name}_pdf_table_{table_index}",
@@ -607,6 +758,7 @@ class ContentExtractor:
                     metadata=self._get_standard_metadata("table", {"extraction_library": "camelot"}),
                     extraction_method="camelot"
                 )
+                components.append(component)
                 table_index += 1
                 
         except Exception as camelot_error:
@@ -618,7 +770,7 @@ class ContentExtractor:
                 for table_df in tables:
                     table_data = self._convert_tabula_table(table_df)
                     
-                    yield ContentComponent(
+                    component = ContentComponent(
                         object_id=object_id,
                         component_type="table",
                         component_id=f"{base_name}_pdf_table_{table_index}",
@@ -631,20 +783,25 @@ class ContentExtractor:
                         metadata=self._get_standard_metadata("table", {"extraction_library": "tabula"}),
                         extraction_method="tabula_fallback"
                     )
+                    components.append(component)
                     table_index += 1
                     
             except Exception as tabula_error:
                 self.logger.error("All PDF table extraction methods failed",
                                  camelot_error=str(camelot_error),
                                  tabula_error=str(tabula_error))
+        
+        return components
 
-    async def _extract_pdf_images(self, file_path: str, object_id: str, doc, 
-                                 job_id: int, task_id: str, datasource_id: str) -> AsyncIterator[ContentComponent]:
-        """Extract and OCR images from PDF"""
+    def _extract_pdf_images_blocking(self, file_path: str, object_id: str, doc, 
+                                   job_id: int, task_id: str, datasource_id: str) -> List[ContentComponent]:
+        """Extract and OCR images from PDF - blocking version"""
         import pymupdf as fitz
         
+        components = []
+        
         if not self.ocr_available:
-            return
+            return components
         
         base_name = self._get_base_name(file_path)
         image_index = 1
@@ -664,21 +821,27 @@ class ContentExtractor:
                         pix.save(temp_img_path)
                         self.temp_files_created.append(temp_img_path)
                         
-                        ocr_text = await self._extract_text_from_image_async(temp_img_path)
+                        # Use synchronous OCR since we're already in thread pool
+                        ocr_text = self._extract_text_from_image(temp_img_path)
                         if ocr_text.strip():
-                            yield ContentComponent(
+                            # Get file size synchronously since we're in thread pool
+                            import os
+                            file_size = os.path.getsize(temp_img_path)
+                            
+                            component = ContentComponent(
                                 object_id=object_id,
                                 component_type="image_ocr",
                                 component_id=f"{base_name}_pdf_image_ocr_{image_index}",
                                 parent_path=file_path,
                                 content=ocr_text,
-                                original_size=(await aiofiles.os.stat(temp_img_path)).st_size,
+                                original_size=file_size,
                                 extracted_size=len(ocr_text),
                                 is_truncated=False,
                                 schema={},
                                 metadata=self._get_standard_metadata("image_ocr", {"page_number": page_num + 1}),
                                 extraction_method="pdf_image_ocr"
                             )
+                            components.append(component)
                         
                         image_index += 1
                     
@@ -688,14 +851,37 @@ class ContentExtractor:
                     self.logger.warning("Failed to process PDF image",
                                        page_num=page_num, error=str(img_error))
                     continue
+        
+        return components
+
 
     # =============================================================================
     # Word Document Processing - Added Missing Image Extraction
     # =============================================================================
-
     async def extract_docx_components(self, file_path: str, object_id: str,
                                     job_id: int, task_id: str, datasource_id: str) -> AsyncIterator[ContentComponent]:
-        """Complete Word document extraction"""
+        """Complete Word document extraction - Non-blocking version"""
+        
+        try:
+            # Run the blocking extraction in a thread pool
+            loop = asyncio.get_running_loop()
+            components = await loop.run_in_executor(
+                None, 
+                self._blocking_docx_extraction,
+                file_path, object_id, job_id, task_id, datasource_id
+            )
+            
+            # Yield each component
+            for component in components:
+                yield component
+                
+        except Exception as e:
+            yield self._create_error_component(object_id, f"Word document processing system error: {str(e)}")
+
+    def _blocking_docx_extraction(self, file_path: str, object_id: str, 
+                                 job_id: int, task_id: str, datasource_id: str) -> List[ContentComponent]:
+        """Synchronous Word document extraction to run in thread pool"""
+        components = []
         
         try:
             from docx import Document
@@ -711,7 +897,7 @@ class ContentExtractor:
                     object_id, f"{base_name}_docx_text_1", file_path,
                     text_content, {"paragraph_count": len(doc.paragraphs)}, "python_docx_text"
                 )
-                yield text_component
+                components.append(text_component)
             
             # 2. Extract tables (if enabled)
             if self.extraction_config.features.extract_tables:
@@ -719,7 +905,7 @@ class ContentExtractor:
                     table_data = self._convert_docx_table(table)
                     
                     if table_data["rows"]:
-                        yield ContentComponent(
+                        component = ContentComponent(
                             object_id=object_id,
                             component_type="table",
                             component_id=f"{base_name}_docx_table_{table_index}",
@@ -732,26 +918,34 @@ class ContentExtractor:
                             metadata=self._get_standard_metadata("table", {"table_index": table_index}),
                             extraction_method="python_docx_tables"
                         )
+                        components.append(component)
             
             # 3. Extract images (if enabled)
             if (self.extraction_config.features.extract_pictures and self._is_ocr_enabled()):
-                async for component in self._extract_docx_images(file_path, object_id, doc, job_id, task_id, datasource_id):
-                    yield component
+                image_components = self._extract_docx_images_blocking(file_path, object_id, doc, job_id, task_id, datasource_id)
+                components.extend(image_components)
+            
+            return components
             
         except ImportError:
-            yield self._create_error_component(object_id, "python-docx library not available")
+            error_component = self._create_error_component(object_id, "python-docx library not available")
+            return [error_component]
         except Exception as e:
-            yield self._create_error_component(object_id, f"Word document extraction failed: {str(e)}")
+            error_component = self._create_error_component(object_id, f"Word document extraction failed: {str(e)}")
+            return [error_component]
 
-    async def _extract_docx_images(self, file_path: str, object_id: str, doc, 
-                                 job_id: int, task_id: str, datasource_id: str) -> AsyncIterator[ContentComponent]:
-        """Extract images from Word document"""
+    def _extract_docx_images_blocking(self, file_path: str, object_id: str, doc, 
+                                    job_id: int, task_id: str, datasource_id: str) -> List[ContentComponent]:
+        """Extract images from Word document - blocking version"""
+        
+        components = []
         
         if not self.ocr_available:
-            return
+            return components
         
         try:
             import zipfile
+            import os
             base_name = self._get_base_name(file_path)
             image_index = 1
             
@@ -765,13 +959,15 @@ class ContentExtractor:
                         temp_img_path = self._create_temp_path(job_id, task_id, datasource_id, 
                                                              f"docx_img_{image_index}")
                         
-                        async with aiofiles.open(temp_img_path, 'wb') as f:
-                            await f.write(img_data)
+                        # Write file synchronously since we're in thread pool
+                        with open(temp_img_path, 'wb') as f:
+                            f.write(img_data)
                         self.temp_files_created.append(temp_img_path)
                         
-                        ocr_text = await self._extract_text_from_image_async(temp_img_path)
+                        # Use synchronous OCR since we're already in thread pool
+                        ocr_text = self._extract_text_from_image(temp_img_path)
                         if ocr_text.strip():
-                            yield ContentComponent(
+                            component = ContentComponent(
                                 object_id=object_id,
                                 component_type="image_ocr",
                                 component_id=f"{base_name}_docx_image_ocr_{image_index}",
@@ -784,6 +980,7 @@ class ContentExtractor:
                                 metadata=self._get_standard_metadata("image_ocr", {"source_file": img_file}),
                                 extraction_method="docx_image_ocr"
                             )
+                            components.append(component)
                         
                         image_index += 1
                         
@@ -791,17 +988,40 @@ class ContentExtractor:
                         self.logger.warning("Failed to process Word image",
                                            img_file=img_file, error=str(img_error))
                         continue
+            
+            return components
                         
         except Exception as e:
             self.logger.warning("Word image extraction failed", error=str(e))
+            return components
 
     # =============================================================================
     # Excel Processing - Added Text Extraction
     # =============================================================================
-
     async def extract_xlsx_components(self, file_path: str, object_id: str,
                                     job_id: int, task_id: str, datasource_id: str) -> AsyncIterator[ContentComponent]:
-        """Complete Excel workbook extraction with text and tables"""
+        """Complete Excel workbook extraction with text and tables - Non-blocking version"""
+        
+        try:
+            # Run the blocking extraction in a thread pool
+            loop = asyncio.get_running_loop()
+            components = await loop.run_in_executor(
+                None, 
+                self._blocking_xlsx_extraction,
+                file_path, object_id, job_id, task_id, datasource_id
+            )
+            
+            # Yield each component
+            for component in components:
+                yield component
+                
+        except Exception as e:
+            yield self._create_error_component(object_id, f"Excel workbook processing system error: {str(e)}")
+
+    def _blocking_xlsx_extraction(self, file_path: str, object_id: str, 
+                                 job_id: int, task_id: str, datasource_id: str) -> List[ContentComponent]:
+        """Synchronous Excel workbook extraction to run in thread pool"""
+        components = []
         
         try:
             import pandas as pd
@@ -831,7 +1051,7 @@ class ContentExtractor:
                     # Extract table structure
                     table_data = self._convert_excel_sheet(df, sheet_name)
                     
-                    yield ContentComponent(
+                    component = ContentComponent(
                         object_id=object_id,
                         component_type="table",
                         component_id=f"{base_name}_xlsx_sheet_{sheet_index}",
@@ -844,6 +1064,7 @@ class ContentExtractor:
                         metadata=self._get_standard_metadata("table", {"sheet_name": sheet_name}),
                         extraction_method="pandas_excel"
                     )
+                    components.append(component)
                     
                 except Exception as sheet_error:
                     self.logger.warning("Failed to process Excel sheet",
@@ -857,29 +1078,34 @@ class ContentExtractor:
                     object_id, f"{base_name}_xlsx_text_1", file_path,
                     combined_text, {"sheet_count": len(excel_file.sheet_names)}, "excel_cell_text"
                 )
-                yield text_component
+                components.append(text_component)
             
             # Extract embedded images (if enabled)
             if (self.extraction_config.features.extract_pictures and self._is_ocr_enabled()):
-                async for component in self._extract_xlsx_images(file_path, object_id, job_id, task_id, datasource_id):
-                    yield component
+                image_components = self._extract_xlsx_images_blocking(file_path, object_id, job_id, task_id, datasource_id)
+                components.extend(image_components)
+            
+            return components
             
         except ImportError:
-            self.logger.warning("pandas/openpyxl not available", file_path=file_path)
-            yield self._create_error_component(object_id, "pandas/openpyxl libraries not available")
+            error_component = self._create_error_component(object_id, "pandas/openpyxl libraries not available")
+            return [error_component]
         except Exception as e:
-            self.logger.warning("Excel processing failed", file_path=file_path, error=str(e))
-            yield self._create_error_component(object_id, f"Excel extraction failed: {str(e)}")
+            error_component = self._create_error_component(object_id, f"Excel extraction failed: {str(e)}")
+            return [error_component]
 
-    async def _extract_xlsx_images(self, file_path: str, object_id: str, 
-                                 job_id: int, task_id: str, datasource_id: str) -> AsyncIterator[ContentComponent]:
-        """Extract images from Excel file"""
+    def _extract_xlsx_images_blocking(self, file_path: str, object_id: str, 
+                                    job_id: int, task_id: str, datasource_id: str) -> List[ContentComponent]:
+        """Extract images from Excel file - blocking version"""
+        
+        components = []
         
         if not self.ocr_available:
-            return
+            return components
         
         try:
             import zipfile
+            import os
             base_name = self._get_base_name(file_path)
             image_index = 1
             
@@ -893,13 +1119,15 @@ class ContentExtractor:
                         temp_img_path = self._create_temp_path(job_id, task_id, datasource_id, 
                                                              f"xlsx_img_{image_index}")
                         
-                        async with aiofiles.open(temp_img_path, 'wb') as f:
-                            await f.write(img_data)
+                        # Write file synchronously since we're in thread pool
+                        with open(temp_img_path, 'wb') as f:
+                            f.write(img_data)
                         self.temp_files_created.append(temp_img_path)
                         
-                        ocr_text = await self._extract_text_from_image_async(temp_img_path)
+                        # Use synchronous OCR since we're already in thread pool
+                        ocr_text = self._extract_text_from_image(temp_img_path)
                         if ocr_text.strip():
-                            yield ContentComponent(
+                            component = ContentComponent(
                                 object_id=object_id,
                                 component_type="image_ocr",
                                 component_id=f"{base_name}_xlsx_image_ocr_{image_index}",
@@ -912,6 +1140,7 @@ class ContentExtractor:
                                 metadata=self._get_standard_metadata("image_ocr", {"source_file": media_file}),
                                 extraction_method="xlsx_image_ocr"
                             )
+                            components.append(component)
                         
                         image_index += 1
                         
@@ -919,9 +1148,12 @@ class ContentExtractor:
                         self.logger.warning("Failed to process Excel image",
                                            media_file=media_file, error=str(img_error))
                         continue
+            
+            return components
                         
         except Exception as e:
             self.logger.warning("Excel image extraction failed", error=str(e))
+            return components
 
     # =============================================================================
     # PowerPoint Processing - Added Missing Implementation
@@ -929,7 +1161,28 @@ class ContentExtractor:
 
     async def extract_pptx_components(self, file_path: str, object_id: str,
                                     job_id: int, task_id: str, datasource_id: str) -> AsyncIterator[ContentComponent]:
-        """Complete PowerPoint presentation extraction"""
+        """Complete PowerPoint presentation extraction - Non-blocking version"""
+        
+        try:
+            # Run the blocking extraction in a thread pool
+            loop = asyncio.get_running_loop()
+            components = await loop.run_in_executor(
+                None, 
+                self._blocking_pptx_extraction,
+                file_path, object_id, job_id, task_id, datasource_id
+            )
+            
+            # Yield each component
+            for component in components:
+                yield component
+                
+        except Exception as e:
+            yield self._create_error_component(object_id, f"PowerPoint presentation processing system error: {str(e)}")
+
+    def _blocking_pptx_extraction(self, file_path: str, object_id: str, 
+                                 job_id: int, task_id: str, datasource_id: str) -> List[ContentComponent]:
+        """Synchronous PowerPoint presentation extraction to run in thread pool"""
+        components = []
         
         try:
             from pptx import Presentation
@@ -957,7 +1210,7 @@ class ContentExtractor:
                     object_id, f"{base_name}_pptx_text_1", file_path,
                     combined_text, {"slide_count": len(prs.slides)}, "python_pptx_text"
                 )
-                yield text_component
+                components.append(text_component)
             
             # Extract tables (if enabled)
             if self.extraction_config.features.extract_tables:
@@ -967,7 +1220,7 @@ class ContentExtractor:
                         if shape.has_table:
                             table_data = self._convert_pptx_table(shape.table)
                             
-                            yield ContentComponent(
+                            component = ContentComponent(
                                 object_id=object_id,
                                 component_type="table",
                                 component_id=f"{base_name}_pptx_table_{table_index}",
@@ -980,25 +1233,32 @@ class ContentExtractor:
                                 metadata=self._get_standard_metadata("table", {"slide_number": slide_num}),
                                 extraction_method="python_pptx_tables"
                             )
+                            components.append(component)
                             table_index += 1
             
             # Extract images (if enabled)
             if (self.extraction_config.features.extract_pictures and self._is_ocr_enabled()):
-                async for component in self._extract_pptx_images(file_path, object_id, prs, job_id, task_id, datasource_id):
-                    yield component
+                image_components = self._extract_pptx_images_blocking(file_path, object_id, prs, job_id, task_id, datasource_id)
+                components.extend(image_components)
+            
+            return components
             
         except ImportError:
-            yield self._create_error_component(object_id, "python-pptx library not available")
+            error_component = self._create_error_component(object_id, "python-pptx library not available")
+            return [error_component]
         except Exception as e:
-            yield self._create_error_component(object_id, f"PowerPoint extraction failed: {str(e)}")
+            error_component = self._create_error_component(object_id, f"PowerPoint extraction failed: {str(e)}")
+            return [error_component]
 
-    async def _extract_pptx_images(self, file_path: str, object_id: str, prs, 
-                                 job_id: int, task_id: str, datasource_id: str) -> AsyncIterator[ContentComponent]:
-        """Extract images from PowerPoint presentation"""
+    def _extract_pptx_images_blocking(self, file_path: str, object_id: str, prs, 
+                                    job_id: int, task_id: str, datasource_id: str) -> List[ContentComponent]:
+        """Extract images from PowerPoint presentation - blocking version"""
         from pptx.enum.shapes import MSO_SHAPE_TYPE
         
+        components = []
+        
         if not self.ocr_available:
-            return
+            return components
         
         base_name = self._get_base_name(file_path)
         image_index = 1
@@ -1013,13 +1273,15 @@ class ContentExtractor:
                         temp_img_path = self._create_temp_path(job_id, task_id, datasource_id, 
                                                              f"pptx_img_{image_index}")
                         
-                        async with aiofiles.open(temp_img_path, 'wb') as f:
-                            await f.write(image_bytes)
+                        # Write file synchronously since we're in thread pool
+                        with open(temp_img_path, 'wb') as f:
+                            f.write(image_bytes)
                         self.temp_files_created.append(temp_img_path)
                         
-                        ocr_text = await self._extract_text_from_image_async(temp_img_path)
+                        # Use synchronous OCR since we're already in thread pool
+                        ocr_text = self._extract_text_from_image(temp_img_path)
                         if ocr_text.strip():
-                            yield ContentComponent(
+                            component = ContentComponent(
                                 object_id=object_id,
                                 component_type="image_ocr",
                                 component_id=f"{base_name}_pptx_image_ocr_{image_index}",
@@ -1032,6 +1294,7 @@ class ContentExtractor:
                                 metadata=self._get_standard_metadata("image_ocr", {"slide_number": slide_num}),
                                 extraction_method="pptx_image_ocr"
                             )
+                            components.append(component)
                         
                         image_index += 1
                         
@@ -1039,6 +1302,8 @@ class ContentExtractor:
                         self.logger.warning("Failed to process PowerPoint image",
                                            slide_num=slide_num, error=str(img_error))
                         continue
+        
+        return components
 
     # =============================================================================
     # XML Processing - Complete Implementation
@@ -1137,17 +1402,38 @@ class ContentExtractor:
     # =============================================================================
     # Email Processing - Complete Implementation  
     # =============================================================================
-
     async def extract_eml_components(self, file_path: str, object_id: str,
                                    job_id: int, task_id: str, datasource_id: str) -> AsyncIterator[ContentComponent]:
-        """Complete email file extraction"""
+        """Complete email file extraction - Non-blocking version"""
+        
+        try:
+            # Run the blocking extraction in a thread pool
+            loop = asyncio.get_running_loop()
+            components = await loop.run_in_executor(
+                None, 
+                self._blocking_eml_extraction,
+                file_path, object_id, job_id, task_id, datasource_id
+            )
+            
+            # Yield each component
+            for component in components:
+                yield component
+                
+        except Exception as e:
+            yield self._create_error_component(object_id, f"Email file processing system error: {str(e)}")
+
+    def _blocking_eml_extraction(self, file_path: str, object_id: str, 
+                                job_id: int, task_id: str, datasource_id: str) -> List[ContentComponent]:
+        """Synchronous email file extraction to run in thread pool"""
+        components = []
         
         try:
             import email
             from email.policy import default
             
-            async with aiofiles.open(file_path, 'rb') as f:
-                msg_data = await f.read()
+            # Read email data synchronously since we're in thread pool
+            with open(file_path, 'rb') as f:
+                msg_data = f.read()
                 msg = email.message_from_bytes(msg_data, policy=default)
             
             base_name = self._get_base_name(file_path)
@@ -1167,10 +1453,10 @@ class ContentExtractor:
                     elif part.get_content_type() == "text/html":
                         # Parse HTML body for tables if enabled
                         if self.extraction_config.features.extract_tables:
-                            async for component in self._extract_html_tables_from_content(
+                            table_components = self._extract_html_tables_from_content_blocking(
                                 part.get_content(), object_id, f"{base_name}_email_html"
-                            ):
-                                yield component
+                            )
+                            components.extend(table_components)
             else:
                 email_text.append(msg.get_content())
             
@@ -1181,13 +1467,18 @@ class ContentExtractor:
                     object_id, f"{base_name}_eml_text_1", file_path,
                     combined_text, {"from": msg['From'], "subject": msg['Subject']}, "email_parsing"
                 )
-                yield text_component
+                components.append(text_component)
+            
+            return components
             
         except Exception as e:
-            yield self._create_error_component(object_id, f"Email extraction failed: {str(e)}")
+            error_component = self._create_error_component(object_id, f"Email extraction failed: {str(e)}")
+            return [error_component]
 
-    async def _extract_html_tables_from_content(self, html_content: str, object_id: str, base_id: str) -> AsyncIterator[ContentComponent]:
-        """Extract tables from HTML content string"""
+    def _extract_html_tables_from_content_blocking(self, html_content: str, object_id: str, base_id: str) -> List[ContentComponent]:
+        """Extract tables from HTML content string - blocking version"""
+        
+        components = []
         
         try:
             from bs4 import BeautifulSoup
@@ -1199,7 +1490,7 @@ class ContentExtractor:
                 table_data = self._convert_html_table(table)
                 
                 if table_data["rows"]:
-                    yield ContentComponent(
+                    component = ContentComponent(
                         object_id=object_id,
                         component_type="table",
                         component_id=f"{base_id}_table_{table_index}",
@@ -1212,23 +1503,49 @@ class ContentExtractor:
                         metadata=self._get_standard_metadata("table", {"source": "html_email"}),
                         extraction_method="email_html_tables"
                     )
+                    components.append(component)
+            
+            return components
                     
         except Exception as e:
             self.logger.warning("HTML table extraction from email failed", error=str(e))
+            return components
+
 
     # =============================================================================
     # HTML Processing - Added Image Processing
     # =============================================================================
-
     async def extract_html_components(self, file_path: str, object_id: str,
                                     job_id: int, task_id: str, datasource_id: str) -> AsyncIterator[ContentComponent]:
-        """Complete HTML document extraction with image processing"""
+        """Complete HTML document extraction with image processing - Non-blocking version"""
+        
+        try:
+            # Run the blocking extraction in a thread pool
+            loop = asyncio.get_running_loop()
+            components = await loop.run_in_executor(
+                None, 
+                self._blocking_html_extraction,
+                file_path, object_id, job_id, task_id, datasource_id
+            )
+            
+            # Yield each component
+            for component in components:
+                yield component
+                
+        except Exception as e:
+            yield self._create_error_component(object_id, f"HTML document processing system error: {str(e)}")
+
+    def _blocking_html_extraction(self, file_path: str, object_id: str, 
+                                 job_id: int, task_id: str, datasource_id: str) -> List[ContentComponent]:
+        """Synchronous HTML document extraction to run in thread pool"""
+        components = []
         
         try:
             from bs4 import BeautifulSoup
             
-            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
-                html_content = await f.read()
+            # Read HTML content synchronously since we're in thread pool
+            with open(file_path, 'r', encoding='utf-8') as f:
+                html_content = f.read()
             
             soup = BeautifulSoup(html_content, 'html.parser')
             base_name = self._get_base_name(file_path)
@@ -1241,7 +1558,7 @@ class ContentExtractor:
                     object_id, f"{base_name}_html_text_1", file_path,
                     text_content, {"title": soup.title.string if soup.title else ""}, "beautifulsoup_text"
                 )
-                yield text_component
+                components.append(text_component)
             
             # 2. Extract tables (if enabled)
             if self.extraction_config.features.extract_tables:
@@ -1251,7 +1568,7 @@ class ContentExtractor:
                     table_data = self._convert_html_table(table)
                     
                     if table_data["rows"]:
-                        yield ContentComponent(
+                        component = ContentComponent(
                             object_id=object_id,
                             component_type="table",
                             component_id=f"{base_name}_html_table_{table_index}",
@@ -1264,23 +1581,30 @@ class ContentExtractor:
                             metadata=self._get_standard_metadata("table", {"table_index": table_index}),
                             extraction_method="beautifulsoup_tables"
                         )
+                        components.append(component)
             
             # 3. Extract image references (if enabled)
             if (self.extraction_config.features.extract_pictures and self._is_ocr_enabled()):
-                async for component in self._extract_html_images(file_path, object_id, soup, job_id, task_id, datasource_id):
-                    yield component
+                image_components = self._extract_html_images_blocking(file_path, object_id, soup, job_id, task_id, datasource_id)
+                components.extend(image_components)
+            
+            return components
             
         except ImportError:
-            yield self._create_error_component(object_id, "BeautifulSoup library not available")
+            error_component = self._create_error_component(object_id, "BeautifulSoup library not available")
+            return [error_component]
         except Exception as e:
-            yield self._create_error_component(object_id, f"HTML extraction failed: {str(e)}")
+            error_component = self._create_error_component(object_id, f"HTML extraction failed: {str(e)}")
+            return [error_component]
 
-    async def _extract_html_images(self, file_path: str, object_id: str, soup, 
-                                 job_id: int, task_id: str, datasource_id: str) -> AsyncIterator[ContentComponent]:
-        """Extract and OCR images referenced in HTML"""
+    def _extract_html_images_blocking(self, file_path: str, object_id: str, soup, 
+                                    job_id: int, task_id: str, datasource_id: str) -> List[ContentComponent]:
+        """Extract and OCR images referenced in HTML - blocking version"""
+        
+        components = []
         
         if not self.ocr_available:
-            return
+            return components
         
         images = soup.find_all('img')
         image_index = 1
@@ -1293,26 +1617,30 @@ class ContentExtractor:
             
             try:
                 # Resolve image path relative to HTML file
+                import os
                 html_dir = os.path.dirname(file_path)
                 image_path = os.path.join(html_dir, src)
                 
-                if await aiofiles.os.path.exists(image_path):
-                    ocr_text = await self._extract_text_from_image_async(image_path)
+                if os.path.exists(image_path):
+                    # Use synchronous OCR since we're already in thread pool
+                    ocr_text = self._extract_text_from_image(image_path)
                     
                     if ocr_text.strip():
-                        yield ContentComponent(
+                        file_size = os.path.getsize(image_path)
+                        component = ContentComponent(
                             object_id=object_id,
                             component_type="image_ocr", 
                             component_id=f"{base_name}_html_image_ocr_{image_index}",
                             parent_path=file_path,
                             content=ocr_text,
-                            original_size=(await aiofiles.os.stat(image_path)).st_size,
+                            original_size=file_size,
                             extracted_size=len(ocr_text),
                             is_truncated=False,
                             schema={},
                             metadata=self._get_standard_metadata("image_ocr", {"src": src, "alt": img.get('alt', '')}),
                             extraction_method="html_image_ocr"
                         )
+                        components.append(component)
                     
                     image_index += 1
                     
@@ -1320,6 +1648,8 @@ class ContentExtractor:
                 self.logger.warning("Failed to process HTML image",
                                    src=src, error=str(img_error))
                 continue
+        
+        return components
 
     # =============================================================================
     # Simple File Type Extractors - Signatures Updated for Context IDs
@@ -1343,12 +1673,35 @@ class ContentExtractor:
 
     async def extract_json_components(self, file_path: str, object_id: str,
                                     job_id: int, task_id: str, datasource_id: str) -> AsyncIterator[ContentComponent]:
-        """Extract JSON file content"""
+        """Extract JSON file content - Non-blocking version"""
+        
+        try:
+            # Run the blocking extraction in a thread pool
+            loop = asyncio.get_running_loop()
+            components = await loop.run_in_executor(
+                None, 
+                self._blocking_json_extraction,
+                file_path, object_id, job_id, task_id, datasource_id
+            )
+            
+            # Yield each component
+            for component in components:
+                yield component
+                
+        except Exception as e:
+            yield self._create_error_component(object_id, f"JSON file processing system error: {str(e)}")
+
+    def _blocking_json_extraction(self, file_path: str, object_id: str, 
+                                 job_id: int, task_id: str, datasource_id: str) -> List[ContentComponent]:
+        """Synchronous JSON file extraction to run in thread pool"""
+        components = []
+        
         try:
             import json
             
-            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
-                json_text = await f.read()
+            # Read JSON content synchronously since we're in thread pool
+            with open(file_path, 'r', encoding='utf-8') as f:
+                json_text = f.read()
                 json_data = json.loads(json_text)
             
             formatted_json = json.dumps(json_data, indent=2, ensure_ascii=False)
@@ -1357,66 +1710,104 @@ class ContentExtractor:
                 object_id, f"{self._get_base_name(file_path)}_json_text_1", file_path,
                 formatted_json, {"json_type": type(json_data).__name__}, "json_parsing"
             )
-            yield text_component
+            components.append(text_component)
+            
+            return components
             
         except Exception as e:
-            yield self._create_error_component(object_id, f"JSON extraction failed: {str(e)}")
+            error_component = self._create_error_component(object_id, f"JSON extraction failed: {str(e)}")
+            return [error_component]
 
     async def extract_image_components(self, file_path: str, object_id: str,
                                      job_id: int, task_id: str, datasource_id: str) -> AsyncIterator[ContentComponent]:
-        """Extract text from image files using OCR"""
+        """Extract text from image files using OCR - Non-blocking version"""
+        
+        try:
+            # Run the blocking extraction in a thread pool
+            loop = asyncio.get_running_loop()
+            components = await loop.run_in_executor(
+                None, 
+                self._blocking_image_extraction,
+                file_path, object_id, job_id, task_id, datasource_id
+            )
+            
+            # Yield each component
+            for component in components:
+                yield component
+                
+        except Exception as e:
+            yield self._create_error_component(object_id, f"Image file processing system error: {str(e)}")
+
+    def _blocking_image_extraction(self, file_path: str, object_id: str, 
+                                  job_id: int, task_id: str, datasource_id: str) -> List[ContentComponent]:
+        """Synchronous image file extraction to run in thread pool"""
+        components = []
         
         if not self._is_ocr_enabled():
-            yield ContentComponent(
+            component = ContentComponent(
                 object_id=object_id,
                 component_type="no_content_extractable",
                 component_id=f"{self._get_base_name(file_path)}_image_no_ocr_1",
                 parent_path=file_path,
                 content="OCR not available for image text extraction",
-                original_size=(await aiofiles.os.stat(file_path)).st_size,
+                original_size=self._get_file_size_sync(file_path),
                 extracted_size=0,
                 is_truncated=False,
                 schema={},
                 metadata=self._get_standard_metadata("no_content_extractable", {"reason": "ocr_disabled"}),
                 extraction_method="ocr_check"
             )
-            return
+            return [component]
         
         try:
-            ocr_text = await self._extract_text_from_image_async(file_path)
+            # Use synchronous OCR since we're already in thread pool
+            ocr_text = self._extract_text_from_image(file_path)
             base_name = self._get_base_name(file_path)
             
             if ocr_text.strip():
-                yield ContentComponent(
+                component = ContentComponent(
                     object_id=object_id,
                     component_type="image_ocr",
                     component_id=f"{base_name}_image_ocr_1",
                     parent_path=file_path,
                     content=ocr_text,
-                    original_size=(await aiofiles.os.stat(file_path)).st_size,
+                    original_size=self._get_file_size_sync(file_path),
                     extracted_size=len(ocr_text),
                     is_truncated=False,
                     schema={},
                     metadata=self._get_standard_metadata("image_ocr", {"ocr_confidence": "filtered_0.5"}),
                     extraction_method="easyocr"
                 )
+                components.append(component)
             else:
-                yield ContentComponent(
+                component = ContentComponent(
                     object_id=object_id,
                     component_type="no_content_extractable",
                     component_id=f"{base_name}_image_no_text_1",
                     parent_path=file_path,
                     content="No text detected in image",
-                    original_size=(await aiofiles.os.stat(file_path)).st_size,
+                    original_size=self._get_file_size_sync(file_path),
                     extracted_size=0,
                     is_truncated=False,
                     schema={},
                     metadata=self._get_standard_metadata("no_content_extractable", {"reason": "no_text_detected"}),
                     extraction_method="easyocr"
                 )
+                components.append(component)
+            
+            return components
                 
         except Exception as e:
-            yield self._create_error_component(object_id, f"Image OCR failed: {str(e)}")
+            error_component = self._create_error_component(object_id, f"Image OCR failed: {str(e)}")
+            return [error_component]
+
+    def _get_file_size_sync(self, file_path: str) -> int:
+        """Get file size synchronously for use in thread pool"""
+        try:
+            import os
+            return os.path.getsize(file_path)
+        except Exception:
+            return 0
 
     # =============================================================================
     # Component Creation Helpers
@@ -1630,14 +2021,33 @@ class ContentExtractor:
             self.ocr_available = False
             self.ocr_reader = None
 
+
     async def _extract_text_from_image_async(self, image_path: str) -> str:
-        """Extract text from image using OCR - async version"""
+        """Extract text from image using OCR - truly async version"""
+        
         if not self.ocr_available:
             return ""
         
         try:
-            # EasyOCR readtext is not async, but we can run it in thread pool if needed
-            # For now, keeping it sync since OCR operations are typically CPU-bound
+            # Run the blocking OCR operation in a thread pool
+            loop = asyncio.get_running_loop()
+            extracted_text = await loop.run_in_executor(
+                None, 
+                self._blocking_ocr_extraction,
+                image_path
+            )
+            return extracted_text
+            
+        except Exception as e:
+            self.logger.warning("OCR extraction failed", 
+                               image_path=image_path, error=str(e))
+            return ""
+
+    def _blocking_ocr_extraction(self, image_path: str) -> str:
+        """Synchronous OCR extraction to run in thread pool"""
+        
+        try:
+            # EasyOCR readtext is CPU-intensive and blocking
             results = self.ocr_reader.readtext(image_path)
             extracted_text = " ".join([
                 result[1] for result in results 
@@ -1646,7 +2056,7 @@ class ContentExtractor:
             return extracted_text
             
         except Exception as e:
-            self.logger.warning("OCR extraction failed", 
+            self.logger.warning("OCR processing failed", 
                                image_path=image_path, error=str(e))
             return ""
 
@@ -2029,6 +2439,7 @@ class ContentExtractor:
                         missing_libraries=missing_libraries)
         
         return registry
+
 
     def _validate_extraction_config(self):
             """Validate configuration and log issues"""

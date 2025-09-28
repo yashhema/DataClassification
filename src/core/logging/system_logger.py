@@ -202,7 +202,7 @@ class SystemLogger:
         with self._sampling_lock:
             self._sampling_counters.pop(counter_key, None)
 
-    def log_heartbeat(self, task_id: int, worker_id: str, **context):
+    def log_heartbeat(self, task_id: int, main_worker_id: str, **context):
         """Logs heartbeat from a worker."""
         self._log(logging.DEBUG, f"Heartbeat received for task {task_id} from worker {worker_id}.", {"task_id": task_id, "worker_id": worker_id, **context})
 

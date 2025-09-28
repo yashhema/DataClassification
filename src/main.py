@@ -195,10 +195,17 @@ async def run_worker_mode(workers: List[Worker], logger, base_log_context):
 async def debug_event_loop_activity():
     """Debug task that logs periodically to verify the event loop is active"""
     counter = 0
+    # Add a check for the shutdown_event in the loop condition
     while not shutdown_event.is_set():
-        await asyncio.sleep(5)  # Log every 5 seconds
-        counter += 1
-        logger.info(f"EVENT LOOP DEBUG: Tick #{counter} - Loop is processing tasks")
+        try:
+            # Instead of a simple sleep, wait for the event with a timeout.
+            # This allows the loop to exit immediately when shutdown is triggered.
+            await asyncio.wait_for(shutdown_event.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            # This is the normal path; the timeout expires and we continue.
+            counter += 1
+            if logger: # Add a safety check for the logger
+                logger.info(f"EVENT LOOP DEBUG: Tick #{counter} - Loop is processing tasks")
 
 async def main():
     """ The main asynchronous entry point for the application service. """

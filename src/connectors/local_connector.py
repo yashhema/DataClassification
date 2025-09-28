@@ -8,7 +8,7 @@ from core.models.models import DiscoveredObject, RemediationResult, ContentCompo
 from content_extraction.content_extractor import ContentExtractor
 from core.utils.hash_utils import generate_object_key_hash
 from datetime import datetime, timezone
-
+from typing import AsyncIterator, List, Dict, Any, Optional,Tuple
 class LocalConnector(IFileDataSourceConnector):
     """
     A connector for scanning a directory on the local file system.
@@ -20,7 +20,7 @@ class LocalConnector(IFileDataSourceConnector):
         self.datasource_id = datasource_id
         self.logger = logger
         self.error_handler = error_handler
-        self.root_path = local_config.get("root_path")
+        self.root_path = local_config.get("connection", {}).get("root_path")
 
         if not self.root_path or not os.path.isdir(self.root_path):
             raise ValueError(f"Root path '{self.root_path}' is not a valid directory.")
@@ -82,21 +82,25 @@ class LocalConnector(IFileDataSourceConnector):
 
 
     async def get_object_content(self, work_packet: Any) -> AsyncIterator[ContentComponent]:
-        """
-        Passes the local file path directly to the ContentExtractor.
-        No download is required.
-        """
-        object_ids = work_packet.payload.object_ids
-        for file_path in object_ids:
-            # The object_id *is* the file path for this connector
-            async for component in self.content_extractor.extract_from_file(
-                file_path=file_path,
-                object_id=file_path,
-                job_id=work_packet.header.job_id,
-                task_id=work_packet.header.task_id,
-                datasource_id=self.datasource_id
-            ):
-                yield component
+            """
+            Passes the local file path directly to the ContentExtractor.
+            """
+            # Access the correct attribute: 'discovered_objects'
+            discovered_objects = work_packet.payload.discovered_objects
+
+            # Loop through the list of DiscoveredObject models
+            for discovered_obj in discovered_objects:
+                # Extract the 'object_path' from each model
+                file_path = discovered_obj.object_path
+
+                async for component in self.content_extractor.extract_from_file(
+                    file_path=file_path,
+                    object_id=file_path,
+                    job_id=work_packet.header.job_id,
+                    task_id=work_packet.header.task_id,
+                    datasource_id=self.datasource_id
+                ):
+                    yield component
 
     # --- Remediation Methods ---
 
@@ -122,3 +126,31 @@ class LocalConnector(IFileDataSourceConnector):
             except (OSError, shutil.Error) as e:
                 failed.append({"path": path, "error_message": str(e)})
         return RemediationResult(succeeded_paths=succeeded, failed_paths=failed, success_count=len(succeeded), failure_count=len(failed))
+        
+    async def get_object_details(self, work_packet: Any) -> List[ObjectMetadata]:
+        """
+        Fetches detailed metadata. Not implemented for LocalConnector.
+        """
+        self.logger.info("get_object_details is not implemented for LocalConnector.")
+        pass
+
+    async def tag_objects(self, objects_with_tags: List[Tuple[str, List[str]]], context: Dict[str, Any]) -> RemediationResult:
+        """
+        Applies metadata tags. Not implemented for LocalConnector.
+        """
+        self.logger.info("tag_objects is not implemented for LocalConnector.")
+        pass
+
+    async def apply_encryption(self, object_paths: List[str], encryption_key_id: str, context: Dict[str, Any]) -> RemediationResult:
+        """
+        Encrypts objects. Not implemented for LocalConnector.
+        """
+        self.logger.info("apply_encryption is not implemented for LocalConnector.")
+        pass
+
+    async def apply_mip_labels(self, objects_with_labels: List[Tuple[str, str]], context: Dict[str, Any]) -> RemediationResult:
+        """
+        Applies MIP labels. Not implemented for LocalConnector.
+        """
+        self.logger.info("apply_mip_labels is not implemented for LocalConnector.")
+        pass

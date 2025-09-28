@@ -95,6 +95,18 @@ class Orchestrator:
             
         self.logger.log_component_lifecycle("Orchestrator", "INITIALIZED")
 
+
+    async def report_heartbeat_async(self, task_id: str, context: Optional[Dict[str, Any]] = None):
+        """
+        Receives and logs a heartbeat from a worker in single-process mode.
+        """
+        context = context or {}
+        self.logger.log_heartbeat(
+            task_id=task_id, 
+            main_worker_id=context.get("worker_id", "unknown"), 
+            **context
+        )
+
     async def _perform_startup_validation(self):
         """
         Performs critical validation before starting coroutines.

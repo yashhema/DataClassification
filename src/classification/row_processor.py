@@ -151,22 +151,25 @@ class RowProcessor:
             }
             
             # Run classification
-            findings = classifier.classify_content(content, context_info)
+            # --- FIX IS HERE ---
+            # Run the synchronous, CPU-bound classification in a separate thread
+            # to prevent blocking the worker's async event loop.
+            loop = asyncio.get_running_loop()
+            findings = await loop.run_in_executor(
+                None,  # Use the default thread pool executor
+                classifier.classify_content,  # The synchronous function to run
+                content,       # The first argument
+                context_info   # The second argument
+            )
             
-            # Convert to structured format
-            structured_findings = [
-                {
-                    "entity_type": finding.entity_type,
-                    "text": finding.text,
-                    "confidence": finding.confidence_score,
-                    "start_position": finding.start_position,
-                    "end_position": finding.end_position,
-                    "detection_timestamp": datetime.now(timezone.utc).isoformat()
-                }
-                for finding in findings
-            ]
+            # Enrich findings with context data before returning
+            for finding in findings:
+                if not hasattr(finding, 'context_data') or finding.context_data is None:
+                    finding.context_data = {}
+                finding.context_data.update(context_info)
             
-            return structured_findings
+            return findings
+
             
         except Exception as e:
             print(f"Error processing document {file_metadata.get('file_path')}: {str(e)}")

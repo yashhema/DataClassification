@@ -31,7 +31,7 @@ from classification.engineinterface import EngineInterface
 from core.db.database_interface import DatabaseInterface
 from core.config.configuration_manager import ConfigurationManager
 from core.models.models import (
-    TaskType, WorkPacket, ContentComponent, PIIFinding, TaskOutputRecord,
+    TaskType, WorkPacket, ContentComponent, PIIFinding, TaskOutputRecord,DiscoveredObject,
     PolicySelectorPlanPayload,
     PolicySelectorExecutePayload,
     PolicyActionExecutePayload,
@@ -129,6 +129,49 @@ class Worker:
             "trace_id": work_packet.header.trace_id,
             
         }
+
+
+    async def _insert_batch_to_staging_async(self, batch: List[DiscoveredObject], staging_table_name: str, 
+                                           trace_id: str, task_id: int):
+        """Insert batch of objects into staging table (async)."""
+        try:
+            # Convert to database format
+            batch_mappings = []
+            for obj in batch:
+                # Calculate object key hash
+                key_string = f"{obj.datasource_id}|{obj.object_path}|{obj.object_type}"
+                object_key_hash = hashlib.sha256(key_string.encode()).digest()
+                
+                mapping = {
+                    'object_key_hash': object_key_hash,
+                    'data_source_id': obj.datasource_id,
+                    'object_type': obj.object_type,
+                    'object_path': obj.object_path,
+                    'size_bytes': obj.size_bytes,
+                    'created_date': obj.created_date,
+                    'last_modified': obj.last_modified,
+                    
+                    'discovery_timestamp': datetime.now(timezone.utc)
+                    }
+                batch_mappings.append(mapping)
+            
+            # Insert into staging table (async)
+            await self.db_interface.insert_discovered_object_batch(
+                batch_mappings, 
+                staging_table_name,
+                context={'trace_id': trace_id, 'task_id': task_id}
+            )
+            
+        except Exception as e:
+            error = self.error_handler.handle_error(
+                e, "insert_batch_to_staging_async",
+                operation="staging_table_insert",
+                staging_table=staging_table_name,
+                batch_size=len(batch),
+                trace_id=trace_id,
+                task_id=task_id
+            )
+            raise
 
 
 
@@ -585,12 +628,16 @@ class Worker:
         Process a DISCOVERY_ENUMERATE task and includes the complete list of discovered
         objects in the TaskOutputRecord for the Pipeliner.
         """
+        trace_id = work_packet.header.trace_id
+        task_id = work_packet.header.task_id
         payload = work_packet.payload
+        
         connector = await self.connector_factory.create_connector(payload.datasource_id)
         
         total_objects = 0
         batch_count = 0
-        
+        # Use the existing, correct pattern for differentiating connectors, but for now both interfaces should return list of discovered object , so should work (we might need to rethink , when we break the object path to individual componentn
+        is_file_connector = isinstance(connector, IFileDataSourceConnector)
         # [cite_start]The connector yields batches of DiscoveredObject Pydantic models [cite: 1525]
         async for batch in connector.enumerate_objects(work_packet):
             batch_count += 1
@@ -599,6 +646,7 @@ class Worker:
             
             # The payload now contains the full DiscoveredObject models, serialized to dictionaries.
             # The model's json_encoder for bytes will automatically convert the hash to a Base64 string.
+            await self._insert_batch_to_staging_async(batch, payload.staging_table_name, trace_id, task_id)
             progress = TaskOutputRecord(
                 output_type="DISCOVERED_OBJECTS",
                 output_payload={
@@ -617,6 +665,9 @@ class Worker:
         self.logger.info(f"Discovery enumeration completed: {total_objects} objects found", 
                         task_id=work_packet.header.task_id, 
                         total_objects=total_objects)
+
+
+
     async def _process_discovery_get_details_async(self, work_packet: WorkPacket):
         """Process DISCOVERY_GET_DETAILS task (async).""" 
         payload = work_packet.payload

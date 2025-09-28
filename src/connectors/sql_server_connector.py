@@ -315,7 +315,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                     batch_count += 1
                     
                     # Insert batch into staging table (async)
-                    await self._insert_batch_to_staging_async(current_batch, payload.staging_table_name, trace_id, task_id)
+                    #await self._insert_batch_to_staging_async(current_batch, payload.staging_table_name, trace_id, task_id)
                     
                     # Log batch progress
                     self.logger.log_progress_batch(
@@ -336,7 +336,7 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
                 batch_count += 1
                 
                 # Insert final batch into staging table (async)
-                await self._insert_batch_to_staging_async(current_batch, payload.staging_table_name, trace_id, task_id)
+                #await self._insert_batch_to_staging_async(current_batch, payload.staging_table_name, trace_id, task_id)
                 
                 # Log final batch progress
                 self.logger.log_progress_batch(
@@ -927,47 +927,6 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             self.logger.warning(f"Failed to get columns for table {database_name}.{schema_name}.{table_name}: {str(e)}")
             return []
 
-    async def _insert_batch_to_staging_async(self, batch: List[DiscoveredObject], staging_table_name: str, 
-                                           trace_id: str, task_id: int):
-        """Insert batch of objects into staging table (async)."""
-        try:
-            # Convert to database format
-            batch_mappings = []
-            for obj in batch:
-                # Calculate object key hash
-                key_string = f"{obj.datasource_id}|{obj.object_path}|{obj.object_type}"
-                object_key_hash = hashlib.sha256(key_string.encode()).digest()
-                
-                mapping = {
-                    'object_key_hash': object_key_hash,
-                    'data_source_id': obj.datasource_id,
-                    'object_type': obj.object_type,
-                    'object_path': obj.object_path,
-                    'size_bytes': obj.size_bytes,
-                    'created_date': obj.created_date,
-                    'last_modified': obj.last_modified,
-                    
-                    'discovery_timestamp': datetime.now(timezone.utc)
-                    }
-                batch_mappings.append(mapping)
-            
-            # Insert into staging table (async)
-            await self.db.insert_discovered_object_batch(
-                batch_mappings, 
-                staging_table_name,
-                context={'trace_id': trace_id, 'task_id': task_id}
-            )
-            
-        except Exception as e:
-            error = self.error_handler.handle_error(
-                e, "insert_batch_to_staging_async",
-                operation="staging_table_insert",
-                staging_table=staging_table_name,
-                batch_size=len(batch),
-                trace_id=trace_id,
-                task_id=task_id
-            )
-            raise
 
     async def _get_detailed_metadata_async(self, object_id: str, trace_id: str, task_id: int) -> Optional[ObjectMetadata]:
         """Get detailed metadata for a specific object (async)."""
