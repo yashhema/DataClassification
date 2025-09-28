@@ -200,7 +200,7 @@ class ClassificationEngine:
 
     def _check_validations(self, result, content, config) -> bool:
         """Returns False if a required validation fails, True otherwise."""
-        return True
+        
         validation_rules = config.get('validation_rules', [])
         if not validation_rules:
             return True

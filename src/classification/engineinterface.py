@@ -113,7 +113,14 @@ class EngineInterface:
             # The RowProcessor internally calls the engine's classify_content method
             return await self._row_processor.process_database_row(row_data, row_pk, table_metadata, self._engine)
         except Exception as e:
-            context = {**self.job_context, "row_pk": str(row_pk)}
+            context = {**self.job_context, "file_path": file_metadata.get("file_path")}
+
+            # --- ADD THIS LOGGING ---
+            self.logger.error(
+                "An unhandled exception occurred during document content classification in datarow.",
+                exc_info=True,  # This is the key part that adds the traceback
+                **context
+            )
             # Do not re-raise; just log the error and return empty list to allow the job to continue
             self.error_handler.handle_error(e, "classify_database_row", **context)
             return []
@@ -132,6 +139,13 @@ class EngineInterface:
             return await self._row_processor.process_document_content(content, file_metadata, self._engine)
         except Exception as e:
             context = {**self.job_context, "file_path": file_metadata.get("file_path")}
+
+            # --- ADD THIS LOGGING ---
+            self.logger.error(
+                "An unhandled exception occurred during document content classification in datarow.",
+                exc_info=True,  # This is the key part that adds the traceback
+                **context
+            )
             self.error_handler.handle_error(e, "classify_document_content", **context)
             return []
 

@@ -33,19 +33,33 @@ def custom_json_serializer(obj):
 
 class JsonFormatter(logging.Formatter):
     """
-    Custom formatter to output log records as a single JSON string.
-    This is essential for log aggregation in distributed systems like EKS.
+    Custom formatter to output log records as a single, comprehensive JSON string,
+    including source location, context, and tracebacks.
     """
     def format(self, record):
+        # Start with the standard log record attributes
         log_record = {
             "timestamp": self.formatTime(record, self.datefmt),
             "level": record.levelname,
             "message": record.getMessage(),
+            "logger_name": record.name,
+            "source": {
+                "file": record.pathname,
+                "line": record.lineno,
+                "function": record.funcName
+            },
+            "process_id": record.process,
+            "thread_name": record.threadName,
         }
-        if hasattr(record, 'extra_context'):
-            log_record.update(record.extra_context)
 
-        # ⬇️ STEP 2: Modify this line to use the new serializer ⬇️
+        # Add the custom 'extra_context' dictionary if it exists
+        if hasattr(record, 'extra_context'):
+            log_record['context'] = record.extra_context
+
+        # Add the formatted traceback if exception info exists
+        if record.exc_info:
+            log_record['traceback'] = self.formatException(record.exc_info)
+        
         return json.dumps(log_record, default=custom_json_serializer)
 
 
@@ -204,7 +218,7 @@ class SystemLogger:
 
     def log_heartbeat(self, task_id: int, main_worker_id: str, **context):
         """Logs heartbeat from a worker."""
-        self._log(logging.DEBUG, f"Heartbeat received for task {task_id} from worker {worker_id}.", {"task_id": task_id, "worker_id": worker_id, **context})
+        self._log(logging.DEBUG, f"Heartbeat received for task {task_id} from worker {main_worker_id}.", {"task_id": task_id, "worker_id": main_worker_id, **context})
 
     def log_lease_expiry(self, task_id: int, worker_id: str, **context):
         """Logs when a task lease expires and needs re-queuing."""

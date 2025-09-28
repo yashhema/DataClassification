@@ -746,7 +746,14 @@ class Worker:
                     component_type=content_component.component_type,
                     trace_id=work_packet.header.trace_id
                 )
-                self.logger.warning("Component classification failed", error_id=error.error_id)
+                self.logger.warning(
+                    f"Component classification failed for component '{content_component.component_id}'",
+                    exc_info=True,  # This adds the full traceback
+                    component_id=content_component.component_id,
+                    parent_path=content_component.parent_path,
+                    job_id=work_packet.header.job_id,
+                    task_id=work_packet.header.task_id
+                )
                 # Continue processing other components
             
             # Send heartbeat periodically
@@ -871,7 +878,7 @@ class Worker:
         try:
             if component.component_type == "table":
                 # Route to row-by-row classification
-                return await self._classify_table_component_async(component, engine_interface, work_packet)
+                return await self.classify_document_content(component, engine_interface, work_packet)
                 
             elif component.component_type in ["text", "image_ocr", "table_fallback", "archive_member"]:
                 # Route to document content classification
@@ -888,7 +895,7 @@ class Worker:
                     archive_parent = component.parent_path.split('/')[0] if component.parent_path else ""
                     file_metadata["archive_parent"] = archive_parent
                 
-                return await engine_interface.classify_document_content_async(
+                return await engine_interface.classify_document_content(
                     content=component.content,
                     file_metadata=file_metadata
                 )
@@ -905,7 +912,7 @@ class Worker:
                                    component_id=component.component_id)
                 return []
         except Exception as e:
-            self.logger.error("Component classification failed",
+            self.logger.error("Hello Component classification failed",exc_info=True,
                              component_id=component.component_id,
                              error=str(e))
             return []
@@ -967,7 +974,7 @@ class Worker:
                     }
                     
                     # Single row classification call (ASYNC)
-                    row_findings = await engine_interface.classify_database_row_async(
+                    row_findings = await engine_interface.classify_database_row(
                         row_data=row_data,
                         row_pk=row_pk,
                         table_metadata=table_metadata
@@ -991,10 +998,15 @@ class Worker:
                     all_row_findings.extend(row_findings)
                     
                 except Exception as row_error:
-                    self.logger.warning("Row classification failed",
-                                       component_id=component.component_id,
-                                       row_index=row_index,
-                                       error=str(row_error))
+                    self.logger.warning(
+                        "Failed to classify a single row within a table component.",
+                        exc_info=True,  # This adds the full traceback
+                        component_id=component.component_id,
+                        parent_path=component.parent_path,
+                        row_index=row_index,
+                        job_id=work_packet.header.job_id,
+                        task_id=work_packet.header.task_id
+                    )
                     # Continue processing other rows
                     continue
             

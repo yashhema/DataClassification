@@ -11,6 +11,7 @@ import signal
 import sys
 import os
 import sqlalchemy
+from datetime import datetime, timezone, timedelta
 # --- ADD THESE THREE LINES ---
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -249,10 +250,24 @@ async def main():
 
         # 5. Initialize Final Logger & File Logging
         logging.basicConfig(level=settings.logging.level.upper(), format='%(asctime)s - %(levelname)s - %(message)s', force=True)
+
         if settings.logging.file and settings.logging.file.enabled:
             log_dir = os.path.dirname(settings.logging.file.path)
             if log_dir: os.makedirs(log_dir, exist_ok=True)
-            file_handler = logging.FileHandler(settings.logging.file.path)
+
+            # --- START OF CHANGE ---
+            # 1. Generate a timestamp string
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            # 2. Split the original path to insert the timestamp
+            path_root, path_ext = os.path.splitext(settings.logging.file.path)
+            
+            # 3. Create the new, unique log file path
+            unique_log_path = f"{path_root}_{timestamp}{path_ext}"
+            
+            # 4. Use the unique path to create the file handler
+            file_handler = logging.FileHandler(unique_log_path)
+            # --- END OF CHANGE ---
             file_handler.setLevel(settings.logging.file.level.upper())
             if settings.logging.file.format.upper() == "JSON":
                 file_handler.setFormatter(JsonFormatter())
