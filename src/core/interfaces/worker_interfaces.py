@@ -9,14 +9,9 @@ from typing import List, AsyncIterator, Optional, Dict, Any, Tuple
 
 # Import the strongly-typed Pydantic models
 from core.models.models import DiscoveredObject, ObjectMetadata, RemediationResult
-from core.models.models import WorkPacket, ContentComponent, TombstoneConfig
+from core.models.models import WorkPacket, ContentComponent, TombstoneConfig,BoundaryType, DiscoveryBatch
 
-
-class IDatabaseDataSourceConnector(ABC):
-    """
-    Interface for data source connectors that interact with structured databases.
-    """
-   """
+"""
     Interface for data source connectors that interact with structured databases.
 
     --- DESIGN DOCUMENT: Resilient Enumeration Workflow ---
@@ -52,7 +47,9 @@ class IDatabaseDataSourceConnector(ABC):
     This layered approach provides critical fault tolerance. A failure at any
     stage is isolated to that specific task and boundary, and the system can
     resume from the last successful checkpoint.
-    """
+"""
+
+class IDatabaseDataSourceConnector(ABC):
 
 
     @abstractmethod
@@ -63,7 +60,6 @@ class IDatabaseDataSourceConnector(ABC):
         the next stage of enumeration tasks.
         """
         pass
-    @abstractmethod
     @abstractmethod
     async def enumerate_objects(self, work_packet: WorkPacket) -> AsyncIterator[DiscoveryBatch]:
         """

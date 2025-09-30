@@ -7,7 +7,8 @@ import json
 
 # Core system and model imports
 from sqlalchemy import update
-from core.db_models.job_schema import TaskOutputRecord, TaskStatus
+
+from core.db_models.job_schema import Task, TaskOutputRecord, TaskStatus
 from core.db_models.remediation_ledger_schema import LedgerStatus
 from core.models.models import (
     PolicySelectorExecutePayload, PolicyActionExecutePayload, PolicyReconcilePayload,

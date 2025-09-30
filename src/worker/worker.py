@@ -19,6 +19,7 @@ from typing import Optional, Dict, Any, List, Union
 from datetime import datetime, timezone
 from enum import Enum
 import hashlib
+import json
 from core.logging.system_logger import SystemLogger
 from core.config.configuration_manager import SystemConfig
 from core.errors import ErrorHandler
@@ -41,6 +42,7 @@ from core.models.models import (
 from .search_provider import create_search_provider
 from core.db_models.remediation_ledger_schema import LedgerStatus
 from core.models.models import ActionType
+from core.utils.hash_utils import generate_object_key_hash
 class WorkerStatus(str, Enum):
     """Worker operational states."""
     STARTING = "STARTING"

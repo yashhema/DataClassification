@@ -268,193 +268,193 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
     # Async IDatabaseDataSourceConnector Interface Implementation
     # =============================================================================
 
-	def get_boundary_type(self) -> BoundaryType:
-		"""
-		Defines the top-level enumeration boundary for this connector.
-		For SQL Server, discovery always starts at the server level to find
-		all available databases. Therefore, the boundary is DATABASE.
-		This is a static property of the connector's discovery strategy.
-		"""
-		return BoundaryType.DATABASE
+    def get_boundary_type(self) -> BoundaryType:
+        """
+        Defines the top-level enumeration boundary for this connector.
+        For SQL Server, discovery always starts at the server level to find
+        all available databases. Therefore, the boundary is DATABASE.
+        This is a static property of the connector's discovery strategy.
+        """
+        return BoundaryType.DATABASE
 
-	async def enumerate_objects(self, work_packet: WorkPacket) -> AsyncIterator[DiscoveryBatch]:
-		"""
-		--- WORKFLOW DOCUMENTATION ---
-		This method implements a resilient, multi-level "fan-out" discovery process
-		with a special optimization for the initial task of a job.
+    async def enumerate_objects(self, work_packet: WorkPacket) -> AsyncIterator[DiscoveryBatch]:
+        """
+        --- WORKFLOW DOCUMENTATION ---
+        This method implements a resilient, multi-level "fan-out" discovery process
+        with a special optimization for the initial task of a job.
 
-		1.  INITIAL TASK (payload.paths is empty):
-			- The connector performs a two-level discovery to find databases and then schemas.
-			- OPTIMIZATION: If this deep discovery results in only a single schema,
-			  it "drills down" and enumerates the tables within that schema directly,
-			  avoiding the creation of unnecessary intermediate tasks.
-			- FAN-OUT: If multiple databases or schemas are found, it yields them,
-			  allowing the Pipeliner to create new, parallel enumeration tasks for each.
+        1.  INITIAL TASK (payload.paths is empty):
+            - The connector performs a two-level discovery to find databases and then schemas.
+            - OPTIMIZATION: If this deep discovery results in only a single schema,
+              it "drills down" and enumerates the tables within that schema directly,
+              avoiding the creation of unnecessary intermediate tasks.
+            - FAN-OUT: If multiple databases or schemas are found, it yields them,
+              allowing the Pipeliner to create new, parallel enumeration tasks for each.
 
-		2.  SUBSEQUENT TASKS (payload.paths is populated):
-			- The task contains a list of specific boundaries to process (e.g., a list of schemas).
-			- The connector processes each boundary one by one, performing a single-level
-			  discovery (e.g., finding all tables within a schema).
-			- It signals the completion of each boundary with a final DiscoveryBatch,
-			  which acts as a transactional checkpoint for the Worker.
-		"""
-		await self._ensure_connection_async(work_packet.header.trace_id, work_packet.header.task_id)
-		
-		# The 'paths' field determines if this is the first task or a subsequent one.
-		is_initial_task = not work_packet.payload.paths
+        2.  SUBSEQUENT TASKS (payload.paths is populated):
+            - The task contains a list of specific boundaries to process (e.g., a list of schemas).
+            - The connector processes each boundary one by one, performing a single-level
+              discovery (e.g., finding all tables within a schema).
+            - It signals the completion of each boundary with a final DiscoveryBatch,
+              which acts as a transactional checkpoint for the Worker.
+        """
+        await self._ensure_connection_async(work_packet.header.trace_id, work_packet.header.task_id)
+        
+        # The 'paths' field determines if this is the first task or a subsequent one.
+        is_initial_task = not work_packet.payload.paths
 
-		if is_initial_task:
-			# Execute the special initial discovery with the drill-down optimization.
-			async for batch in self._perform_initial_discovery_async(work_packet):
-				yield batch
-		else:
-			# This is a subsequent task; process the specific boundaries it contains.
-			boundaries_to_scan = work_packet.payload.paths
-			# Determine the boundary type by inspecting the path format (e.g., "DB.Schema").
-			boundary_type = BoundaryType.SCHEMA if '.' in boundaries_to_scan[0] else BoundaryType.DATABASE
+        if is_initial_task:
+            # Execute the special initial discovery with the drill-down optimization.
+            async for batch in self._perform_initial_discovery_async(work_packet):
+                yield batch
+        else:
+            # This is a subsequent task; process the specific boundaries it contains.
+            boundaries_to_scan = work_packet.payload.paths
+            # Determine the boundary type by inspecting the path format (e.g., "DB.Schema").
+            boundary_type = BoundaryType.SCHEMA if '.' in boundaries_to_scan[0] else BoundaryType.DATABASE
 
-			if boundary_type == BoundaryType.DATABASE:
-				for db_name in boundaries_to_scan:
-					async for batch in self._discover_and_yield_schemas(db_name, work_packet):
-						yield batch
-			elif boundary_type == BoundaryType.SCHEMA:
-				for fq_schema_name in boundaries_to_scan:
-					async for batch in self._discover_and_yield_tables(fq_schema_name, work_packet):
-						yield batch
+            if boundary_type == BoundaryType.DATABASE:
+                for db_name in boundaries_to_scan:
+                    async for batch in self._discover_and_yield_schemas(db_name, work_packet):
+                        yield batch
+            elif boundary_type == BoundaryType.SCHEMA:
+                for fq_schema_name in boundaries_to_scan:
+                    async for batch in self._discover_and_yield_tables(fq_schema_name, work_packet):
+                        yield batch
 
-	async def _perform_initial_discovery_async(self, work_packet: WorkPacket) -> AsyncIterator[DiscoveryBatch]:
-		"""Handles the special two-level discovery for the first task of a job."""
-		scan_config = self.datasource_config.configuration.get('scan_config', {})
-		
-		# 1. Discover all databases.
-		databases = await self._discover_databases(scan_config)
-		
-		# 2. OPTIMIZATION: If only one database is found, drill down immediately.
-		if len(databases) == 1:
-			single_db_name = databases[0]['database_name']
-			self.logger.info(f"Initial discovery found a single database ('{single_db_name}'). Drilling down to schemas.", **self.job_context(work_packet))
-			
-			# Discover all schemas in that single database.
-			schemas = await self._discover_schemas(single_db_name, scan_config)
-			
-			# 3. OPTIMIZATION: If only one schema is found, drill down again to tables.
-			if len(schemas) == 1:
-				single_schema_name = schemas[0]['schema_name']
-				fq_schema_name = f"{single_db_name}.{single_schema_name}"
-				self.logger.info(f"Single schema ('{fq_schema_name}') found. Drilling down to tables.", **self.job_context(work_packet))
-				
-				# Enumerate and yield all tables within that single schema.
-				async for batch in self._discover_and_yield_tables(fq_schema_name, work_packet):
-					yield batch
-				return # End of the optimization path.
-			
-			# If multiple schemas were found, yield them for the Pipeliner to fan out.
-			else:
-				self.logger.info(f"Fan-out: Found 1 database and {len(schemas)} schemas.", **self.job_context(work_packet))
-				boundary_id = generate_object_key_hash(self.datasource_id, single_db_name, "DATABASE")
-				discovered_objects = [self._create_schema_discovered_object(single_db_name, s['schema_name']) for s in schemas]
-				yield DiscoveryBatch(boundary_id=boundary_id, is_final_batch=True, discovered_objects=discovered_objects)
-				return
+    async def _perform_initial_discovery_async(self, work_packet: WorkPacket) -> AsyncIterator[DiscoveryBatch]:
+        """Handles the special two-level discovery for the first task of a job."""
+        scan_config = self.datasource_config.configuration.get('scan_config', {})
+        
+        # 1. Discover all databases.
+        databases = await self._discover_databases(scan_config)
+        
+        # 2. OPTIMIZATION: If only one database is found, drill down immediately.
+        if len(databases) == 1:
+            single_db_name = databases[0]['database_name']
+            self.logger.info(f"Initial discovery found a single database ('{single_db_name}'). Drilling down to schemas.", **self.job_context(work_packet))
+            
+            # Discover all schemas in that single database.
+            schemas = await self._discover_schemas(single_db_name, scan_config)
+            
+            # 3. OPTIMIZATION: If only one schema is found, drill down again to tables.
+            if len(schemas) == 1:
+                single_schema_name = schemas[0]['schema_name']
+                fq_schema_name = f"{single_db_name}.{single_schema_name}"
+                self.logger.info(f"Single schema ('{fq_schema_name}') found. Drilling down to tables.", **self.job_context(work_packet))
+                
+                # Enumerate and yield all tables within that single schema.
+                async for batch in self._discover_and_yield_tables(fq_schema_name, work_packet):
+                    yield batch
+                return # End of the optimization path.
+            
+            # If multiple schemas were found, yield them for the Pipeliner to fan out.
+            else:
+                self.logger.info(f"Fan-out: Found 1 database and {len(schemas)} schemas.", **self.job_context(work_packet))
+                boundary_id = generate_object_key_hash(self.datasource_id, single_db_name, "DATABASE")
+                discovered_objects = [self._create_schema_discovered_object(single_db_name, s['schema_name']) for s in schemas]
+                yield DiscoveryBatch(boundary_id=boundary_id, is_final_batch=True, discovered_objects=discovered_objects)
+                return
 
-		# FAN-OUT: If multiple databases were found, yield them for the Pipeliner.
-		else:
-			self.logger.info(f"Fan-out: Found {len(databases)} databases.", **self.job_context(work_packet))
-			boundary_id = generate_object_key_hash(self.datasource_id, "server_instance", "DATABASE_SERVER")
-			discovered_objects = [self._create_database_discovered_object(db['database_name']) for db in databases]
-			yield DiscoveryBatch(boundary_id=boundary_id, is_final_batch=True, discovered_objects=discovered_objects)
+        # FAN-OUT: If multiple databases were found, yield them for the Pipeliner.
+        else:
+            self.logger.info(f"Fan-out: Found {len(databases)} databases.", **self.job_context(work_packet))
+            boundary_id = generate_object_key_hash(self.datasource_id, "server_instance", "DATABASE_SERVER")
+            discovered_objects = [self._create_database_discovered_object(db['database_name']) for db in databases]
+            yield DiscoveryBatch(boundary_id=boundary_id, is_final_batch=True, discovered_objects=discovered_objects)
 
-	async def _discover_and_yield_schemas(self, db_name: str, work_packet: WorkPacket) -> AsyncIterator[DiscoveryBatch]:
-		"""Discovers all schemas in a database and yields them in a single final batch."""
-		scan_config = self.datasource_config.configuration.get('scan_config', {})
-		boundary_id = generate_object_key_hash(self.datasource_id, db_name, "DATABASE")
-		try:
-			schemas = await self._discover_schemas(db_name, scan_config)
-			discovered_objects = [self._create_schema_discovered_object(db_name, s['schema_name']) for s in schemas]
-			yield DiscoveryBatch(boundary_id=boundary_id, is_final_batch=True, discovered_objects=discovered_objects)
-		except Exception as e:
-			self.error_handler.handle_error(e, "discover_schemas", database=db_name, **self.job_context(work_packet))
-			yield DiscoveryBatch(boundary_id=boundary_id, is_final_batch=True, discovered_objects=[])
+    async def _discover_and_yield_schemas(self, db_name: str, work_packet: WorkPacket) -> AsyncIterator[DiscoveryBatch]:
+        """Discovers all schemas in a database and yields them in a single final batch."""
+        scan_config = self.datasource_config.configuration.get('scan_config', {})
+        boundary_id = generate_object_key_hash(self.datasource_id, db_name, "DATABASE")
+        try:
+            schemas = await self._discover_schemas(db_name, scan_config)
+            discovered_objects = [self._create_schema_discovered_object(db_name, s['schema_name']) for s in schemas]
+            yield DiscoveryBatch(boundary_id=boundary_id, is_final_batch=True, discovered_objects=discovered_objects)
+        except Exception as e:
+            self.error_handler.handle_error(e, "discover_schemas", database=db_name, **self.job_context(work_packet))
+            yield DiscoveryBatch(boundary_id=boundary_id, is_final_batch=True, discovered_objects=[])
 
-	async def _discover_and_yield_tables(self, fq_schema_name: str, work_packet: WorkPacket) -> AsyncIterator[DiscoveryBatch]:
-		"""Discovers all tables in a schema and yields them in a final batch."""
-		scan_config = self.datasource_config.configuration.get('scan_config', {})
-		boundary_id = generate_object_key_hash(self.datasource_id, fq_schema_name, "SCHEMA")
-		try:
-			db_name, schema_name = fq_schema_name.split('.', 1)
-			tables = await self._discover_tables(db_name, schema_name, scan_config)
-			discovered_objects = [self._create_table_discovered_object(db_name, schema_name, t['table_name'], t) for t in tables]
-			yield DiscoveryBatch(boundary_id=boundary_id, is_final_batch=True, discovered_objects=discovered_objects)
-		except Exception as e:
-			self.error_handler.handle_error(e, "discover_tables", schema=fq_schema_name, **self.job_context(work_packet))
-			yield DiscoveryBatch(boundary_id=boundary_id, is_final_batch=True, discovered_objects=[])
+    async def _discover_and_yield_tables(self, fq_schema_name: str, work_packet: WorkPacket) -> AsyncIterator[DiscoveryBatch]:
+        """Discovers all tables in a schema and yields them in a final batch."""
+        scan_config = self.datasource_config.configuration.get('scan_config', {})
+        boundary_id = generate_object_key_hash(self.datasource_id, fq_schema_name, "SCHEMA")
+        try:
+            db_name, schema_name = fq_schema_name.split('.', 1)
+            tables = await self._discover_tables(db_name, schema_name, scan_config)
+            discovered_objects = [self._create_table_discovered_object(db_name, schema_name, t['table_name'], t) for t in tables]
+            yield DiscoveryBatch(boundary_id=boundary_id, is_final_batch=True, discovered_objects=discovered_objects)
+        except Exception as e:
+            self.error_handler.handle_error(e, "discover_tables", schema=fq_schema_name, **self.job_context(work_packet))
+            yield DiscoveryBatch(boundary_id=boundary_id, is_final_batch=True, discovered_objects=[])
 
-	async def _get_discovery_query(self, query_name: str) -> str:
-		"""Safely gets a discovery query from the connector's configuration."""
-		environment_info = await self._get_environment_info_async()
-		env_type = environment_info.get('environment_type', 'on_premise')
-		
-		try:
-			# Use the structure from your connector config JSON
-			query = self.connector_config['sql_server_queries']['environments'][env_type][query_name]
-		except KeyError:
-			self.logger.warning(f"No specific '{query_name}' query for environment '{env_type}'. Using fallback.", environment=env_type)
-			query = self.connector_config['sql_server_queries']['fallback_queries'][query_name]
-			
-		return query
+    async def _get_discovery_query(self, query_name: str) -> str:
+        """Safely gets a discovery query from the connector's configuration."""
+        environment_info = await self._get_environment_info_async()
+        env_type = environment_info.get('environment_type', 'on_premise')
+        
+        try:
+            # Use the structure from your connector config JSON
+            query = self.connector_config['sql_server_queries']['environments'][env_type][query_name]
+        except KeyError:
+            self.logger.warning(f"No specific '{query_name}' query for environment '{env_type}'. Using fallback.", environment=env_type)
+            query = self.connector_config['sql_server_queries']['fallback_queries'][query_name]
+            
+        return query
 
-	async def _discover_databases(self, scan_config: Dict[str, Any]) -> List[Dict[str, Any]]:
-		"""Executes the database discovery query from the connector configuration."""
-		query = await self._get_discovery_query("database_discovery")
-		return await self.connection.execute_query_async(query)
+    async def _discover_databases(self, scan_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Executes the database discovery query from the connector configuration."""
+        query = await self._get_discovery_query("database_discovery")
+        return await self.connection.execute_query_async(query)
 
-	async def _discover_schemas(self, database_name: str, scan_config: Dict[str, Any]) -> List[Dict[str, Any]]:
-		"""Executes the schema discovery query from the connector configuration."""
-		query_template = await self._get_discovery_query("schema_discovery")
-		formatted_query = query_template.format(database_name=database_name)
-		return await self.connection.execute_query_async(formatted_query)
+    async def _discover_schemas(self, database_name: str, scan_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Executes the schema discovery query from the connector configuration."""
+        query_template = await self._get_discovery_query("schema_discovery")
+        formatted_query = query_template.format(database_name=database_name)
+        return await self.connection.execute_query_async(formatted_query)
 
-	async def _discover_tables(self, database_name: str, schema_name: str, scan_config: Dict[str, Any]) -> List[Dict[str, Any]]:
-		"""Executes the table discovery query from the connector configuration."""
-		query_template = await self._get_discovery_query("table_discovery")
-		formatted_query = query_template.format(database_name=database_name, schema_name=schema_name)
-		return await self.connection.execute_query_async(formatted_query)
+    async def _discover_tables(self, database_name: str, schema_name: str, scan_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Executes the table discovery query from the connector configuration."""
+        query_template = await self._get_discovery_query("table_discovery")
+        formatted_query = query_template.format(database_name=database_name, schema_name=schema_name)
+        return await self.connection.execute_query_async(formatted_query)
 
-	# --- UPDATED HELPER METHODS TO USE NEW ENUMS ---
+    # --- UPDATED HELPER METHODS TO USE NEW ENUMS ---
 
-	def _create_database_discovered_object(self, database_name: str) -> DiscoveredObject:
-		obj_key_hash = generate_object_key_hash(self.datasource_id, database_name, ObjectType.DATABASE.value)
-		return DiscoveredObject(
-			object_key_hash=obj_key_hash,
-			datasource_id=self.datasource_id,
-			object_type=ObjectType.DATABASE,
-			object_path=database_name,
-			discovery_timestamp=datetime.now(timezone.utc)
-		)
+    def _create_database_discovered_object(self, database_name: str) -> DiscoveredObject:
+        obj_key_hash = generate_object_key_hash(self.datasource_id, database_name, ObjectType.DATABASE.value)
+        return DiscoveredObject(
+            object_key_hash=obj_key_hash,
+            datasource_id=self.datasource_id,
+            object_type=ObjectType.DATABASE,
+            object_path=database_name,
+            discovery_timestamp=datetime.now(timezone.utc)
+        )
 
-	def _create_schema_discovered_object(self, database_name: str, schema_name: str) -> DiscoveredObject:
-		object_path = f"{database_name}.{schema_name}"
-		obj_key_hash = generate_object_key_hash(self.datasource_id, object_path, ObjectType.SCHEMA.value)
-		return DiscoveredObject(
-			object_key_hash=obj_key_hash,
-			datasource_id=self.datasource_id,
-			object_type=ObjectType.SCHEMA,
-			object_path=object_path,
-			discovery_timestamp=datetime.now(timezone.utc)
-		)
+    def _create_schema_discovered_object(self, database_name: str, schema_name: str) -> DiscoveredObject:
+        object_path = f"{database_name}.{schema_name}"
+        obj_key_hash = generate_object_key_hash(self.datasource_id, object_path, ObjectType.SCHEMA.value)
+        return DiscoveredObject(
+            object_key_hash=obj_key_hash,
+            datasource_id=self.datasource_id,
+            object_type=ObjectType.SCHEMA,
+            object_path=object_path,
+            discovery_timestamp=datetime.now(timezone.utc)
+        )
 
-	def _create_table_discovered_object(self, database_name: str, schema_name: str, table_name: str, table_info: Dict[str, Any]) -> DiscoveredObject:
-		object_path = f"{database_name}.{schema_name}.{table_name}"
-		obj_key_hash = generate_object_key_hash(self.datasource_id, object_path, ObjectType.DATABASE_TABLE.value)
-		# Use a rough estimate for size; a more precise calculation is expensive here.
-		size_estimate = int(table_info.get('estimated_row_count', 0)) * 1024 
-		return DiscoveredObject(
-			object_key_hash=obj_key_hash,
-			datasource_id=self.datasource_id,
-			object_type=ObjectType.DATABASE_TABLE,
-			object_path=object_path,
-			size_bytes=size_estimate,
-			discovery_timestamp=datetime.now(timezone.utc)
-		)
+    def _create_table_discovered_object(self, database_name: str, schema_name: str, table_name: str, table_info: Dict[str, Any]) -> DiscoveredObject:
+        object_path = f"{database_name}.{schema_name}.{table_name}"
+        obj_key_hash = generate_object_key_hash(self.datasource_id, object_path, ObjectType.DATABASE_TABLE.value)
+        # Use a rough estimate for size; a more precise calculation is expensive here.
+        size_estimate = int(table_info.get('estimated_row_count', 0)) * 1024 
+        return DiscoveredObject(
+            object_key_hash=obj_key_hash,
+            datasource_id=self.datasource_id,
+            object_type=ObjectType.DATABASE_TABLE,
+            object_path=object_path,
+            size_bytes=size_estimate,
+            discovery_timestamp=datetime.now(timezone.utc)
+        )
 
 
 
