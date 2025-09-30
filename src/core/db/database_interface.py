@@ -40,7 +40,7 @@ from ..db_models.classifiertemplate_schema import ClassifierTemplate
 from ..db_models.classifier_schema import Classifier
 from ..db_models.job_schema import PolicyTemplate
 from ..db_models.remediation_ledger_schema import RemediationLedger, LedgerStatus
-
+from ..db_models.enumeration_progress_schema import EnumerationProgress, EnumerationProgressStatus
 # Import Pydantic models for type hinting and data conversion
 
 # Import core services for integration
@@ -151,6 +151,194 @@ class DatabaseInterface:
         """Validates table name to prevent SQL injection."""
         if not self._safe_table_name_pattern.match(table_name):
             raise ValueError(f"Invalid characters in table name: {table_name}")
+
+
+
+# In src/core/db/database_interface.py
+
+
+    async def write_discovery_to_staging_async(
+        self,
+        discovered_objects: List[Dict[str, Any]],
+        staged_output_records: List[Dict[str, Any]],
+        discovery_staging_table: str,
+        output_staging_table: str,
+        context: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        In a single transaction, saves a batch of discovered objects to their
+        staging table and the corresponding TaskOutputRecords to THEIR staging table.
+        """
+        context = context or {}
+        async with self.get_async_session() as session:
+            try:
+                # This logic assumes you have a method like insert_discovered_object_batch
+                # that can participate in an existing session.
+                if discovered_objects:
+                    await self.insert_discovered_object_batch(
+                        objects=discovered_objects,
+                        staging_table_name=discovery_staging_table,
+                        session=session,
+                        context=context
+                    )
+                
+                # Now, bulk insert into the task output staging table
+                if staged_output_records:
+                    await session.run_sync(
+                        lambda sync_session: sync_session.bulk_insert_mappings(
+                            TaskOutputRecord, staged_output_records, render_nulls=True
+                        )
+                    )
+
+                await session.commit()
+            except Exception as e:
+                await session.rollback()
+                self.error_handler.handle_error(e, "write_discovery_to_staging", **context)
+                raise
+
+
+    async def commit_boundary_outputs_from_staging_async(
+        self,
+        task_id: bytes,
+        boundary_id: bytes,
+        boundary_path: str,
+        output_staging_table: str,
+        context: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        In a single transaction, moves all TaskOutputRecords for a given boundary
+        from the staging table to the main table and creates a checkpoint record
+        in the enumeration_progress table.
+        A stored procedure is the safest way to ensure atomicity for this operation.
+        """
+        context = context or {}
+        self.logger.log_database_operation("TRANSACTION", "commit_boundary", "STARTED", task_id=task_id.hex(), **context)
+        try:
+            # It is highly recommended to implement this logic in a database stored procedure
+            # to guarantee atomicity and reduce network round-trips.
+            async with self.get_async_session() as session:
+                
+                # This is a conceptual representation. The actual SQL may vary.
+                stored_proc_sql = text(
+                    "EXEC dbo.CommitBoundaryEnumeration "
+                    "@task_id = :task_id, "
+                    "@boundary_id = :boundary_id, "
+                    "@boundary_path = :boundary_path, "
+                    "@staging_table = :staging_table"
+                )
+                
+                await session.execute(
+                    stored_proc_sql,
+                    {
+                        "task_id": task_id,
+                        "boundary_id": boundary_id,
+                        "boundary_path": boundary_path,
+                        "staging_table": output_staging_table,
+                    }
+                )
+                await session.commit()
+            
+            self.logger.log_database_operation("TRANSACTION", "commit_boundary", "SUCCESS", task_id=task_id.hex(), **context)
+        except Exception as e:
+            self.error_handler.handle_error(e, "commit_boundary_outputs_from_staging", **context)
+            raise
+
+    async def commit_boundary_as_completed_async(
+        self,
+        task_id: bytes,
+        boundary_id: bytes,
+        boundary_path: str,
+        staging_table_name: str,
+        context: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Atomically creates TaskOutputRecords from a staging table for a given boundary
+        and creates a permanent checkpoint record in the enumeration_progress table.
+        """
+        context = context or {}
+        self.logger.log_database_operation(
+            "TRANSACTION", "enumeration_progress", "STARTED",
+            operation="commit_boundary", task_id=task_id.hex(), boundary_path=boundary_path, **context
+        )
+
+        async with self.get_async_session() as session:
+            try:
+                # This logic will be executed within a single, atomic transaction.
+                # A stored procedure is the most efficient way to handle this server-side.
+                # The procedure encapsulates the logic of reading from staging, creating
+                # the two types of output records, and finally creating the progress record.
+
+                # Note: The SQL for the stored procedure would need to be created separately in your database.
+                # This Python code shows how you would call it.
+                stored_proc_sql = text(
+                    "EXEC dbo.CreateTaskOutputsFromStaging "
+                    "@task_id = :task_id, "
+                    "@boundary_id = :boundary_id, "
+                    "@boundary_path = :boundary_path, "
+                    "@staging_table = :staging_table"
+                )
+
+                await session.execute(
+                    stored_proc_sql,
+                    {
+                        "task_id": task_id,
+                        "boundary_id": boundary_id,
+                        "boundary_path": boundary_path,
+                        "staging_table": staging_table_name,
+                    }
+                )
+
+                await session.commit()
+                self.logger.log_database_operation(
+                    "TRANSACTION", "enumeration_progress", "SUCCESS",
+                    operation="commit_boundary", task_id=task_id.hex(), **context
+                )
+
+            except Exception as e:
+                await session.rollback()
+                self.error_handler.handle_error(
+                    e, "commit_boundary_as_completed",
+                    task_id=task_id.hex(), boundary_path=boundary_path, **context
+                )
+                raise
+
+    async def get_completed_boundaries_for_task_async(
+        self,
+        task_id: bytes,
+        context: Optional[Dict[str, Any]] = None
+    ) -> List[bytes]:
+        """
+        Fetches the list of boundary_ids that have already been fully processed
+        for a given task. This is used by a worker to recover and resume a failed task.
+        """
+        context = context or {}
+        self.logger.log_database_operation(
+            "SELECT", "enumeration_progress", "STARTED",
+            operation="get_completed_boundaries", task_id=task_id.hex(), **context
+        )
+
+        try:
+            async with self.get_async_session() as session:
+                stmt = select(EnumerationProgress.boundary_id).where(
+                    EnumerationProgress.task_id == task_id,
+                    EnumerationProgress.status.in_([
+                        EnumerationProgressStatus.PROCESSING_COMPLETE,
+                        EnumerationProgressStatus.PIPELINE_COMPLETE
+                    ])
+                )
+                result = await session.scalars(stmt)
+                completed_ids = result.all()
+                self.logger.log_database_operation(
+                    "SELECT", "enumeration_progress", "SUCCESS",
+                    operation="get_completed_boundaries", count=len(completed_ids), **context
+                )
+                return completed_ids
+        except Exception as e:
+            self.error_handler.handle_error(
+                e, "get_completed_boundaries_for_task",
+                task_id=task_id.hex(), **context
+            )
+            raise
 
 
     async def requeue_job(self, job_id: int, context: Optional[Dict[str, Any]] = None) -> None:

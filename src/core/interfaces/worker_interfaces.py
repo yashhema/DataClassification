@@ -16,10 +16,73 @@ class IDatabaseDataSourceConnector(ABC):
     """
     Interface for data source connectors that interact with structured databases.
     """
+   """
+    Interface for data source connectors that interact with structured databases.
+
+    --- DESIGN DOCUMENT: Resilient Enumeration Workflow ---
+
+    This interface enforces a multi-level, fault-tolerant "fan-out" discovery
+    process. The goal is to ensure that the enumeration of large, complex database
+    servers is both scalable and fully recoverable.
+
+    The enumeration process is broken down into a series of distinct, layered tasks,
+    with each completed task serving as a permanent checkpoint in the database.
+
+    THE LOGICAL FLOW:
+    1.  Task 1 (Discover Databases): The first task connects to the server instance
+        and discovers a list of all database names. It yields a single final
+        DiscoveryBatch containing DiscoveredObjects of type DATABASE.
+
+    2.  Pipeliner (Fan-Out): The Pipeliner receives this list and creates new,
+        batched DISCOVERY_ENUMERATE tasks. Each new task is responsible for
+        processing a batch of databases to find their schemas.
+
+    3.  Task 2 (Discover Schemas): A worker receives a task with a list of database
+        names. For each database, it discovers all schema names and yields a
+        final DiscoveryBatch for that database, containing DiscoveredObjects of
+        type SCHEMA.
+
+    4.  Pipeliner (Fan-Out): The Pipeliner receives these lists of schemas and
+        creates the final set of batched DISCOVERY_ENUMERATE tasks.
+
+    5.  Task 3 (Discover Tables): A worker receives a task with a list of schema
+        names. For each schema, it discovers all tables and yields a final
+        DiscoveryBatch containing the final DiscoveredObjects of type DATABASE_TABLE.
+
+    This layered approach provides critical fault tolerance. A failure at any
+    stage is isolated to that specific task and boundary, and the system can
+    resume from the last successful checkpoint.
+    """
+
 
     @abstractmethod
-    async def enumerate_objects(self, work_packet: WorkPacket) -> AsyncIterator[List[DiscoveredObject]]:
-        """Performs a fast, streaming enumeration of objects from the source."""
+    def get_boundary_type(self) -> BoundaryType:
+        """
+        Returns the logical boundary type this connector enumerates
+        (e.g., DATABASE, SCHEMA). This informs the Pipeliner how to create
+        the next stage of enumeration tasks.
+        """
+        pass
+    @abstractmethod
+    @abstractmethod
+    async def enumerate_objects(self, work_packet: WorkPacket) -> AsyncIterator[DiscoveryBatch]:
+        """
+        Performs a single level of discovery based on the boundaries provided in the
+        work packet (e.g., finds schemas within a database, or tables within a schema).
+
+        IMPLEMENTATION REQUIREMENTS:
+        - This method MUST NOT be recursive. It processes only one logical level at a time.
+        - It must process each boundary from the work_packet.payload.paths list sequentially.
+        - For each boundary, it must yield one or more DiscoveryBatch objects.
+        - CRITICAL: After all objects for a single boundary have been yielded,
+          it MUST yield a final DiscoveryBatch with `is_final_batch=True`. This signal
+          is the transactional checkpoint for the Worker.
+        - If processing a boundary fails, it MUST still yield a final batch with an
+          empty list to prevent the Worker from stalling.
+        """
+        # The 'yield' statement is required to mark this as an async generator
+        if False:
+            yield
 
     @abstractmethod
     async def get_object_details(self, work_packet: WorkPacket) -> List[ObjectMetadata]:
@@ -92,10 +155,49 @@ class IRemediationConnector(ABC):
 # UPDATED: IFileDataSourceConnector now inherits from IRemediationConnector
 class IFileDataSourceConnector(IRemediationConnector):
     """Interface for file-based datasource connectors (SMB, S3, Azure Blob, etc.)"""
+    """
+    Interface for file-based datasource connectors (SMB, S3, Azure Blob, etc.)
+
+    --- DESIGN DOCUMENT: Resilient Enumeration Workflow ---
+
+    This interface enforces a fault-tolerant enumeration process where each
+    directory is treated as a transactional unit of work.
+
+    THE LOGICAL FLOW:
+    1.  A DISCOVERY_ENUMERATE task's payload contains a list of directories to scan.
+    2.  The Worker processes this list one directory at a time.
+    3.  For each directory, the connector performs a single-level listing and streams
+        back its findings (files and subdirectories) in DiscoveryBatch objects.
+    4.  When the connector is finished with a directory, it sends a final
+        DiscoveryBatch with `is_final_batch=True`.
+    5.  The Worker receives this signal and commits the work for that directory
+        to the database, creating a permanent checkpoint.
+    6.  The Pipeliner sees the new subdirectories and creates new, batched
+        DISCOVERY_ENUMERATE tasks for them.
+    """
+    @abstractmethod
+    def get_boundary_type(self) -> BoundaryType:
+        """
+        Returns the logical boundary type this connector enumerates
+        (e.g., DATABASE, SCHEMA). This informs the Pipeliner how to create
+        the next stage of enumeration tasks.
+        """
+        pass
     
     @abstractmethod
-    async def enumerate_objects(self, work_packet: WorkPacket) -> AsyncIterator[List[DiscoveredObject]]:
-        pass
+    async def enumerate_objects(self, work_packet: WorkPacket) -> AsyncIterator[DiscoveryBatch]:
+        """
+        Performs a single-level enumeration for each directory in the work packet.
+
+        IMPLEMENTATION REQUIREMENTS:
+        - This method MUST NOT be recursive.
+        - It must process each directory from the payload sequentially.
+        - It MUST yield DiscoveryBatch objects, signaling completion of each
+          directory with `is_final_batch=True`.
+        """
+        if False:
+            yield
+
     
     @abstractmethod  
     async def get_object_details(self, work_packet: WorkPacket) -> List[ObjectMetadata]:

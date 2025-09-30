@@ -9,6 +9,7 @@ from content_extraction.content_extractor import ContentExtractor
 from core.utils.hash_utils import generate_object_key_hash
 from datetime import datetime, timezone
 from typing import AsyncIterator, List, Dict, Any, Optional,Tuple
+from core.models.models import BoundaryType, DiscoveryBatch
 class LocalConnector(IFileDataSourceConnector):
     """
     A connector for scanning a directory on the local file system.
@@ -40,46 +41,92 @@ class LocalConnector(IFileDataSourceConnector):
             logger=self.logger,
             error_handler=self.error_handler
         )
+    def get_boundary_type(self) -> BoundaryType:
+        """For file systems, the enumeration boundary is always a directory."""
+        return BoundaryType.DIRECTORY
 
-    async def enumerate_objects(self, work_packet: Any) -> AsyncIterator[List[DiscoveredObject]]:
-        """Enumerates files recursively and creates objects with correct hash keys."""
-        self.logger.info(f"Starting local file enumeration at '{self.root_path}'...", datasource_id=self.datasource_id)
+
+    async def enumerate_objects(self, work_packet: Any) -> AsyncIterator[DiscoveryBatch]:
+        """
+        Performs a single-level enumeration for a batch of directories,
+        streaming results back in the DiscoveryBatch format.
+        """
+        paths_to_scan = work_packet.payload.paths or [self.root_path]
         
-        batch = []
-        batch_size = 100
-        
-        for dirpath, _, filenames in os.walk(self.root_path):
-            for filename in filenames:
-                full_path = os.path.join(dirpath, filename)
-                try:
-                    stat = os.stat(full_path)
-                    object_type_str = "FILE"
-                    obj_key_hash = generate_object_key_hash(
-                        datasource_id=self.datasource_id,
-                        object_path=full_path,
-                        object_type=object_type_str
-                    )
-                    obj = DiscoveredObject(
-                        object_key_hash=obj_key_hash,
-                        datasource_id=self.datasource_id,
-                        object_type=ObjectType.FILE,
-                        object_path=full_path,
-                        size_bytes=stat.st_size,
-                        last_modified=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
-                        discovery_timestamp=datetime.now(timezone.utc)
-                    )
-                    batch.append(obj)
-                    if len(batch) >= batch_size:
-                        yield batch
-                        batch = []
-                except OSError as e:
-                    self.logger.warning(f"Could not access file {full_path}: {e}", file_path=full_path)
-        
-        if batch:
-            yield batch
-
-
-
+        for directory_path in paths_to_scan:
+            boundary_id = generate_object_key_hash(
+                self.datasource_id, 
+                directory_path, 
+                self.get_boundary_type().value
+            )
+            batch = []
+            batch_size = 100
+            last_yield_time = time.time()
+            timeout_seconds = 5
+            
+            try:
+                # Use os.scandir for a more efficient single-level listing
+                with os.scandir(directory_path) as it:
+                    for entry in it:
+                        # Check timeout before processing to avoid hangs in slow directories
+                        current_time = time.time()
+                        if batch and (current_time - last_yield_time) > timeout_seconds:
+                            yield DiscoveryBatch(
+                                boundary_id=boundary_id, 
+                                is_final_batch=False, 
+                                discovered_objects=batch
+                            )
+                            batch = []
+                            last_yield_time = current_time
+                        
+                        try:
+                            object_type = ObjectType.DIRECTORY if entry.is_dir() else ObjectType.FILE
+                            
+                            obj_key_hash = generate_object_key_hash(
+                                datasource_id=self.datasource_id,
+                                object_path=entry.path,
+                                object_type=object_type.value
+                            )
+                            stat = entry.stat()
+                            obj = DiscoveredObject(
+                                object_key_hash=obj_key_hash,
+                                datasource_id=self.datasource_id,
+                                object_type=object_type,
+                                object_path=entry.path,
+                                size_bytes=stat.st_size,
+                                last_modified=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
+                                discovery_timestamp=datetime.now(timezone.utc)
+                            )
+                            batch.append(obj)
+                            
+                            # Yield when batch is full
+                            if len(batch) >= batch_size:
+                                yield DiscoveryBatch(
+                                    boundary_id=boundary_id, 
+                                    is_final_batch=False, 
+                                    discovered_objects=batch
+                                )
+                                batch = []
+                                last_yield_time = time.time()
+                                
+                        except OSError as e:
+                            self.logger.warning(
+                                f"Could not access entry {entry.path}: {e}", 
+                                file_path=entry.path
+                            )
+                            
+            except OSError as e:
+                self.logger.error(
+                    f"Could not scan directory {directory_path}: {e}", 
+                    directory_path=directory_path
+                )
+            
+            # Always yield final batch for this directory (even if empty or after error)
+            yield DiscoveryBatch(
+                boundary_id=boundary_id, 
+                is_final_batch=True, 
+                discovered_objects=batch
+            )
 
     async def get_object_content(self, work_packet: Any) -> AsyncIterator[ContentComponent]:
             """

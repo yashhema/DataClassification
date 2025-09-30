@@ -623,50 +623,121 @@ class Worker:
             self.current_task = None
             self.status = WorkerStatus.IDLE
 
+
     async def _process_discovery_enumerate_async(self, work_packet: WorkPacket):
-        """
-        Process a DISCOVERY_ENUMERATE task and includes the complete list of discovered
-        objects in the TaskOutputRecord for the Pipeliner.
-        """
-        trace_id = work_packet.header.trace_id
-        task_id = work_packet.header.task_id
-        payload = work_packet.payload
-        
-        connector = await self.connector_factory.create_connector(payload.datasource_id)
-        
-        total_objects = 0
-        batch_count = 0
-        # Use the existing, correct pattern for differentiating connectors, but for now both interfaces should return list of discovered object , so should work (we might need to rethink , when we break the object path to individual componentn
-        is_file_connector = isinstance(connector, IFileDataSourceConnector)
-        # [cite_start]The connector yields batches of DiscoveredObject Pydantic models [cite: 1525]
-        async for batch in connector.enumerate_objects(work_packet):
-            batch_count += 1
-            batch_size = len(batch)
-            total_objects += batch_size
-            
-            # The payload now contains the full DiscoveredObject models, serialized to dictionaries.
-            # The model's json_encoder for bytes will automatically convert the hash to a Base64 string.
-            await self._insert_batch_to_staging_async(batch, payload.staging_table_name, trace_id, task_id)
-            progress = TaskOutputRecord(
-                output_type="DISCOVERED_OBJECTS",
-                output_payload={
-                    "staging_table": payload.staging_table_name,
-                    "batch_id": f"batch_{batch_count}",
-                    "count": batch_size,
-                    "discovered_objects": [obj.model_dump(mode='json') for obj in batch]
-                }
-            )
-            await self._report_task_progress_async(work_packet.header.job_id,work_packet.header.task_id, progress)
-            
-            # Heartbeat logic for long-running enumerations
-            if batch_count % 10 == 0:
-                await self._send_heartbeat_async(work_packet.header.task_id)
+            """
+            Processes a DISCOVERY_ENUMERATE task using a stateful, recoverable,
+            and transactional workflow with full error handling and operational logic.
+            """
+            payload = work_packet.payload
+            task_id = bytes.fromhex(work_packet.header.task_id)
+            job_context = self.job_context(work_packet)
 
-        self.logger.info(f"Discovery enumeration completed: {total_objects} objects found", 
-                        task_id=work_packet.header.task_id, 
-                        total_objects=total_objects)
+            connector = await self.connector_factory.create_connector(payload.datasource_id)
+            boundary_type_for_next_stage = connector.get_boundary_type()
 
+            # Define staging table names for this job
+            discovery_staging_table = payload.staging_table_name
+            output_staging_table = f"stage_task_outputs_job"
 
+            # --- 1. RECOVERY STEP ---
+            paths_to_scan = payload.paths
+            if work_packet.config.retry_count > 0:
+                self.logger.info("Resuming a previously failed enumeration task. Checking for completed boundaries.", **job_context)
+                completed_boundary_hashes = await self.db_interface.get_completed_boundaries_for_task_async(task_id, context=job_context)
+
+                if completed_boundary_hashes:
+                    completed_set = set(completed_boundary_hashes)
+                    original_count = len(paths_to_scan)
+                    # Filter out paths that correspond to already completed boundaries
+                    paths_to_scan = [
+                        path for path in paths_to_scan
+                        if generate_object_key_hash(payload.datasource_id, path, boundary_type_for_next_stage.value) not in completed_set
+                    ]
+                    self.logger.info(f"Recovery: Skipped {original_count - len(paths_to_scan)} already completed boundaries.", **job_context)
+
+            # --- 2. THE TRANSACTIONAL LOOP ---
+            total_boundaries = len(paths_to_scan)
+            boundaries_processed = 0
+            for boundary_path in sorted(paths_to_scan):
+                boundary_id = generate_object_key_hash(payload.datasource_id, boundary_path, boundary_type_for_next_stage.value)
+
+                # --- RE-ADD: Error handling for each individual boundary ---
+                try:
+                    # Create a new, single-boundary WorkPacket to pass to the connector
+                    single_boundary_payload = payload.copy(update={"paths": [boundary_path]})
+                    boundary_work_packet = work_packet.copy(update={"payload": single_boundary_payload})
+
+                    # --- 3. INNER STREAMING LOOP ---
+                    async for batch in connector.enumerate_objects(boundary_work_packet):
+                        files_for_classification = []
+                        sub_boundaries_for_enumeration = []
+
+                        # A. Separate objects based on their type
+                        for obj in batch.discovered_objects:
+                            if obj.object_type.value == boundary_type_for_next_stage.value:
+                                sub_boundaries_for_enumeration.append(obj.model_dump(mode='json'))
+                            else:
+                                files_for_classification.append(obj.model_dump(mode='json'))
+
+                        # B. Prepare TaskOutputRecords to be saved to the staging table
+                        staged_output_records = []
+                        if files_for_classification:
+                            staged_output_records.append({
+                                "job_id": work_packet.header.job_id, "task_id": task_id, "boundary_id": boundary_id,
+                                "output_type": "DISCOVERED_OBJECTS",
+                                "output_payload": {"discovered_objects": files_for_classification}
+                            })
+                        if sub_boundaries_for_enumeration:
+                            staged_output_records.append({
+                                "job_id": work_packet.header.job_id, "task_id": task_id, "boundary_id": boundary_id,
+                                "output_type": "NEW_ENUMERATION_BOUNDARIES", # Generic trigger for Pipeliner
+                                "output_payload": {"discovered_objects": sub_boundaries_for_enumeration}
+                            })
+
+                        # C. Perform the micro-transaction to save to staging tables
+                        if files_for_classification or staged_output_records:
+                            await self.db_interface.write_discovery_to_staging_async(
+                                discovered_objects=files_for_classification,
+                                staged_output_records=staged_output_records,
+                                discovery_staging_table=discovery_staging_table,
+                                output_staging_table=output_staging_table,
+                                context=job_context
+                            )
+
+                        # D. Check for the final commit signal from the connector
+                        if batch.is_final_batch:
+                            self.logger.info(f"Boundary '{boundary_path}' fully processed by connector. Committing results.", **job_context)
+                            await self.db_interface.commit_boundary_outputs_from_staging_async(
+                                task_id=task_id,
+                                boundary_id=boundary_id,
+                                boundary_path=boundary_path,
+                                output_staging_table=output_staging_table,
+                                context=job_context
+                            )
+                            break  # Exit the inner streaming loop and move to the next boundary
+
+                    boundaries_processed += 1
+
+                    # --- RE-ADD: Heartbeat logic ---
+                    if boundaries_processed % 10 == 0:
+                        self.logger.info(f"Enumeration progress: {boundaries_processed}/{total_boundaries} boundaries processed.", **job_context)
+                        await self._send_heartbeat_async(work_packet.header.task_id)
+
+                except Exception as boundary_error:
+                    self.error_handler.handle_error(
+                        boundary_error, "process_single_boundary",
+                        boundary_path=boundary_path,
+                        **job_context
+                    )
+                    # If one boundary fails, log it and continue to the next one.
+                    continue
+
+            # --- RE-ADD: Final summary logging ---
+            self.logger.info(f"Discovery enumeration task completed. Processed {boundaries_processed} of {total_boundaries} assigned boundaries.",
+                             task_id=work_packet.header.task_id,
+                             boundaries_processed=boundaries_processed,
+                             total_assigned=total_boundaries)
 
     async def _process_discovery_get_details_async(self, work_packet: WorkPacket):
         """Process DISCOVERY_GET_DETAILS task (async).""" 

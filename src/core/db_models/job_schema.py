@@ -231,3 +231,4 @@ class TaskOutputRecord(Base):
     output_type: Mapped[str] = mapped_column(String(100), nullable=False)
     output_payload: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
     created_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    boundary_id: Mapped[Optional[bytes]] = mapped_column(LargeBinary(32), index=True, comment="A hash of the boundary (e.g., directory path) this output pertains to.")

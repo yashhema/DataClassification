@@ -269,6 +269,13 @@ class TaskAssigner:
         )
         
         if was_assigned:
+            # --- START OF CRITICAL FIX ---
+            # The task object from the DB has the correct, incremented retry_count.
+            # We must now inject this into the work_packet's config before dispatching it.
+            # This is the ONLY way the worker knows it's a recovery operation.
+            task.work_packet['config']['retry_count'] = task.retry_count
+            # --- END OF CRITICAL FIX ---
+
             self.rc.state_manager.confirm_task_assignment(task.job_id)
             self.logger.info(f"Task {task_id_str} successfully assigned.", task_id=task_id_str)
             

@@ -17,10 +17,11 @@ import fnmatch
 import asyncio
 import tempfile
 import aiofiles
+import time
 from typing import AsyncIterator, Optional, Dict, Any, List,Tuple
 from pathlib import Path
 from datetime import datetime, timezone
-
+from zoneinfo import ZoneInfo
 from core.models.models import ContentExtractionConfig, FailedObject
 # SMB protocol imports
 try:
@@ -31,9 +32,11 @@ try:
         Open, CreateDisposition, ShareAccess, FileAttributes, 
         CreateOptions, FilePipePrinterAccessMask, ImpersonationLevel
     )
-    from smbprotocol.file_info import FileInformationClass
+    
     from smbprotocol.exceptions import SMBException
     from smbprotocol.security_descriptor import SMB2CreateSDBuffer
+    from smbprotocol.file_info import FileInformationClass, InfoType
+    from smbprotocol.open import SMB2QueryInfoRequest, SMB2QueryInfoResponse
 except ImportError as e:
     raise ImportError(
         "SMB datasource requires smbprotocol: pip install smbprotocol"
@@ -209,7 +212,7 @@ class SMBConnector(IFileDataSourceConnector):
         #    This allows each data source to have unique extraction settings.
         extraction_dict = smb_config.get('content_extraction', {})
         self.extraction_config = ContentExtractionConfig.from_dict(extraction_dict)
-        
+        self.server_tz = ZoneInfo(self.smb_config.get('connection', {}).get('server_timezone', 'UTC'))
         # 2. For an SMB connector, we know it downloads temporary files
         #    that must be cleaned up, so we enforce it here.
         self.extraction_config.features.cleanup_temp_files = True
@@ -235,50 +238,139 @@ class SMBConnector(IFileDataSourceConnector):
         # Temp file management
         self.temp_files_created = []
         self.temp_dir = tempfile.gettempdir()
+        self._is_connected = False
+        self.db_interface = db_interface
 
     # =============================================================================
     # Async IFileDataSourceConnector Interface Implementation
     # =============================================================================
 
-    async def enumerate_objects(self, work_packet: WorkPacket) -> AsyncIterator[List[DiscoveredObject]]:
-        """Enumerate objects for discovery tasks - async interface method"""
+    def get_boundary_type(self) -> BoundaryType:
+        """
+        For file systems like SMB, the fundamental unit of enumeration (the boundary)
+        is always a directory.
+        """
+        return BoundaryType.DIRECTORY
+
+
+
+    async def enumerate_objects(self, work_packet: Any) -> AsyncIterator[DiscoveryBatch]:
+        """
+        Performs a single-level enumeration for each directory specified in the
+        work packet's payload. It streams results back in the DiscoveryBatch format,
+        signaling the completion of each directory.
+        """
+        paths_to_scan = work_packet.payload.paths or [self.root_path]
         
-        # Extract filters from work packet
-        filters = work_packet.payload.filters if hasattr(work_packet.payload, 'filters') else None
-        
-        self.logger.info("Starting SMB object enumeration",
-                        task_id=work_packet.header.task_id,
-                        datasource_id=self.datasource_id)
-        
-        try:
-            # Ensure connection is established
-            if not self.smb_connection or not self.smb_connection.is_connected():
-                await self._ensure_connection_async()
-            
-            # Process discovery asynchronously
-            batch = []
-            batch_size = 100  # Process in batches for memory efficiency
-            
-            async for obj in self._enumerate_files_async(self.root_path, filters):
-                batch.append(obj)
-                
-                # Yield batch when full
-                if len(batch) >= batch_size:
-                    yield batch
-                    batch = []
-            
-            # Yield final batch if not empty
-            if batch:
-                yield batch
-                
-        except Exception as e:
-            error = self.error_handler.handle_error(
-                e, f"smb_enumerate_objects_{work_packet.header.task_id}",
-                operation="enumerate_objects",
-                task_id=work_packet.header.task_id
+        await self._ensure_connection_async(work_packet.header.trace_id, work_packet.header.task_id)
+
+        for directory_path in paths_to_scan:
+            boundary_id = generate_object_key_hash(
+                self.datasource_id, 
+                directory_path, 
+                self.get_boundary_type().value
             )
-            self.logger.error("SMB enumeration failed", error_id=error.error_id)
-            raise
+            batch = []
+            batch_size = 100
+            last_yield_time = time.time()
+            timeout_seconds = 5
+
+            try:
+                async for discovered_obj in self._enumerate_single_directory_async(directory_path, work_packet):
+                    # Check timeout before processing to avoid hangs
+                    current_time = time.time()
+                    if batch and (current_time - last_yield_time) > timeout_seconds:
+                        yield DiscoveryBatch(
+                            boundary_id=boundary_id, 
+                            is_final_batch=False, 
+                            discovered_objects=batch
+                        )
+                        batch = []
+                        last_yield_time = current_time
+                    
+                    batch.append(discovered_obj)
+                    
+                    # Yield when batch is full
+                    if len(batch) >= batch_size:
+                        yield DiscoveryBatch(
+                            boundary_id=boundary_id, 
+                            is_final_batch=False, 
+                            discovered_objects=batch
+                        )
+                        batch = []
+                        last_yield_time = time.time()
+
+            except Exception as e:
+                self.logger.error(
+                    f"Failed to enumerate directory {directory_path}", 
+                    error=str(e), 
+                    directory_path=directory_path
+                )
+            
+            # Always yield final batch for this directory
+            yield DiscoveryBatch(
+                boundary_id=boundary_id, 
+                is_final_batch=True, 
+                discovered_objects=batch
+            )
+
+    async def _enumerate_single_directory_async(self, directory_path: str, work_packet: Any) -> AsyncIterator[DiscoveredObject]:
+        """
+        Performs a non-recursive, single-level listing of the specified directory
+        and yields DiscoveredObject instances for each file and subdirectory found.
+        """
+        if not self.smb_connection or not self.smb_connection.is_connected():
+            raise ProcessingError(
+                "SMB connection not established", 
+                ErrorType.PROCESSING_LOGIC_ERROR,
+                operation="enumerate_single_directory"
+            )
+
+        normalized_path = self._normalize_smb_path(directory_path)
+        loop = asyncio.get_event_loop()
+
+        def _list_directory_sync():
+            try:
+                dir_handle = Open(self.smb_connection.tree, normalized_path)
+                dir_handle.create(
+                    ImpersonationLevel.Impersonation,
+                    FilePipePrinterAccessMask.GENERIC_READ,
+                    FileAttributes.FILE_ATTRIBUTE_DIRECTORY,
+                    ShareAccess.FILE_SHARE_READ,
+                    CreateDisposition.FILE_OPEN,
+                    CreateOptions.FILE_DIRECTORY_FILE
+                )
+                entries = dir_handle.query_directory(
+                    "*", 
+                    FileInformationClass.FILE_ID_FULL_DIRECTORY_INFORMATION
+                )
+                dir_handle.close()
+                return entries
+                
+            except SMBException as e:
+                if "STATUS_OBJECT_NAME_NOT_FOUND" in str(e):
+                    return []
+                raise NetworkError(
+                    f"SMB directory enumeration failed: {str(e)}",
+                    ErrorType.NETWORK_SMB_ERROR,
+                    path=directory_path
+                )
+
+        entries = await loop.run_in_executor(None, _list_directory_sync)
+
+        for entry in entries:
+            file_name_bytes = entry['file_name'].get_value()
+            file_name = file_name_bytes.decode('utf-16-le').rstrip('\x00')
+            if file_name in ['.', '..']:
+                continue
+
+            full_path = self._join_smb_path(normalized_path, file_name)
+            
+            # Use the existing _create_discovered_object_async which handles object_type internally
+            discovered_obj = await self._create_discovered_object_async(entry, full_path)
+            if discovered_obj:
+                yield discovered_obj
+
 
     async def _enumerate_files_async(self, directory_path: str, 
                                    filters: Optional[Dict[str, Any]] = None) -> AsyncIterator[DiscoveredObject]:
@@ -457,39 +549,7 @@ class SMBConnector(IFileDataSourceConnector):
                 # Yield error component
                 yield self._create_extraction_error_component(object_id, str(e))
 
-    def get_object_details(self, work_packet: WorkPacket) -> Dict[str, Any]:
-        """Get detailed metadata for objects - interface method (sync for compatibility)"""
-        
-        object_ids = work_packet.payload.object_ids
-        results = []
-        
-        for object_id in object_ids:
-            try:
-                file_path = self._extract_path_from_object_id(object_id)
-                if not file_path:
-                    continue
-                
-                # Get detailed metadata including security info
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # If called from async context, create task
-                    metadata = asyncio.create_task(self._get_detailed_file_metadata_async(file_path))
-                else:
-                    metadata = loop.run_until_complete(
-                        self._get_detailed_file_metadata_async(file_path)
-                    )
-                
-                results.append({
-                    "object_id": object_id,
-                    "metadata": metadata
-                })
-                
-            except Exception as e:
-                self.logger.warning("Failed to get object details",
-                                   object_id=object_id, error=str(e))
-                continue
-        
-        return results
+
 
 
     # =============================================================================
@@ -922,123 +982,400 @@ class SMBConnector(IFileDataSourceConnector):
     # =============================================================================
 
     async def _create_discovered_object_async(self, entry: Dict[str, Any], full_path: str) -> Optional[DiscoveredObject]:
-        """Create DiscoveredObject from SMB directory entry with a correct hash key."""
+        """
+        Create DiscoveredObject from SMB directory entry using correct smbprotocol field access pattern.
+        All timestamps are converted to UTC.
+        
+        Args:
+            entry: Raw SMB directory entry object from query_directory()
+            full_path: Normalized SMB path for this object
+            
+        Returns:
+            DiscoveredObject instance or None if creation fails
+        """
         try:
-            object_type_str = "FILE"
-            obj_key_hash = generate_object_key_hash(
+            # Extract file attributes to determine if directory or file
+            file_attributes = entry['file_attributes'].get_value()
+            is_directory = bool(file_attributes & FileAttributes.FILE_ATTRIBUTE_DIRECTORY)
+            
+            # Set object type based on file attributes
+            if is_directory:
+                object_type_str = "DIRECTORY"
+                object_type_enum = ObjectType.DIRECTORY
+            else:
+                object_type_str = "FILE"
+                object_type_enum = ObjectType.FILE
+            
+            # Extract file size (directories have 0 size)
+            size_bytes = entry['end_of_file'].get_value() if not is_directory else 0
+            
+            # Extract timestamps - they are naive datetimes in server's local timezone
+            # Convert to UTC using configured server timezone
+            creation_time_naive = entry['creation_time'].get_value()
+            last_write_time_naive = entry['last_write_time'].get_value()
+            last_access_time_naive = entry['last_access_time'].get_value()
+            
+            # Convert from server timezone to UTC
+            creation_time = creation_time_naive.replace(tzinfo=self.server_tz).astimezone(timezone.utc)
+            last_write_time = last_write_time_naive.replace(tzinfo=self.server_tz).astimezone(timezone.utc)
+            last_access_time = last_access_time_naive.replace(tzinfo=self.server_tz).astimezone(timezone.utc)
+            
+            # Generate consistent object key hash
+            object_key_hash = generate_object_key_hash(
                 datasource_id=self.datasource_id,
                 object_path=full_path,
                 object_type=object_type_str
             )
-            return DiscoveredObject(
-                object_key_hash=obj_key_hash,
+            
+            # Create DiscoveredObject with all required fields
+            discovered_obj = DiscoveredObject(
+                object_key_hash=object_key_hash,
                 datasource_id=self.datasource_id,
-                object_type=ObjectType.FILE,
+                object_type=object_type_enum,
                 object_path=full_path,
-                size_bytes=entry['end_of_file'],
-                last_modified=self._filetime_to_datetime(entry.get('last_write_time', 0)),
-                created_date=self._filetime_to_datetime(entry.get('creation_time', 0)),
-                last_accessed=self._filetime_to_datetime(entry.get('last_access_time', 0)),
+                size_bytes=size_bytes,
+                created_date=creation_time,
+                last_modified=last_write_time,
+                last_accessed=last_access_time,
                 discovery_timestamp=datetime.now(timezone.utc)
             )
-        except Exception as e:
-            self.logger.warning("Failed to create discovered object", file_path=full_path, error=str(e))
+            
+            return discovered_obj
+            
+        except KeyError as e:
+            self.logger.warning(
+                f"Missing expected field in SMB entry: {e}",
+                file_path=full_path
+            )
             return None
-
+        except Exception as e:
+            self.logger.warning(
+                f"Failed to create discovered object: {str(e)}",
+                file_path=full_path,
+                error=str(e)
+            )
+            return None
 
     # =============================================================================
     # Async Detailed Metadata Collection
     # =============================================================================
 
-    async def _get_detailed_file_metadata_async(self, file_path: str) -> Dict[str, Any]:
-        """Get comprehensive file metadata including security information (async)"""
+    def get_object_details(self, work_packet: WorkPacket) -> List[Dict[str, Any]]:
+        """
+        Get detailed metadata for objects including security information.
+        Returns list of dicts compatible with ObjectMetadata model structure.
         
+        This is a sync wrapper that handles the async operation properly.
+        """
+        discovered_objects = work_packet.payload.discovered_objects
+        results = []
+        
+        # Run async operation in event loop
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If called from async context, create task
+            future = asyncio.ensure_future(self._get_details_batch_async(discovered_objects))
+            # This will block until complete - not ideal but maintains sync interface
+            results = loop.run_until_complete(future)
+        else:
+            results = loop.run_until_complete(self._get_details_batch_async(discovered_objects))
+        
+        return results
+
+
+    async def _get_details_batch_async(self, discovered_objects: List[DiscoveredObject]) -> List[Dict[str, Any]]:
+        """Process batch of objects for detailed metadata collection."""
+        results = []
+        
+        for obj in discovered_objects:
+            try:
+                # Get detailed metadata
+                detailed_metadata = await self._get_detailed_file_metadata_async(
+                    obj.object_path,
+                    obj.object_type
+                )
+                
+                # Construct result in ObjectMetadata-compatible format
+                result = {
+                    "base_object": obj.dict(),
+                    "detailed_metadata": detailed_metadata,
+                    "metadata_fetch_timestamp": datetime.now(timezone.utc).isoformat()
+                }
+                results.append(result)
+                
+            except Exception as e:
+                self.logger.warning(
+                    "Failed to get object details",
+                    object_path=obj.object_path,
+                    error=str(e)
+                )
+                # Add minimal result with error info
+                results.append({
+                    "base_object": obj.dict(),
+                    "detailed_metadata": {
+                        "object_path": obj.object_path,
+                        "metadata_collection_failed": True,
+                        "error": str(e)
+                    },
+                    "metadata_fetch_timestamp": datetime.now(timezone.utc).isoformat()
+                })
+        
+        return results
+
+
+    async def _get_detailed_file_metadata_async(self, object_path: str, object_type: ObjectType) -> Dict[str, Any]:
+        """
+        Get comprehensive security metadata for an object using SMB2 security queries.
+        Uses the proven pattern from smbtest.py.
+        
+        Args:
+            object_path: Full SMB path to the object
+            object_type: ObjectType enum (FILE or DIRECTORY)
+            
+        Returns:
+            Dictionary with security metadata matching smbtest.py output format
+        """
         try:
-            normalized_path = self._normalize_smb_path(file_path)
+            normalized_path = self._normalize_smb_path(object_path)
+            is_directory = (object_type == ObjectType.DIRECTORY)
             
             loop = asyncio.get_event_loop()
             
-            def _get_file_info():
-                """Get file information synchronously (in thread pool)"""
+            def _get_security_info():
+                """Synchronous security query executed in thread pool."""
                 try:
-                    # Open file to get detailed info
-                    file_handle = Open(self.smb_connection.tree, normalized_path)
-                    file_handle.create(
-                        ImpersonationLevel.Impersonation,
-                        FilePipePrinterAccessMask.GENERIC_READ | FilePipePrinterAccessMask.READ_CONTROL,
-                        FileAttributes.FILE_ATTRIBUTE_NORMAL,
-                        ShareAccess.FILE_SHARE_READ,
-                        CreateDisposition.FILE_OPEN,
-                        CreateOptions.FILE_NON_DIRECTORY_FILE
-                    )
+                    # Open the object with appropriate flags
+                    handle = Open(self.smb_connection.tree, normalized_path)
                     
-                    # Get basic file information
-                    basic_info = file_handle.query_info(
-                        FileInformationClass.FILE_BASIC_INFORMATION
-                    )
+                    # Try different access levels for security queries
+                    access_attempts = [
+                        (FilePipePrinterAccessMask.GENERIC_READ | FilePipePrinterAccessMask.READ_CONTROL, "GENERIC_READ + READ_CONTROL"),
+                        (FilePipePrinterAccessMask.READ_CONTROL, "READ_CONTROL only"),
+                        (FilePipePrinterAccessMask.GENERIC_READ, "GENERIC_READ only")
+                    ]
                     
-                    # Get security information
-                    security_metadata = {}
-                    try:
-                        security_info = file_handle.query_info(
-                            FileInformationClass.FILE_SECURITY_INFORMATION
-                        )
-                        
-                        if security_info:
-                            # Parse security descriptor
-                            sd_buffer = SMB2CreateSDBuffer()
-                            sd_buffer.unpack(security_info)
-                            
-                            security_metadata = {
-                                "owner_sid": str(sd_buffer.get_owner()) if hasattr(sd_buffer, 'get_owner') else None,
-                                "group_sid": str(sd_buffer.get_group()) if hasattr(sd_buffer, 'get_group') else None,
-                                "dacl_entries": self._parse_dacl_entries(sd_buffer.get_dacl()) if hasattr(sd_buffer, 'get_dacl') else [],
-                                "sacl_entries": self._parse_sacl_entries(sd_buffer.get_sacl()) if hasattr(sd_buffer, 'get_sacl') else [],
-                                "security_descriptor_collected": True
-                            }
+                    access_granted = False
+                    access_used = None
                     
-                    except Exception as security_error:
-                        security_metadata = {
-                            "security_collection_failed": True,
-                            "security_error": str(security_error)
+                    for access_mask, access_description in access_attempts:
+                        try:
+                            if is_directory:
+                                handle.create(
+                                    ImpersonationLevel.Impersonation,
+                                    access_mask,
+                                    FileAttributes.FILE_ATTRIBUTE_DIRECTORY,
+                                    ShareAccess.FILE_SHARE_READ,
+                                    CreateDisposition.FILE_OPEN,
+                                    CreateOptions.FILE_DIRECTORY_FILE
+                                )
+                            else:
+                                handle.create(
+                                    ImpersonationLevel.Impersonation,
+                                    access_mask,
+                                    FileAttributes.FILE_ATTRIBUTE_NORMAL,
+                                    ShareAccess.FILE_SHARE_READ,
+                                    CreateDisposition.FILE_OPEN,
+                                    CreateOptions.FILE_NON_DIRECTORY_FILE
+                                )
+                            access_granted = True
+                            access_used = access_description
+                            break
+                        except Exception:
+                            try:
+                                handle.close()
+                            except:
+                                pass
+                            handle = Open(self.smb_connection.tree, normalized_path)
+                    
+                    if not access_granted:
+                        return {
+                            "object_path": object_path,
+                            "object_type": "directory" if is_directory else "file",
+                            "security_query_failed": True,
+                            "error": "All access attempts failed",
+                            "collection_timestamp": datetime.now(timezone.utc).isoformat()
                         }
                     
-                    file_handle.close()
+                    # Set security flags based on object type
+                    # Files: Owner + Group only (0x3)
+                    # Directories: Owner + Group + DACL (0x7)
+                    security_flags = 0x00000007 if is_directory else 0x00000003
                     
-                    # Combine metadata
+                    # Build SMB2 security query request
+                    query_req = SMB2QueryInfoRequest()
+                    query_req['info_type'] = InfoType.SMB2_0_INFO_SECURITY
+                    query_req['output_buffer_length'] = 65535
+                    query_req['additional_information'] = security_flags
+                    query_req['file_id'] = handle.file_id
+                    
+                    # Send query and receive response
+                    req = handle.connection.send(
+                        query_req,
+                        sid=handle.tree_connect.session.session_id,
+                        tid=handle.tree_connect.tree_connect_id
+                    )
+                    resp = handle.connection.receive(req)
+                    
+                    # Unpack response
+                    query_resp = SMB2QueryInfoResponse()
+                    query_resp.unpack(resp['data'].get_value())
+                    
+                    # Parse security descriptor
+                    security_descriptor = SMB2CreateSDBuffer()
+                    security_descriptor.unpack(query_resp['buffer'].get_value())
+                    
+                    # Build metadata result
                     metadata = {
-                        "file_path": file_path,
-                        "smb_server": self.smb_config.get('host'),
-                        "smb_share": self.smb_config.get('share_name'),
-                        "smb_version": self._get_smb_version(),
-                        "basic_info": basic_info,
-                        **security_metadata
+                        "object_path": object_path,
+                        "object_type": "directory" if is_directory else "file",
+                        "security_query_type": "full_acls_enhanced" if is_directory else "basic_owner_group",
+                        "security_flags_requested": hex(security_flags),
+                        "access_method_used": access_used,
+                        "collection_timestamp": datetime.now(timezone.utc).isoformat()
                     }
                     
+                    # Extract Owner SID
+                    try:
+                        owner = security_descriptor.get_owner()
+                        metadata["owner_sid"] = str(owner) if owner else None
+                    except Exception as e:
+                        metadata["owner_extraction_error"] = str(e)
+                    
+                    # Extract Group SID
+                    try:
+                        group = security_descriptor.get_group()
+                        metadata["group_sid"] = str(group) if group else None
+                    except Exception as e:
+                        metadata["group_extraction_error"] = str(e)
+                    
+                    # Extract DACL for directories only
+                    if is_directory:
+                        try:
+                            dacl = security_descriptor.get_dacl()
+                            if dacl and hasattr(dacl, 'fields') and dacl.fields and 'aces' in dacl.fields:
+                                aces_list = dacl.fields['aces'].get_value()
+                                ace_count = dacl.fields['ace_count'].get_value()
+                                
+                                dacl_info = {
+                                    "dacl_present": True,
+                                    "ace_count": ace_count,
+                                    "acl_revision": dacl.fields['acl_revision'].get_value(),
+                                    "acl_size": dacl.fields['acl_size'].get_value(),
+                                    "aces": []
+                                }
+                                
+                                # Extract each ACE
+                                for i, ace in enumerate(aces_list):
+                                    ace_info = self._extract_ace_info(ace, i)
+                                    dacl_info["aces"].append(ace_info)
+                                
+                                metadata["dacl_info"] = dacl_info
+                            else:
+                                metadata["dacl_info"] = {"dacl_present": False}
+                        except Exception as e:
+                            metadata["dacl_extraction_error"] = str(e)
+                    
+                    handle.close()
                     return metadata
                     
                 except SMBException as e:
                     if "STATUS_ACCESS_DENIED" in str(e):
                         return {
-                            "file_path": file_path,
-                            "access_denied": True,
-                            "error": str(e)
+                            "object_path": object_path,
+                            "object_type": "directory" if is_directory else "file",
+                            "security_query_failed": True,
+                            "error": "Access denied",
+                            "collection_timestamp": datetime.now(timezone.utc).isoformat()
                         }
                     else:
                         raise
             
-            # Get file info asynchronously
-            return await loop.run_in_executor(None, _get_file_info)
+            # Execute security query asynchronously
+            return await loop.run_in_executor(None, _get_security_info)
             
         except Exception as e:
-            self.logger.warning("Failed to get detailed metadata",
-                               file_path=file_path, error=str(e))
             return {
-                "file_path": file_path,
+                "object_path": object_path,
+                "object_type": "directory" if object_type == ObjectType.DIRECTORY else "file",
                 "metadata_collection_failed": True,
-                "error": str(e)
+                "error": str(e),
+                "collection_timestamp": datetime.now(timezone.utc).isoformat()
             }
 
+
+    def _extract_ace_info(self, ace, index: int) -> Dict[str, Any]:
+        """
+        Extract detailed information from an ACE.
+        This helper already exists in the connector from smbtest.py pattern.
+        """
+        ace_info = {
+            "ace_index": index,
+            "ace_type": str(type(ace)),
+            "ace_class_name": ace.__class__.__name__
+        }
+        
+        try:
+            # Extract ACE type
+            if hasattr(ace, 'fields') and 'ace_type' in ace.fields:
+                ace_type_value = ace.fields['ace_type'].get_value()
+                ace_info["ace_type_value"] = ace_type_value
+                
+                ace_type_map = {
+                    0: "ACCESS_ALLOWED_ACE_TYPE",
+                    1: "ACCESS_DENIED_ACE_TYPE",
+                    2: "SYSTEM_AUDIT_ACE_TYPE"
+                }
+                ace_info["ace_type_name"] = ace_type_map.get(ace_type_value, f"UNKNOWN_TYPE_{ace_type_value}")
+            
+            # Extract ACE flags
+            if hasattr(ace, 'fields') and 'ace_flags' in ace.fields:
+                ace_flags_value = ace.fields['ace_flags'].get_value()
+                ace_info["ace_flags"] = ace_flags_value
+                ace_info["ace_flags_decoded"] = self._decode_ace_flags(ace_flags_value)
+            
+            # Extract access mask
+            access_mask = None
+            if hasattr(ace, 'fields') and 'mask' in ace.fields:
+                access_mask = ace.fields['mask'].get_value()
+            elif hasattr(ace, 'fields') and 'access_mask' in ace.fields:
+                access_mask = ace.fields['access_mask'].get_value()
+            
+            if access_mask is not None:
+                ace_info["access_mask"] = access_mask
+                ace_info["access_mask_hex"] = hex(access_mask)
+                ace_info["permissions"] = self._decode_access_mask(access_mask)
+            
+            # Extract SID
+            if hasattr(ace, 'fields') and 'sid' in ace.fields:
+                sid_obj = ace.fields['sid'].get_value()
+                ace_info["sid"] = str(sid_obj)
+            
+            # Extract ACE size
+            if hasattr(ace, 'fields') and 'ace_size' in ace.fields:
+                ace_info["ace_size"] = ace.fields['ace_size'].get_value()
+            
+        except Exception as e:
+            ace_info["extraction_error"] = str(e)
+        
+        return ace_info
+
+
+    def _decode_ace_flags(self, flags: int) -> List[str]:
+        """Decode ACE flags to human-readable descriptions."""
+        flag_descriptions = []
+        
+        if flags & 0x01:
+            flag_descriptions.append("OBJECT_INHERIT")
+        if flags & 0x02:
+            flag_descriptions.append("CONTAINER_INHERIT")
+        if flags & 0x04:
+            flag_descriptions.append("NO_PROPAGATE_INHERIT")
+        if flags & 0x08:
+            flag_descriptions.append("INHERIT_ONLY")
+        if flags & 0x10:
+            flag_descriptions.append("INHERITED")
+        
+        return flag_descriptions if flag_descriptions else ["NONE"]
     # =============================================================================
     # Helper Methods (unchanged from original)
     # =============================================================================

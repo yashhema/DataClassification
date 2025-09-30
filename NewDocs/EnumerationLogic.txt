@@ -1,0 +1,117 @@
+Of course. Based on our discussion, we have finalized a robust, transactional, and recoverable logic for the enumeration process. This model prioritizes data integrity and system resilience, which are the most important factors for a distributed system.
+For directory enumeration : Unstructured datasources
+Here is the detailed, step-by-step logic for the finalized design.
+
+### **Guiding Principle: The Database is the Single Source of Truth**
+
+The state of the enumeration process is not stored in a worker's memory; it is managed through database transactions. A piece of work (like processing a directory) is only considered "done" once its results are atomically committed to the main `task_output_records` table. This makes the entire process fault-tolerant and auditable.
+
+---
+### **1. The Unit of Work: A Batch of Directories**
+
+-   An enumeration task (`DISCOVERY_ENUMERATE`) no longer represents a full recursive scan. Instead, its payload contains a **list of specific directory paths** that a single worker is responsible for processing.
+-   **Example**: The first task for a job might be `paths_to_scan: ["/finance"]`. The Pipeliner might later create a subsequent task like `paths_to_scan: ["/finance/2022", "/finance/2023", "/finance/2024"]`.
+
+---
+### **2. The Worker's Responsibility: The Transactional Loop**
+
+The Worker is the driver of the process. It processes its assigned batch of directories **one by one, in a predictable, sorted order**. The completion of each directory is treated as a self-contained transaction.
+
+Here is the logic for a Worker assigned a task with a list of directories:
+
+1.  **Task Startup & Recovery Check**:
+    * The Worker receives the task. It immediately creates a **temporary table** in the database that is unique to this specific `task_id` (e.g., `temp_outputs_{task_id}`). This table has the same schema as the main `task_output_records` table.
+    * **Recovery Check**: The Worker queries the database to see which directories from its list have *already* been fully processed for this `task_id`. (This is explained in the recovery section below). It removes these completed directories from its in-memory work list.
+
+2.  **Process a Single Directory**:
+    * The Worker takes the next directory from its sorted work list (e.g., `/finance/reports`).
+    * It instructs the connector to perform a **single-level, non-recursive listing** of that directory's contents.
+    * The connector streams back its findings in small, memory-safe batches (e.g., 100 objects at a time).
+    * For each batch, the Worker separates the files and subdirectories and creates the corresponding `TaskOutputRecord`s.
+    * Crucially, it **bulk-inserts these new records into the temporary table** (`temp_outputs_{task_id}`).
+
+3.  **Commit a Directory as a Single Transaction**:
+    * Once the connector has finished streaming all contents of `/finance/reports`, the `temp_outputs_{task_id}` table contains all the output records for that directory.
+    * The Worker then executes a **single, atomic database transaction** (e.g., via a stored procedure or a `MERGE` statement) that does two things:
+        * **A.** Moves all records from `temp_outputs_{task_id}` into the main, permanent `task_output_records` table.
+        * **B.** Deletes all records from `temp_outputs_{task_id}`.
+    * **This is the critical checkpoint.** The directory `/finance/reports` is now officially considered "done." The Pipeliner can now safely see these new records and begin creating the next stage of work (classification tasks for the files and new enumeration tasks for the subdirectories).
+
+4.  **Loop or Complete**:
+    * The Worker continues this loop until it has processed all directories in its list.
+    * Once the entire list is processed, the Worker's final action is to **drop the temporary table** and mark its `DISCOVERY_ENUMERATE` task as `COMPLETED`.
+
+---
+### **3. The Failure and Resumption Scenario**
+
+This model provides clear, unambiguous recovery.
+
+1.  **Failure**: A Worker is processing a task for 50 directories. It fully completes directories #1-10. It is halfway through processing directory #11 when it crashes.
+    * **State**: The main `task_output_records` table contains all the records for directories #1-10. The `temp_outputs_{task_id}` table contains the partial records for directory #11.
+2.  **Recovery**: The `Reaper` re-queues the task.
+3.  **Resumption**: A new Worker picks up the task.
+    * It performs the **Recovery Check** (Step 1.B). It queries the main `task_output_records` table and finds that directories #1-10 are already done for this `task_id`, so it removes them from its work list.
+    * Its work list now begins with directory #11.
+    * It sees that the `temp_outputs_{task_id}` table still exists and contains records. This tells the Worker that directory #11 was only partially processed.
+    * **Intra-Directory Resumption**: The Worker loads the `object_key_hash`es from the `temp_outputs_{task_id}` table into an in-memory `set`. It passes this set to the connector as an **exclusion list**.
+    * The connector begins enumerating directory #11, but it filters out any object whose hash is in the exclusion set, seamlessly resuming the stream from the exact point of failure.
+
+This logic ensures that your enumeration process is resilient, auditable, and can scale to handle any number of files and directories without risk of data loss or duplication.
+
+For structured Database
+Of course. Let's outline the complete, finalized enumeration logic for structured databases.
+
+This model combines the architectural principles we've discussed: it is connector-driven, fault-tolerant, and uses a common, transactional process for checkpointing to ensure data integrity and recoverability.
+
+---
+### **The Logic: Multi-Level, Recoverable Enumeration for Databases**
+
+The guiding principle remains the same: **the database is the single source of truth**. A unit of work is only considered complete once its results are atomically committed, creating a permanent and auditable checkpoint.
+
+### **Phase 1: The Initial Task**
+
+1.  **Orchestrator Kick-off**: The system starts with a single `DISCOVERY_ENUMERATE` task for the database data source. The payload for this task simply contains the `datasource_id`.
+2.  **Connector's First Action**: The Worker receives this task and instructs the appropriate connector (e.g., `SQLServerConnector`) to begin enumeration. The connector's first job is to determine its starting point. Based on the data source's configuration, it will either:
+    * **Targeted Scan**: Connect directly to a specific, pre-configured database (like for MySQL or a single-database application).
+    * **Discovery Scan**: Connect to the server's default database (e.g., `master` in SQL Server) to get a list of all databases on the instance.
+
+---
+### **Phase 2: The Worker's Transactional Loop**
+
+The Worker drives the process. It treats the full processing of each logical level (database, schema) as a self-contained transaction.
+
+1.  **Create Temporary Checkpoint Table**: When the `DISCOVERY_ENUMERATE` task starts, the Worker creates a unique temporary table in the database (e.g., `temp_outputs_{task_id}`). This table will hold the `TaskOutputRecord`s for the current stage of work before they are committed to the main table.
+
+2.  **Process the Current Level**:
+    * The Worker instructs the connector to perform a **single-level listing**. For example, it asks for the list of all schemas within a specific database.
+    * The connector streams back the results (e.g., a list of schema names) in small, memory-safe batches.
+    * For each batch of results, the Worker creates the appropriate `TaskOutputRecord` (e.g., one of type `SCHEMAS_FOUND`) and **bulk-inserts these records into the temporary table**.
+
+3.  **Commit as a Single Transaction**:
+    * Once the connector has finished processing the current level (e.g., it has found all schemas in the database), the Worker executes a single, atomic database transaction.
+    * This transaction **moves all the records** from `temp_outputs_{task_id}` into the main `task_output_records` table.
+    * **This is the critical checkpoint.** The `Pipeliner` can now safely see these new, fully-vetted records and create the next stage of work.
+
+---
+### **Phase 3: The Pipeliner's Fan-Out**
+
+The `Pipeliner` is the engine that drives the multi-level discovery.
+
+1.  **React to Output**: The `Pipeliner` periodically scans the `task_output_records` table.
+2.  **Create Next-Stage Tasks**: Based on the record type, it creates new tasks:
+    * If it sees a `DATABASES_FOUND` record, it creates a new `DISCOVERY_ENUMERATE` task whose payload is the list of database names to scan for schemas.
+    * If it sees a `SCHEMAS_FOUND` record, it creates a new `DISCOVERY_ENUMERATE` task whose payload is the list of schema names to scan for tables.
+    * If it sees a `TABLES_FOUND` record (which are `DiscoveredObject`s), it creates the final `CLASSIFICATION` task.
+
+---
+### **Failure and Recovery**
+
+This model provides robust, multi-level recovery.
+
+* **Scenario**: A Worker is tasked with enumerating 10 schemas. It successfully processes 5, and the corresponding `TaskOutputRecord`s are moved to the main table. It then crashes while processing the 6th schema.
+* **State on Failure**: The main `task_output_records` table contains the results for the first 5 schemas. The `temp_outputs_{task_id}` table contains the partial results for the 6th schema.
+* **Recovery**: The `Reaper` re-queues the task.
+* **Resumption**: A new Worker picks up the task.
+    1.  It queries the main `task_output_records` table to see which schemas for this `task_id` are already complete. It finds the first 5 and removes them from its work list.
+    2.  It sees that the `temp_outputs_{task_id}` table still exists. It **clears this temporary table**, discarding the partial results from the failed 6th schema.
+    3.  It then begins its work loop, starting fresh on schema #6, ensuring there is no data duplication or partial processing.
