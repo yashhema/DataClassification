@@ -364,25 +364,28 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             else:
                 self.logger.info(f"Fan-out: Found 1 database and {len(schemas)} schemas.", **self.job_context(work_packet))
                 boundary_id = generate_object_key_hash(self.datasource_id, single_db_name, "DATABASE")
+                boundary_path = f"{self.datasource_id}:{single_db_name}:DATABASE"
                 discovered_objects = [self._create_schema_discovered_object(single_db_name, s['schema_name']) for s in schemas]
-                yield DiscoveryBatch(boundary_id=boundary_id, is_final_batch=True, discovered_objects=discovered_objects)
+                yield DiscoveryBatch(boundary_id=boundary_id,boundary_path=boundary_path, is_final_batch=True, discovered_objects=discovered_objects)
                 return
 
         # FAN-OUT: If multiple databases were found, yield them for the Pipeliner.
         else:
             self.logger.info(f"Fan-out: Found {len(databases)} databases.", **self.job_context(work_packet))
             boundary_id = generate_object_key_hash(self.datasource_id, "server_instance", "DATABASE_SERVER")
+            boundary_path = f"{self.datasource_id}:server_instance:DATABASE"
             discovered_objects = [self._create_database_discovered_object(db['database_name']) for db in databases]
-            yield DiscoveryBatch(boundary_id=boundary_id, is_final_batch=True, discovered_objects=discovered_objects)
+            yield DiscoveryBatch(boundary_id=boundary_id,boundary_path=boundary_path, is_final_batch=True, discovered_objects=discovered_objects)
 
     async def _discover_and_yield_schemas(self, db_name: str, work_packet: WorkPacket) -> AsyncIterator[DiscoveryBatch]:
         """Discovers all schemas in a database and yields them in a single final batch."""
         scan_config = self.datasource_config.configuration.get('scan_config', {})
         boundary_id = generate_object_key_hash(self.datasource_id, db_name, "DATABASE")
+        boundary_path = f"{self.datasource_id}:{db_name}:DATABASE"
         try:
             schemas = await self._discover_schemas(db_name, scan_config)
             discovered_objects = [self._create_schema_discovered_object(db_name, s['schema_name']) for s in schemas]
-            yield DiscoveryBatch(boundary_id=boundary_id, is_final_batch=True, discovered_objects=discovered_objects)
+            yield DiscoveryBatch(boundary_id=boundary_id,boundary_path=boundary_path, is_final_batch=True, discovered_objects=discovered_objects)
         except Exception as e:
             self.error_handler.handle_error(e, "discover_schemas", database=db_name, **self.job_context(work_packet))
             yield DiscoveryBatch(boundary_id=boundary_id, is_final_batch=True, discovered_objects=[])
@@ -391,14 +394,15 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
         """Discovers all tables in a schema and yields them in a final batch."""
         scan_config = self.datasource_config.configuration.get('scan_config', {})
         boundary_id = generate_object_key_hash(self.datasource_id, fq_schema_name, "SCHEMA")
+        boundary_path = f"{self.datasource_id}:{fq_schema_name}:DATABASE"
         try:
             db_name, schema_name = fq_schema_name.split('.', 1)
             tables = await self._discover_tables(db_name, schema_name, scan_config)
             discovered_objects = [self._create_table_discovered_object(db_name, schema_name, t['table_name'], t) for t in tables]
-            yield DiscoveryBatch(boundary_id=boundary_id, is_final_batch=True, discovered_objects=discovered_objects)
+            yield DiscoveryBatch(boundary_id=boundary_id,boundary_path=boundary_path, is_final_batch=True, discovered_objects=discovered_objects)
         except Exception as e:
             self.error_handler.handle_error(e, "discover_tables", schema=fq_schema_name, **self.job_context(work_packet))
-            yield DiscoveryBatch(boundary_id=boundary_id, is_final_batch=True, discovered_objects=[])
+            yield DiscoveryBatch(boundary_id=boundary_id,boundary_path=boundary_path, is_final_batch=True, discovered_objects=[])
 
     async def _get_discovery_query(self, query_name: str) -> str:
         """Safely gets a discovery query from the connector's configuration."""

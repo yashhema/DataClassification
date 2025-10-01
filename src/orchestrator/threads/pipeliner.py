@@ -2,7 +2,7 @@ import asyncio
 from math import ceil
 import base64
 import traceback
-from typing import List, Dict, Any
+from typing import List, Dict, Any,Optional
 import json
 
 # Core system and model imports
@@ -34,74 +34,15 @@ class Pipeliner:
         self.name = "PipelinerCoroutine"
 
 
+
+
     async def run_async(self):
             """The main async loop for the Pipeliner coroutine."""
             self.logger.log_component_lifecycle("Pipeliner", "STARTED")
             
             while not self.orchestrator._shutdown_event.is_set():
                 try:
-                    records = await self.db.get_pending_output_records(limit=100)
-                    if not records:
-                        await asyncio.sleep(self.interval)
-                        continue
-                    
-                    self.logger.info(f"Pipeliner found {len(records)} output records to process.", count=len(records))
-                    
-                    # Prepare lists to accumulate work for the batch transaction
-                    tasks_to_create: List[Dict[str, Any]] = []
-                    processed_records: List[TaskOutputRecord] = []
-                    failed_record_ids: List[int] = []
-
-                    for record in records:
-                        try:
-                            # This method now returns a list of dictionaries for new tasks
-                            task_params_list = await self._process_output_record(record)
-                            if task_params_list:
-                                tasks_to_create.extend(task_params_list)
-                            
-                            # If processing succeeds, add the record to be marked as "PROCESSED"
-                            processed_records.append(record)
-                        except Exception as e:
-                            # Isolate failure for a single record. Log it and add it to the failed list.
-                            full_traceback = traceback.format_exc()
-                            self.logger.error(
-                            f"Error processing output record {record.id}: {e}",
-                            record_id=record.id,
-                            error_message=str(e),
-                            traceback=full_traceback,
-                            exc_info=True  # This tells the logger to include exception info
-                            )
-                            failed_record_ids.append(record.id)
-                            continue
-                    
-                    # --- Transactional Batch Update ---
-                    if processed_records or failed_record_ids:
-                        self.logger.info(f"Preparing to commit batch transaction: {len(tasks_to_create)} new tasks, "
-                                       f"{len(processed_records)} records to process, {len(failed_record_ids)} to fail.")
-                        
-                        # Start a single session for all database operations in this batch
-                        async with self.db.get_async_session() as session:
-                            try:
-                                # 1. Create all new tasks in a single bulk operation
-                                if tasks_to_create:
-                                    await self.db.create_task_batch(tasks_to_create, session=session)
-
-                                # 2. Mark all successfully processed records as "PROCESSED"
-                                if processed_records:
-                                    processed_ids = [r.id for r in processed_records]
-                                    await self.db.update_output_record_status_batch(processed_ids, "PROCESSED", session=session)
-                                
-                                # 3. Mark all records that failed during processing as "FAILED"
-                                if failed_record_ids:
-                                    await self.db.update_output_record_status_batch(failed_record_ids, "FAILED", session=session)
-                                
-                                await session.commit()
-                                self.logger.info("Pipeliner batch transaction committed successfully.")
-                            except Exception as batch_error:
-                                await session.rollback()
-                                self.logger.error("Pipeliner batch transaction failed and was rolled back.", error=str(batch_error), exc_info=True)
-                                # Records that failed to commit will be retried on the next cycle
-
+                    await self.process_batch(limit=100)
                     self.orchestrator.update_thread_liveness("pipeliner")
                     await asyncio.sleep(self.interval)
                 
@@ -117,29 +58,87 @@ class Pipeliner:
 
             self.logger.log_component_lifecycle("Pipeliner", "STOPPED")
 
-    async def _process_output_record_not_to_use(self, record) -> List[Dict[str, Any]]:
-        """
-        Main dispatcher that routes records to a handler and returns the
-        list of new tasks to be created.
-        """
-        parent_task = await self.db.get_task_by_id(record.task_id)
-        
-        if not parent_task or parent_task.status != TaskStatus.COMPLETED:
-            self.logger.warning(f"Orphaning output record {record.id} from a non-completed or missing parent task.")
-            await self.db.update_output_record_status(record.id, "ORPHANED")
-            return []
 
-        output_type = record.output_type
-        if output_type == "SELECTION_PLAN_CREATED":
-            return await self._fan_out_selection_tasks(parent_task, record)
-        elif output_type == "ACTION_PLAN_CREATED":
-            return await self._fan_out_action_tasks(parent_task, record)
-        elif output_type == "METADATA_RECONCILE_UPDATES":
-            return await self._create_reconciliation_task(parent_task, record)
-        elif output_type in ["DISCOVERED_OBJECTS", "OBJECT_DETAILS_FETCHED"]:
-            return await self._create_next_stage_scan_task(parent_task, record)
+    async def process_batch(self, job_id_filter: Optional[int] = None, limit: int = 100) -> int:
+        """
+        Process one batch of pending output records and create follow-up tasks.
         
-        return []
+        Args:
+            job_id_filter: If provided, only process records for this job
+            limit: Maximum records to fetch
+        
+        Returns:
+            Number of tasks created
+        """
+        records = await self.db.get_pending_output_records(limit=limit)
+        
+        if job_id_filter:
+            records = [r for r in records if r.job_id == job_id_filter]
+        
+        if not records:
+            return 0
+        
+        tasks_to_create = []
+        processed_record_ids = []
+        failed_record_ids = []
+        
+        for record in records:
+            try:
+                task_params_list = await self._process_output_record(record)
+                if task_params_list:
+                    tasks_to_create.extend(task_params_list)
+                processed_record_ids.append(record.id)
+            except Exception as e:
+                full_traceback = traceback.format_exc()
+                self.logger.error(
+                    f"Error processing output record {record.id}: {e}",
+                    record_id=record.id,
+                    error_message=str(e),
+                    traceback=full_traceback,
+                    exc_info=True
+                )
+                failed_record_ids.append(record.id)
+        
+        if tasks_to_create or processed_record_ids or failed_record_ids:
+            async with self.db.get_async_session() as session:
+                try:
+                    if tasks_to_create:
+                        await self.db.create_task_batch(tasks_to_create, session=session)
+                    if processed_record_ids:
+                        await self.db.update_output_record_status_batch(processed_record_ids, "PROCESSED", session=session)
+                    if failed_record_ids:
+                        await self.db.update_output_record_status_batch(failed_record_ids, "FAILED", session=session)
+                    await session.commit()
+                except Exception as batch_error:
+                    await session.rollback()
+                    self.logger.error("Pipeliner batch transaction failed and was rolled back.", error=str(batch_error), exc_info=True)
+                    raise
+        
+        return len(tasks_to_create)
+
+        async def _process_output_record_not_to_use(self, record) -> List[Dict[str, Any]]:
+            """
+            Main dispatcher that routes records to a handler and returns the
+            list of new tasks to be created.
+            """
+            parent_task = await self.db.get_task_by_id(record.task_id)
+            
+            if not parent_task or parent_task.status != TaskStatus.COMPLETED:
+                self.logger.warning(f"Orphaning output record {record.id} from a non-completed or missing parent task.")
+                await self.db.update_output_record_status(record.id, "ORPHANED")
+                return []
+
+            output_type = record.output_type
+            if output_type == "SELECTION_PLAN_CREATED":
+                return await self._fan_out_selection_tasks(parent_task, record)
+            elif output_type == "ACTION_PLAN_CREATED":
+                return await self._fan_out_action_tasks(parent_task, record)
+            elif output_type == "METADATA_RECONCILE_UPDATES":
+                return await self._create_reconciliation_task(parent_task, record)
+            elif output_type in ["DISCOVERED_OBJECTS", "OBJECT_DETAILS_FETCHED"]:
+                return await self._create_next_stage_scan_task(parent_task, record)
+            
+            return []
 
 
     async def _process_output_record(self, record) -> List[Dict[str, Any]]:

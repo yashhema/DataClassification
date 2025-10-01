@@ -3035,6 +3035,46 @@ class DatabaseInterface:
         except Exception as e:
             self.error_handler.handle_error(e, context="get_ledger_bins_by_status", plan_id=plan_id, status=status.value, **context)
             raise
+
+    async def execute_raw_sql(self, sql: str, context: Optional[Dict[str, Any]] = None) -> Optional[List[Dict[str, Any]]]:
+            """
+            Executes a raw, non-parameterized SQL string against the database.
+
+            **WARNING**: This method is intended for administrative or testing scripts
+            and does not sanitize the input SQL string. Do NOT use this method with
+            user-provided input, as it is vulnerable to SQL injection.
+
+            Args:
+                sql: The raw SQL string to execute.
+                context: Optional dictionary for logging and trace propagation.
+
+            Returns:
+                A list of dictionaries for each row if the statement was a query (e.g., SELECT),
+                or None if it was a non-returning statement (e.g., DELETE, UPDATE).
+            """
+            context = context or {}
+            self.logger.log_database_operation("EXECUTE_RAW", "database", "STARTED", **context)
+            
+            try:
+                async with self.get_async_session() as session:
+                    result = await session.execute(text(sql))
+                    
+                    if result.returns_rows:
+                        # For SELECT statements, fetch all results
+                        rows = result.all()
+                        # Convert list of Row objects to a list of dictionaries
+                        data = [dict(row._mapping) for row in rows]
+                        self.logger.log_database_operation("EXECUTE_RAW", "database", "SUCCESS", returned_rows=len(data), **context)
+                        return data
+                    else:
+                        # For DELETE, UPDATE, INSERT, etc., commit the transaction
+                        await session.commit()
+                        self.logger.log_database_operation("EXECUTE_RAW", "database", "SUCCESS", rows_affected=result.rowcount, **context)
+                        return None
+            except Exception as e:
+                self.error_handler.handle_error(e, context="execute_raw_sql", sql_executed=sql, **context)
+                raise
+
             
     async def close_async(self):
         """

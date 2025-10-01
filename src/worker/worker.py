@@ -659,83 +659,80 @@ class Worker:
                     self.logger.info(f"Recovery: Skipped {original_count - len(paths_to_scan)} already completed boundaries.", **job_context)
 
             # --- 2. THE TRANSACTIONAL LOOP ---
-            total_boundaries = len(paths_to_scan)
+            final_payload = payload.model_copy(update={"paths": paths_to_scan})
+            final_work_packet = work_packet.model_copy(update={"payload": final_payload})
             boundaries_processed = 0
-            for boundary_path in sorted(paths_to_scan):
-                boundary_id = generate_object_key_hash(payload.datasource_id, boundary_path, boundary_type_for_next_stage.value)
-
+            total_boundaries = 1 if len(paths_to_scan) == 0 else len(paths_to_scan)      
                 # --- RE-ADD: Error handling for each individual boundary ---
+            async for batch in connector.enumerate_objects(final_work_packet):
                 try:
-                    # Create a new, single-boundary WorkPacket to pass to the connector
-                    single_boundary_payload = payload.copy(update={"paths": [boundary_path]})
-                    boundary_work_packet = work_packet.copy(update={"payload": single_boundary_payload})
 
-                    # --- 3. INNER STREAMING LOOP ---
-                    async for batch in connector.enumerate_objects(boundary_work_packet):
-                        files_for_classification = []
-                        sub_boundaries_for_enumeration = []
-                        batch_mappings = [] #this we need for db save
-                        # A. Separate objects based on their type
-                        for obj in batch.discovered_objects:
-                            if obj.object_type.value == boundary_type_for_next_stage.value:
-                                sub_boundaries_for_enumeration.append(obj.model_dump(mode='json'))
-                            else:
-                                files_for_classification.append(obj.model_dump(mode='json'))
+                    files_for_classification = []
+                    sub_boundaries_for_enumeration = []
+                    batch_mappings = [] #this we need for db save
+                    boundary_id=batch.boundary_id
+                    boundary_path=batch.boundary_path
+                    # A. Separate objects based on their type
+                    for obj in batch.discovered_objects:
+                        if obj.object_type.value == boundary_type_for_next_stage.value:
+                            sub_boundaries_for_enumeration.append(obj.model_dump(mode='json'))
+                        else:
+                            files_for_classification.append(obj.model_dump(mode='json'))
+                        
+                        # Calculate object key hash
+                        key_string = f"{obj.datasource_id}|{obj.object_path}|{obj.object_type}"
+                        object_key_hash = hashlib.sha256(key_string.encode()).digest()
+                        
+                        mapping = {
+                            'object_key_hash': object_key_hash,
+                            'data_source_id': obj.datasource_id,
+                            'object_type': obj.object_type,
+                            'object_path': obj.object_path,
+                            'size_bytes': obj.size_bytes,
+                            'created_date': obj.created_date,
+                            'last_modified': obj.last_modified,
                             
-                            # Calculate object key hash
-                            key_string = f"{obj.datasource_id}|{obj.object_path}|{obj.object_type}"
-                            object_key_hash = hashlib.sha256(key_string.encode()).digest()
-                            
-                            mapping = {
-                                'object_key_hash': object_key_hash,
-                                'data_source_id': obj.datasource_id,
-                                'object_type': obj.object_type,
-                                'object_path': obj.object_path,
-                                'size_bytes': obj.size_bytes,
-                                'created_date': obj.created_date,
-                                'last_modified': obj.last_modified,
-                                
-                                'discovery_timestamp': datetime.now(timezone.utc)
-                                }
-                            batch_mappings.append(mapping)                            
+                            'discovery_timestamp': datetime.now(timezone.utc)
+                            }
+                        batch_mappings.append(mapping)                            
 
-                        # B. Prepare TaskOutputRecords to be saved to the staging table
-                        staged_output_records = []
-                        if files_for_classification:
-                            staged_output_records.append({
-                                "job_id": work_packet.header.job_id, "task_id": task_id, "boundary_id": boundary_id,
-                                "output_type": "DISCOVERED_OBJECTS",
-                                "output_payload": {"discovered_objects": files_for_classification}
-                            })
-                        if sub_boundaries_for_enumeration:
-                            staged_output_records.append({
-                                "job_id": work_packet.header.job_id, "task_id": task_id, "boundary_id": boundary_id,
-                                "output_type": "NEW_ENUMERATION_BOUNDARIES", # Generic trigger for Pipeliner
-                                "output_payload": {"discovered_objects": sub_boundaries_for_enumeration}
-                            })
+                    # B. Prepare TaskOutputRecords to be saved to the staging table
+                    staged_output_records = []
+                    if files_for_classification:
+                        staged_output_records.append({
+                            "job_id": work_packet.header.job_id, "task_id": task_id, "boundary_id": boundary_id,
+                            "output_type": "DISCOVERED_OBJECTS",
+                            "output_payload": {"discovered_objects": files_for_classification}
+                        })
+                    if sub_boundaries_for_enumeration:
+                        staged_output_records.append({
+                            "job_id": work_packet.header.job_id, "task_id": task_id, "boundary_id": boundary_id,
+                            "output_type": "NEW_ENUMERATION_BOUNDARIES", # Generic trigger for Pipeliner
+                            "output_payload": {"discovered_objects": sub_boundaries_for_enumeration}
+                        })
 
-                        # C. Perform the micro-transaction to save to staging tables
-                        if files_for_classification or staged_output_records:
-                            
-                            await self.db_interface.write_discovery_to_staging_async(
-                                discovered_objects=batch_mappings,
-                                staged_output_records=staged_output_records,
-                                discovery_staging_table=discovery_staging_table,
-                                output_staging_table=output_staging_table,
-                                context=job_context
-                            )
+                    # C. Perform the micro-transaction to save to staging tables
+                    if files_for_classification or staged_output_records:
+                        
+                        await self.db_interface.write_discovery_to_staging_async(
+                            discovered_objects=batch_mappings,
+                            staged_output_records=staged_output_records,
+                            discovery_staging_table=discovery_staging_table,
+                            output_staging_table=output_staging_table,
+                            context=job_context
+                        )
 
-                        # D. Check for the final commit signal from the connector
-                        if batch.is_final_batch:
-                            self.logger.info(f"Boundary '{boundary_path}' fully processed by connector. Committing results.", **job_context)
-                            await self.db_interface.commit_boundary_outputs_from_staging_async(
-                                task_id=task_id,
-                                boundary_id=boundary_id,
-                                boundary_path=boundary_path,
-                                output_staging_table=output_staging_table,
-                                context=job_context
-                            )
-                            break  # Exit the inner streaming loop and move to the next boundary
+                    # D. Check for the final commit signal from the connector
+                    if batch.is_final_batch:
+                        self.logger.info(f"Boundary '{boundary_path}' fully processed by connector. Committing results.", **job_context)
+                        await self.db_interface.commit_boundary_outputs_from_staging_async(
+                            task_id=task_id,
+                            boundary_id=boundary_id,
+                            boundary_path=boundary_path,
+                            output_staging_table=output_staging_table,
+                            context=job_context
+                        )
+                        
 
                     boundaries_processed += 1
 
@@ -750,14 +747,13 @@ class Worker:
                         boundary_path=boundary_path,
                         **job_context
                     )
-                    # If one boundary fails, log it and continue to the next one.
-                    continue
-
+                
             # --- RE-ADD: Final summary logging ---
             self.logger.info(f"Discovery enumeration task completed. Processed {boundaries_processed} of {total_boundaries} assigned boundaries.",
                              task_id=work_packet.header.task_id,
                              boundaries_processed=boundaries_processed,
                              total_assigned=total_boundaries)
+
 
 
     async def _process_discovery_get_details_async(self, work_packet: WorkPacket):

@@ -59,6 +59,7 @@ class LocalConnector(IFileDataSourceConnector):
                 directory_path, 
                 self.get_boundary_type().value
             )
+            boundary_path = f"{self.datasource_id}:{directory_path}:{self.get_boundary_type().value}"
             batch = []
             batch_size = 100
             last_yield_time = time.time()
@@ -72,7 +73,7 @@ class LocalConnector(IFileDataSourceConnector):
                         current_time = time.time()
                         if batch and (current_time - last_yield_time) > timeout_seconds:
                             yield DiscoveryBatch(
-                                boundary_id=boundary_id, 
+                                boundary_id=boundary_id,boundary_path=boundary_path, 
                                 is_final_batch=False, 
                                 discovered_objects=batch
                             )
@@ -102,7 +103,7 @@ class LocalConnector(IFileDataSourceConnector):
                             # Yield when batch is full
                             if len(batch) >= batch_size:
                                 yield DiscoveryBatch(
-                                    boundary_id=boundary_id, 
+                                    boundary_id=boundary_id,boundary_path=boundary_path, 
                                     is_final_batch=False, 
                                     discovered_objects=batch
                                 )
@@ -123,7 +124,7 @@ class LocalConnector(IFileDataSourceConnector):
             
             # Always yield final batch for this directory (even if empty or after error)
             yield DiscoveryBatch(
-                boundary_id=boundary_id, 
+                boundary_id=boundary_id,boundary_path=boundary_path, 
                 is_final_batch=True, 
                 discovered_objects=batch
             )
