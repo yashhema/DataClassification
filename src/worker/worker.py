@@ -640,7 +640,7 @@ class Worker:
 
             # Define staging table names for this job
             discovery_staging_table = payload.staging_table_name
-            output_staging_table = f"stage_task_outputs_job"
+            output_staging_table = f"stage_task_output_records"
 
             # --- 1. RECOVERY STEP ---
             paths_to_scan = payload.paths
@@ -974,7 +974,7 @@ class Worker:
         try:
             if component.component_type == "table":
                 # Route to row-by-row classification
-                return await self.classify_document_content(component, engine_interface, work_packet)
+                return await self._classify_table_component_async(component, engine_interface, work_packet)
                 
             elif component.component_type in ["text", "image_ocr", "table_fallback", "archive_member"]:
                 # Route to document content classification

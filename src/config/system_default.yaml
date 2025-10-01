@@ -8,7 +8,7 @@
 
 # --- Database & Cache Configuration ---
 database:
-  connection_string: "mssql+aioodbc://localhost/NewDataClassification?driver=ODBC+Driver+17+for+SQL+Server&trusted_connection=yes"
+  connection_string: "mssql+aioodbc://localhost/NewDataClassification?driver=ODBC+Driver+17+for+SQL+Server&trusted_connection=yes&MARS_Connection=yes"
 
 redis:
   host: "localhost"

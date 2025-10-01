@@ -15,6 +15,7 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import joinedload
 import hashlib
 import time
+import base64
 from sqlalchemy import (
     select, update, text, inspect, Table, func, Column, Integer, String,
     DateTime, LargeBinary, case,delete
@@ -209,22 +210,21 @@ class DatabaseInterface:
         In a single transaction, moves all TaskOutputRecords for a given boundary
         from the staging table to the main table and creates a checkpoint record
         in the enumeration_progress table.
-        A stored procedure is the safest way to ensure atomicity for this operation.
         """
         context = context or {}
-        self.logger.log_database_operation("TRANSACTION", "commit_boundary", "STARTED", task_id=task_id.hex(), **context)
+        self.logger.log_database_operation("TRANSACTION", "commit_boundary", "STARTED", **context)
         try:
-            # It is highly recommended to implement this logic in a database stored procedure
-            # to guarantee atomicity and reduce network round-trips.
             async with self.get_async_session() as session:
                 
-                # This is a conceptual representation. The actual SQL may vary.
+                # --- START OF FIX ---
+                # The parameter name in the SQL string and the dictionary key must match.
                 stored_proc_sql = text(
-                    "EXEC dbo.CommitBoundaryEnumeration "
+                     "EXEC dbo.CommitBoundaryEnumeration "
                     "@task_id = :task_id, "
                     "@boundary_id = :boundary_id, "
                     "@boundary_path = :boundary_path, "
-                    "@staging_table = :staging_table"
+                    # This now correctly matches the parameter name in the dictionary below
+                    "@output_staging_table = :output_staging_table" 
                 )
                 
                 await session.execute(
@@ -233,12 +233,15 @@ class DatabaseInterface:
                         "task_id": task_id,
                         "boundary_id": boundary_id,
                         "boundary_path": boundary_path,
-                        "staging_table": output_staging_table,
+                        # This key now correctly matches the bind parameter in the SQL string
+                        "output_staging_table": output_staging_table,
                     }
                 )
+                # --- END OF FIX ---
+                
                 await session.commit()
             
-            self.logger.log_database_operation("TRANSACTION", "commit_boundary", "SUCCESS", task_id=task_id.hex(), **context)
+            self.logger.log_database_operation("TRANSACTION", "commit_boundary", "SUCCESS", **context)
         except Exception as e:
             self.error_handler.handle_error(e, "commit_boundary_outputs_from_staging", **context)
             raise
@@ -1002,11 +1005,27 @@ class DatabaseInterface:
         
         # 1. Prepare the data for bulk insertion
         processed_records = []
+        self.logger.info(f"DEBUG: object_key_hash type: {type(records[0].object_key_hash)}")
+        self.logger.info(f"DEBUG: object_key_hash value: {records[0].object_key_hash}")
+        self.logger.info(f"DEBUG: object_key_hash length: {len(records[0].object_key_hash)}")        
         for pydantic_obj in records:
+            if isinstance(pydantic_obj.object_key_hash, bytes):
+                object_key_hash = base64.b64decode(pydantic_obj.object_key_hash)
+            elif isinstance(pydantic_obj.object_key_hash, str):
+                object_key_hash = base64.b64decode(pydantic_obj.object_key_hash.encode())
+            else:
+                object_key_hash = pydantic_obj.object_key_hash
+
+                
             processed_records.append({
-                "object_key_hash": pydantic_obj.object_key_hash,
-                "base_object": json.dumps(pydantic_obj.base_object),
-                "detailed_metadata": json.dumps(pydantic_obj.detailed_metadata), # Serialize the JSON part
+                "object_key_hash": object_key_hash,
+                
+                # This line is correct as `base_object` is a Pydantic model
+                "base_object": json.dumps(pydantic_obj.base_object.model_dump(mode='json')),
+                
+                # This is the corrected line, as `detailed_metadata` is just a dictionary
+                "detailed_metadata": json.dumps(pydantic_obj.detailed_metadata),
+                
                 "metadata_fetch_timestamp": pydantic_obj.metadata_fetch_timestamp
             })
 
@@ -1021,16 +1040,17 @@ class DatabaseInterface:
                     sync_session.execute(text(f"""
                     CREATE TABLE {temp_table_name} (
                         object_key_hash VARBINARY(32) PRIMARY KEY,
+                        base_object NVARCHAR(MAX),
                         detailed_metadata NVARCHAR(MAX),
-                        metadata_fetch_timestamp DATETIME2
+                        metadata_fetch_timestamp datetimeoffset(7)
                     )
                     """))
 
                     # Bulk insert the processed data into the temp table
                     if processed_records:
                         insert_sql = text(f"""
-                        INSERT INTO {temp_table_name} (object_key_hash, detailed_metadata, metadata_fetch_timestamp)
-                        VALUES (:object_key_hash, :detailed_metadata, :metadata_fetch_timestamp)
+                        INSERT INTO {temp_table_name} (object_key_hash, base_object, detailed_metadata, metadata_fetch_timestamp)
+                        VALUES (:object_key_hash, :base_object, :detailed_metadata, :metadata_fetch_timestamp)
                         """)
                         sync_session.execute(insert_sql, processed_records)
 
@@ -1041,11 +1061,12 @@ class DatabaseInterface:
                     ON target.object_key_hash = source.object_key_hash
                     WHEN MATCHED THEN
                         UPDATE SET
+                            base_object = source.base_object,
                             detailed_metadata = source.detailed_metadata,
                             metadata_fetch_timestamp = source.metadata_fetch_timestamp
                     WHEN NOT MATCHED THEN
-                        INSERT (object_key_hash, detailed_metadata, metadata_fetch_timestamp)
-                        VALUES (source.object_key_hash, source.detailed_metadata, source.metadata_fetch_timestamp);
+                        INSERT (object_key_hash, base_object, detailed_metadata, metadata_fetch_timestamp)
+                        VALUES (source.object_key_hash, source.base_object, source.detailed_metadata, source.metadata_fetch_timestamp);
                     """)
                     sync_session.execute(merge_sql)
                 
@@ -1507,178 +1528,168 @@ class DatabaseInterface:
                                           datasource_id=datasource_id, **context)
             raise
 
-    async def insert_discovered_object_batch(self, objects: List[Dict[str, Any]], 
-                                         staging_table_name: str,
-                                         context: Optional[Dict[str, Any]] = None) -> int:
-        """Upsert batch of discovered objects into staging table using SQL Server MERGE."""
-        context = context or {}
-        if not objects:
-            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "NO_OBJECTS_TO_PROCESS", **context)
-            return 0
+    async def insert_discovered_object_batch(
+            self, 
+            objects: List[Dict[str, Any]], 
+            staging_table_name: str,
+            context: Optional[Dict[str, Any]] = None,
+            session: Optional[AsyncSession] = None
+        ) -> int:
+            """Upsert batch of discovered objects into staging table using SQL Server MERGE."""
+            context = context or {}
+            if not objects:
+                self.logger.log_database_operation("BULK UPSERT", staging_table_name, "NO_OBJECTS_TO_PROCESS", **context)
+                return 0
+                
+            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "VALIDATING_TABLE_NAME", **context)
+            self._validate_table_name(staging_table_name)
             
-        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "VALIDATING_TABLE_NAME", **context)
-        self._validate_table_name(staging_table_name)
-        
-        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "STARTED", 
-                                         record_count=len(objects), **context)
-        try:
-            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "GETTING_ASYNC_SESSION", **context)
-            async with self.get_async_session() as session:
-                self.logger.log_database_operation("BULK UPSERT", staging_table_name, "SESSION_ACQUIRED", **context)
-                
-                # Process objects - FIXED: hashlib import moved outside loop
-                self.logger.log_database_operation("BULK UPSERT", staging_table_name, "STARTING_OBJECT_PROCESSING", 
-                                                 input_count=len(objects), **context)
-                
-                processed_objects = []
-                for i, obj in enumerate(objects):
-                    if i % 100 == 0:  # Log every 100 objects
-                        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "PROCESSING_PROGRESS", 
-                                                         processed=i, total=len(objects), **context)
+            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "STARTED", 
+                                             record_count=len(objects), **context)
+            try:
+                async with self._get_session_context(session=session) as inner_session:
+                    self.logger.log_database_operation("BULK UPSERT", staging_table_name, "SESSION_ACQUIRED", **context)
                     
-                    key_components = [
-                        obj.get('data_source_id', ''),
-                        obj.get('object_path', ''),
-                        obj.get('object_type', '')
-                    ]
-                    key_string = '|'.join(str(comp) for comp in key_components)
-                    object_key_hash = hashlib.sha256(key_string.encode()).digest()
+                    self.logger.log_database_operation("BULK UPSERT", staging_table_name, "STARTING_OBJECT_PROCESSING", 
+                                                     input_count=len(objects), **context)
                     
-                    processed_obj = {
-                        'object_key_hash': object_key_hash,
-                        'data_source_id': obj.get('data_source_id'),
-                        'object_type': obj.get('object_type'),
-                        'object_path': obj.get('object_path'),
-                        'size_bytes': obj.get('size_bytes'),
-                        'created_date': obj.get('created_date'),
-                        'last_modified': obj.get('last_modified'),
-                        'last_accessed': obj.get('last_accessed'),
-                        'discovery_timestamp': datetime.now(timezone.utc)
-                    }
-                    processed_objects.append(processed_obj)
-                
-                self.logger.log_database_operation("BULK UPSERT", staging_table_name, "OBJECTS_PROCESSED", 
-                                                 record_count=len(processed_objects), **context)
+                    processed_objects = []
+                    for i, obj in enumerate(objects):
+                        if i % 100 == 0:
+                            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "PROCESSING_PROGRESS", 
+                                                             processed=i, total=len(objects), **context)
+                        
+                        key_components = [
+                            obj.get('data_source_id', ''),
+                            obj.get('object_path', ''),
+                            obj.get('object_type', '')
+                        ]
+                        key_string = '|'.join(str(comp) for comp in key_components)
+                        object_key_hash = hashlib.sha256(key_string.encode()).digest()
+                        
+                        processed_obj = {
+                            'object_key_hash': object_key_hash,
+                            'data_source_id': obj.get('data_source_id'),
+                            'object_type': obj.get('object_type'),
+                            'object_path': obj.get('object_path'),
+                            'size_bytes': obj.get('size_bytes'),
+                            'created_date': obj.get('created_date'),
+                            'last_modified': obj.get('last_modified'),
+                            'last_accessed': obj.get('last_accessed'),
+                            'discovery_timestamp': datetime.now(timezone.utc)
+                        }
+                        processed_objects.append(processed_obj)
+                    
+                    self.logger.log_database_operation("BULK UPSERT", staging_table_name, "OBJECTS_PROCESSED", 
+                                                     record_count=len(processed_objects), **context)
 
-                def sync_upsert(sync_session):
-                    try:
-                        # FIXED: Use session-local temporary table (single #) with timestamp for uniqueness
-                        temp_table_name = f"#temp_{staging_table_name}_{int(time.time() * 1000)}"
-                        
-                        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "STARTING_TEMP_OPERATIONS", 
-                                                         temp_table=temp_table_name, **context)
-                        
-                        # Create session-local temporary table (automatically cleaned up when session ends)
-                        create_temp_sql = f"""
-                        CREATE TABLE {temp_table_name} (
-                            object_key_hash VARBINARY(32) PRIMARY KEY,
-                            data_source_id NVARCHAR(255),
-                            object_type NVARCHAR(50),
-                            object_path NVARCHAR(4000),
-                            size_bytes BIGINT,
-                            created_date DATETIME2,
-                            last_modified DATETIME2,
-                            last_accessed DATETIME2,
-                            discovery_timestamp DATETIME2
-                        )
-                        """
-                        
-                        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "CREATING_SESSION_LOCAL_TEMP_TABLE", 
-                                                         sql=create_temp_sql.replace('\n', ' ').strip(), 
-                                                         temp_table=temp_table_name, **context)
-                        sync_session.execute(text(create_temp_sql))
-                        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "TEMP_TABLE_CREATED", 
-                                                         temp_table=temp_table_name, **context)
-                        
-                        # Insert data into temp table - FIXED: Avoid autoload, use direct SQL insert
-                        if processed_objects:
-                            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "STARTING_BULK_INSERT", 
-                                                             record_count=len(processed_objects), 
+                    def sync_upsert(sync_session):
+                        try:
+                            temp_table_name = f"#temp_{staging_table_name}_{int(time.time() * 1000)}"
+                            
+                            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "STARTING_TEMP_OPERATIONS", 
                                                              temp_table=temp_table_name, **context)
                             
-                            # Use direct SQL bulk insert to avoid autoload issues with temp tables
-                            insert_sql = f"""
-                            INSERT INTO {temp_table_name} 
-                            (object_key_hash, data_source_id, object_type, object_path, 
-                             size_bytes, created_date, last_modified, last_accessed, discovery_timestamp)
-                            VALUES 
-                            (:object_key_hash, :data_source_id, :object_type, :object_path, 
-                             :size_bytes, :created_date, :last_modified, :last_accessed, :discovery_timestamp)
+                            create_temp_sql = f"""
+                            CREATE TABLE {temp_table_name} (
+                                object_key_hash VARBINARY(32) PRIMARY KEY,
+                                data_source_id NVARCHAR(255),
+                                object_type NVARCHAR(50),
+                                object_path NVARCHAR(4000),
+                                size_bytes BIGINT,
+                                created_date DATETIME2,
+                                last_modified DATETIME2,
+                                last_accessed DATETIME2,
+                                discovery_timestamp DATETIME2
+                            )
                             """
                             
-                            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "EXECUTING_BULK_INSERT", 
-                                                             sql=insert_sql.replace('\n', ' ').strip(),
-                                                             param_count=len(processed_objects), 
+                            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "CREATING_SESSION_LOCAL_TEMP_TABLE", 
+                                                             sql=create_temp_sql.replace('\\n', ' ').strip(), 
+                                                             temp_table=temp_table_name, **context)
+                            sync_session.execute(text(create_temp_sql))
+                            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "TEMP_TABLE_CREATED", 
                                                              temp_table=temp_table_name, **context)
                             
-                            # Execute the bulk insert
-                            sync_session.execute(text(insert_sql), processed_objects)
+                            if processed_objects:
+                                self.logger.log_database_operation("BULK UPSERT", staging_table_name, "STARTING_BULK_INSERT", 
+                                                                 record_count=len(processed_objects), 
+                                                                 temp_table=temp_table_name, **context)
+                                
+                                insert_sql = f"""
+                                INSERT INTO {temp_table_name} 
+                                (object_key_hash, data_source_id, object_type, object_path, 
+                                 size_bytes, created_date, last_modified, last_accessed, discovery_timestamp)
+                                VALUES 
+                                (:object_key_hash, :data_source_id, :object_type, :object_path, 
+                                 :size_bytes, :created_date, :last_modified, :last_accessed, :discovery_timestamp)
+                                """
+                                
+                                self.logger.log_database_operation("BULK UPSERT", staging_table_name, "EXECUTING_BULK_INSERT", 
+                                                                 sql=insert_sql.replace('\\n', ' ').strip(),
+                                                                 param_count=len(processed_objects), 
+                                                                 temp_table=temp_table_name, **context)
+                                
+                                sync_session.execute(text(insert_sql), processed_objects)
+                                
+                                self.logger.log_database_operation("BULK UPSERT", staging_table_name, "BULK_INSERT_COMPLETE", 
+                                                                 record_count=len(processed_objects), 
+                                                                 temp_table=temp_table_name, **context)
                             
-                            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "BULK_INSERT_COMPLETE", 
-                                                             record_count=len(processed_objects), 
+                            merge_sql = f"""
+                            MERGE {staging_table_name} AS target
+                            USING {temp_table_name} AS source
+                            ON target.object_key_hash = source.object_key_hash
+                            WHEN MATCHED THEN
+                                UPDATE SET
+                                     last_modified = source.last_modified,
+                                     last_accessed = source.last_accessed,
+                                     size_bytes = source.size_bytes,
+                                     discovery_timestamp = source.discovery_timestamp
+                            WHEN NOT MATCHED THEN
+                                 INSERT (object_key_hash, data_source_id, object_type, object_path, 
+                                       size_bytes, created_date, last_modified, last_accessed, discovery_timestamp)
+                                VALUES (source.object_key_hash, source.data_source_id, source.object_type, 
+                                       source.object_path, source.size_bytes, source.created_date, 
+                                       source.last_modified, source.last_accessed, source.discovery_timestamp);
+                            """
+
+                            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "EXECUTING_MERGE", 
+                                                             sql=merge_sql.replace('\\n', ' ').strip(), 
+                                                             from_temp=temp_table_name, 
+                                                             to_staging=staging_table_name, **context)
+
+                            result = sync_session.execute(text(merge_sql))
+                            affected_rows = result.rowcount if hasattr(result, 'rowcount') else len(processed_objects)
+                            
+                            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "MERGE_COMPLETE", 
+                                                             rows_affected=affected_rows, 
                                                              temp_table=temp_table_name, **context)
-                        
-                        # MERGE from session-local temp table to permanent staging table
-                        merge_sql = f"""
-                        MERGE {staging_table_name} AS target
-                        USING {temp_table_name} AS source
-                        ON target.object_key_hash = source.object_key_hash
-                        WHEN MATCHED THEN
-                            UPDATE SET
-                                last_modified = source.last_modified,
-                                last_accessed = source.last_accessed,
-                                size_bytes = source.size_bytes,
-                                discovery_timestamp = source.discovery_timestamp
-                        WHEN NOT MATCHED THEN
-                            INSERT (object_key_hash, data_source_id, object_type, object_path, 
-                                   size_bytes, created_date, last_modified, last_accessed, discovery_timestamp)
-                            VALUES (source.object_key_hash, source.data_source_id, source.object_type, 
-                                   source.object_path, source.size_bytes, source.created_date, 
-                                   source.last_modified, source.last_accessed, source.discovery_timestamp);
-                        """
+                            
+                            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "TEMP_TABLE_AUTO_CLEANUP", 
+                                                             temp_table=temp_table_name, **context)
+                            
+                        except Exception as e:
+                            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "SYNC_ERROR", 
+                                                             error=str(e), **context)
+                            raise
+                    
+                    self.logger.log_database_operation("BULK UPSERT", staging_table_name, "CALLING_RUN_SYNC", **context)
+                    await inner_session.run_sync(sync_upsert)
+                    
+                    self.logger.log_database_operation("BULK UPSERT", staging_table_name, "RUN_SYNC_COMPLETE", **context)
 
-                        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "EXECUTING_MERGE", 
-                                                         sql=merge_sql.replace('\n', ' ').strip(), 
-                                                         from_temp=temp_table_name, 
-                                                         to_staging=staging_table_name, **context)
-
-                        result = sync_session.execute(text(merge_sql))
-                        affected_rows = result.rowcount if hasattr(result, 'rowcount') else len(processed_objects)
-                        
-                        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "MERGE_COMPLETE", 
-                                                         rows_affected=affected_rows, 
-                                                         temp_table=temp_table_name, **context)
-                        
-                        # Session-local temp table will be automatically dropped when session ends
-                        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "TEMP_TABLE_AUTO_CLEANUP", 
-                                                         temp_table=temp_table_name, **context)
-                        
-                    except Exception as e:
-                        self.logger.log_database_operation("BULK UPSERT", staging_table_name, "SYNC_ERROR", 
-                                                         error=str(e), **context)
-                        raise
-                
-                self.logger.log_database_operation("BULK UPSERT", staging_table_name, "CALLING_RUN_SYNC", **context)
-                await session.run_sync(sync_upsert)
-                
-                self.logger.log_database_operation("BULK UPSERT", staging_table_name, "RUN_SYNC_COMPLETE", **context)
-                await session.commit()
-                
-                self.logger.log_database_operation("BULK UPSERT", staging_table_name, "COMMIT_COMPLETE", **context)
-                
                 self.logger.log_database_operation("BULK UPSERT", staging_table_name, "SUCCESS", 
                                                  record_count=len(processed_objects), **context)
                 return len(processed_objects)
-            
-        except Exception as e:
-            self.logger.log_database_operation("BULK UPSERT", staging_table_name, "FAILED", 
-                                             error=str(e), object_count=len(objects), **context)
-            self.error_handler.handle_error(e, context="upsert_discovered_object_batch", 
-                                          staging_table=staging_table_name,
-                                          object_count=len(objects), **context)
-            raise
-
-
+                
+            except Exception as e:
+                self.logger.log_database_operation("BULK UPSERT", staging_table_name, "FAILED", 
+                                                 error=str(e), object_count=len(objects), **context)
+                self.error_handler.handle_error(e, context="upsert_discovered_object_batch", 
+                                              staging_table=staging_table_name,
+                                              object_count=len(objects), **context)
+                raise
 
     async def insert_scan_findings(self, findings: List[Dict[str, Any]], context: Optional[Dict[str, Any]] = None) -> int:
         """Insert scan findings into the findings tables using hash-based primary keys with upsert logic."""

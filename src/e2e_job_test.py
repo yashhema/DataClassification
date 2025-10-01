@@ -25,6 +25,7 @@ from worker.worker import Worker, ConnectorFactory
 from orchestrator.orchestrator import Orchestrator
 from orchestrator.orchestrator_state import JobState
 from core.db_models.discovery_catalog_schema import ObjectMetadata
+from core.db_models.findings_schema import ScanFindingSummary
 from core.db_models.job_schema import Job, JobType, JobStatus
 from core.models.models import WorkPacket
 
@@ -32,7 +33,7 @@ from core.models.models import WorkPacket
 # TEST CONFIGURATION
 # =============================================================================
 
-TEST_DATASOURCE_ID: str = "ds_sql_localhost"  # Options: "ds_local_test_files", "ds_smb_finance_dept", "ds_sql_localhost"
+TEST_DATASOURCE_ID: str = "ds_smb_finance_dept"  # Options: "ds_local_test_files", "ds_smb_finance_dept", "ds_sql_localhost"
 
 GROUND_TRUTH_CONFIG = {
     "ds_sql_localhost": {
@@ -102,69 +103,6 @@ async def build_ground_truth(datasource_id: str, config: Dict) -> Set[str]:
         
     return expected_paths
 
-# =============================================================================
-# SETUP HELPER
-# =============================================================================
-
-async def setup_test_job(job_id: int, datasource_id: str, orchestrator: Orchestrator, db: DatabaseInterface):
-    """Create job record, register in orchestrator state, and initialize first task."""
-    
-    print("\n[SETUP] Cleaning old test data...")
-    await db.execute_raw_sql(
-        f"DELETE FROM discovered_objects WHERE data_source_id = '{datasource_id}'"
-    )
-    await db.execute_raw_sql(
-        f"DELETE FROM object_metadata WHERE object_key_hash IN "
-        f"(SELECT object_key_hash FROM discovered_objects WHERE data_source_id = '{datasource_id}')"
-    )
-    await db.execute_raw_sql(
-        f"DELETE FROM task_output_records WHERE job_id = {job_id}"
-    )
-    await db.execute_raw_sql(
-        f"DELETE FROM tasks WHERE job_id = {job_id}"
-    )
-    await db.execute_raw_sql(
-        f"DELETE FROM jobs WHERE id = {job_id}"
-    )
-    
-    print("[SETUP] Creating job record...")
-    async with db.get_async_session() as session:
-        job = Job(
-            id=job_id,
-            execution_id=f"e2e_test_{job_id}",
-            template_type=JobType.SCANNING,
-            status=JobStatus.QUEUED,
-            orchestrator_id=orchestrator.instance_id,
-            node_group=orchestrator.settings.system.node_group,
-            lease_expiry=datetime.now(timezone.utc) + timedelta(hours=2),
-            configuration={
-                'datasource_targets': [{'datasource_id': datasource_id}],
-                'classifier_template_id': CLASSIFIER_TEMPLATE_ID,
-                'discovery_workflow': 'two-phase',
-                'discovery_mode': 'FULL'
-            },
-            priority=1,
-            created_timestamp=datetime.now(timezone.utc),
-            version=1
-        )
-        session.add(job)
-        await session.commit()
-    
-    print("[SETUP] Registering job in orchestrator state...")
-    await orchestrator._update_job_in_memory_state(
-        job_id=job_id,
-        new_status=JobState.QUEUED,
-        version=1,
-        lease_expiry=datetime.now(timezone.utc) + timedelta(hours=2),
-        is_new=True
-    )
-    
-    print("[SETUP] Claiming job and creating initial task...")
-    success = await orchestrator.task_assigner._claim_and_initialize_new_job()
-    if not success:
-        raise RuntimeError("Failed to claim and initialize job")
-    
-    print("[SETUP] Complete\n")
 
 # =============================================================================
 # MAIN TEST FUNCTION
@@ -193,7 +131,7 @@ async def run_job_simulation():
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(JsonFormatter())
         root_logger.addHandler(console_handler)
-        root_logger.setLevel(logging.INFO)
+        root_logger.setLevel(logging.ERROR)
         
         # Initialize core components
         error_handler = ErrorHandler()
@@ -371,12 +309,20 @@ async def run_job_simulation():
         metadata_count = 0
         if actual_hashes:
             async with db_interface.get_async_session() as session:
-                stmt = select(func.count()).select_from(ObjectMetadata).where(
-                    ObjectMetadata.object_key_hash.in_(actual_hashes)
-                )
+                stmt = select(func.count()).select_from(ObjectMetadata)
                 result = await session.execute(stmt)
                 metadata_count = result.scalar_one()
+
+        findings_count = 0
+        if actual_hashes:
+            async with db_interface.get_async_session() as session:
+                stmt = select(func.count()).select_from(ScanFindingSummary)
+                result = await session.execute(stmt)
+                findings_count = result.scalar_one()
         
+
+
+
         # Print results
         print(f"\n{'='*60}")
         print("VERIFICATION RESULTS")
@@ -387,6 +333,7 @@ async def run_job_simulation():
         print(f"Missing:             {len(missing)}")
         print(f"Unexpected:          {len(unexpected)}")
         print(f"With metadata:       {metadata_count}")
+        print(f"Total Findings:      {findings_count}")
         
         # Pass/Fail determination
         if not missing and not unexpected:
@@ -428,8 +375,9 @@ async def setup_test_job(job_id: int, datasource_id: str, orchestrator, db: Data
     from core.db_models.job_schema import Job, JobType, JobStatus
     
     print("\n[SETUP: Cleaning old test data]")
-    await db.execute_raw_sql(f"DELETE FROM discovered_objects '")
-    await db.execute_raw_sql(f"DELETE FROM object_metadata ')")
+    await db.execute_raw_sql(f"DELETE FROM discovered_objects ")
+    await db.execute_raw_sql(f"DELETE FROM object_metadata ")
+    await db.execute_raw_sql(f"DELETE FROM scan_finding_summaries ")    
     await db.execute_raw_sql(f"DELETE FROM task_output_records WHERE job_id = {job_id}")
     await db.execute_raw_sql(f"DELETE FROM tasks WHERE job_id = {job_id}")
     await db.execute_raw_sql(f"DELETE FROM jobs WHERE id = {job_id}")
@@ -439,11 +387,13 @@ async def setup_test_job(job_id: int, datasource_id: str, orchestrator, db: Data
         job = Job(
             id=job_id,
             execution_id=f"e2e_test_{job_id}",
+            template_table_id=1,  # CORRECTED: Added missing required field
             template_type=JobType.SCANNING,
             status=JobStatus.QUEUED,
+            trigger_type='e2e_test',  # CORRECTED: Added missing required field
             orchestrator_id=orchestrator.instance_id,
             node_group=orchestrator.settings.system.node_group,
-            lease_expiry=datetime.now(timezone.utc) + timedelta(hours=2),
+            orchestrator_lease_expiry=datetime.now(timezone.utc) + timedelta(hours=2),  # CORRECTED: Renamed field
             configuration={
                 'datasource_targets': [{'datasource_id': datasource_id}],
                 'classifier_template_id': CLASSIFIER_TEMPLATE_ID,
@@ -456,6 +406,7 @@ async def setup_test_job(job_id: int, datasource_id: str, orchestrator, db: Data
         )
         session.add(job)
         await session.commit()
+
     
     print("[SETUP: Registering job in orchestrator state]")
     await orchestrator._update_job_in_memory_state(

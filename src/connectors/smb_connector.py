@@ -522,7 +522,8 @@ class SMBConnector(IFileDataSourceConnector):
 
     async def get_object_content(self, work_packet: WorkPacket) -> AsyncIterator[ContentComponent]:
         """Get content components for classification - async interface method"""
-        
+        await self._ensure_connection_async(work_packet.header.trace_id, work_packet.header.task_id)
+
         # --- FIX STARTS HERE ---
 
         # 1. Access the correct attribute: 'discovered_objects'
@@ -849,7 +850,11 @@ class SMBConnector(IFileDataSourceConnector):
         """Download SMB file to temporary location for ContentExtractor processing (async)"""
         
         if not self.smb_connection or not self.smb_connection.is_connected():
-            self.logger.error("SMB connection not established for file download")
+            self.logger.error(
+                "SMB connection not established for file download",
+                file_path=file_path,
+                task_id=task_id
+            )
             return None
         
         try:
@@ -1128,6 +1133,7 @@ class SMBConnector(IFileDataSourceConnector):
         
         # Simply await the async helper method directly.
         # There is no need for any complex event loop management.
+        await self._ensure_connection_async(work_packet.header.trace_id, work_packet.header.task_id)
         results = await self._get_details_batch_async(discovered_objects)
         
         return results
