@@ -168,6 +168,7 @@ class ScanConfig(BaseModel):
     include_schemas: List[str] = Field(default_factory=list)
     exclude_tables: List[str] = Field(default_factory=list)
     max_sample_rows: int = 1000
+    sample_percent: Optional[float] = Field(None, description="If set, overrides max_sample_rows for percentage-based sampling.")
     connection_limits: ConnectionLimits = Field(default_factory=ConnectionLimits)
 
 class FailureThresholds(BaseModel):

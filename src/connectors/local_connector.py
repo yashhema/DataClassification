@@ -137,7 +137,18 @@ class LocalConnector(IFileDataSourceConnector):
 
             # Loop through the list of DiscoveredObject models
             for discovered_obj in discovered_objects:
+
+                if discovered_obj.object_type != ObjectType.FILE:
+                    self.logger.info(
+                        f"Skipping content extraction for non-file object: {discovered_obj.object_path}",
+                        object_path=discovered_obj.object_path,
+                        object_type=discovered_obj.object_type.value
+                    )
+                    continue
+                
                 # Extract the 'object_path' from each model
+
+
                 file_path = discovered_obj.object_path
 
                 async for component in self.content_extractor.extract_from_file(

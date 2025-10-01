@@ -674,13 +674,30 @@ class Worker:
                     async for batch in connector.enumerate_objects(boundary_work_packet):
                         files_for_classification = []
                         sub_boundaries_for_enumeration = []
-
+                        batch_mappings = [] #this we need for db save
                         # A. Separate objects based on their type
                         for obj in batch.discovered_objects:
                             if obj.object_type.value == boundary_type_for_next_stage.value:
                                 sub_boundaries_for_enumeration.append(obj.model_dump(mode='json'))
                             else:
                                 files_for_classification.append(obj.model_dump(mode='json'))
+                            
+                            # Calculate object key hash
+                            key_string = f"{obj.datasource_id}|{obj.object_path}|{obj.object_type}"
+                            object_key_hash = hashlib.sha256(key_string.encode()).digest()
+                            
+                            mapping = {
+                                'object_key_hash': object_key_hash,
+                                'data_source_id': obj.datasource_id,
+                                'object_type': obj.object_type,
+                                'object_path': obj.object_path,
+                                'size_bytes': obj.size_bytes,
+                                'created_date': obj.created_date,
+                                'last_modified': obj.last_modified,
+                                
+                                'discovery_timestamp': datetime.now(timezone.utc)
+                                }
+                            batch_mappings.append(mapping)                            
 
                         # B. Prepare TaskOutputRecords to be saved to the staging table
                         staged_output_records = []
@@ -699,8 +716,9 @@ class Worker:
 
                         # C. Perform the micro-transaction to save to staging tables
                         if files_for_classification or staged_output_records:
+                            
                             await self.db_interface.write_discovery_to_staging_async(
-                                discovered_objects=files_for_classification,
+                                discovered_objects=batch_mappings,
                                 staged_output_records=staged_output_records,
                                 discovery_staging_table=discovery_staging_table,
                                 output_staging_table=output_staging_table,
@@ -741,25 +759,34 @@ class Worker:
                              boundaries_processed=boundaries_processed,
                              total_assigned=total_boundaries)
 
+
     async def _process_discovery_get_details_async(self, work_packet: WorkPacket):
-        """Process DISCOVERY_GET_DETAILS task (async).""" 
+        """
+        Processes a DISCOVERY_GET_DETAILS task by fetching detailed metadata from the
+        connector and saving it to the master object_metadata table.
+        """
         payload = work_packet.payload
+        context = self.job_context(work_packet)
+        self.logger.info(f"Starting GET_DETAILS task for {len(payload.discovered_objects)} objects.", **context)
         
-        # Get appropriate connector
+        # 1. Get the appropriate connector
         connector = await self.connector_factory.create_connector(payload.datasource_id)
         
-        # Process detailed metadata retrieval (note: get_object_details is still sync)
-        metadata_results = connector.get_object_details(work_packet)
+        # 2. Call the connector to fetch the rich metadata
+        # This returns a list of Pydantic ObjectMetadata models
+        metadata_results = await connector.get_object_details(work_packet)
         
-        # Report completion
-        progress = TaskOutputRecord(
-            output_type="OBJECT_DETAILS_FETCHED",
-            output_payload={
-                "object_ids": payload.object_ids,
-                "success_count": len(metadata_results)
-            }
+        if not metadata_results:
+            self.logger.info("Connector returned no metadata to save.", **context)
+            return
+
+        # 3. Call the database interface to save the metadata results.
+        # This is the step that was missing.
+        self.logger.info(f"Saving {len(metadata_results)} metadata records to the database.", **context)
+        await self.db_interface.upsert_object_metadata(
+            records=metadata_results,
+            context=context
         )
-        await self._report_task_progress_async(work_packet.header.job_id,work_packet.header.task_id, progress)
 
 
     async def _process_classification_async(self, work_packet: WorkPacket):

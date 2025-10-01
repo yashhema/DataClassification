@@ -242,6 +242,18 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
         self.logger.info("SQL Server connector initialized", 
                         datasource_id=datasource_id)
 
+
+    # --- ADD THIS METHOD ---
+    @staticmethod
+    def job_context(work_packet: WorkPacket) -> Dict[str, Any]:
+        """Extracts a consistent context dictionary for logging."""
+        return {
+            "job_id": work_packet.header.job_id,
+            "task_id": work_packet.header.task_id,
+            "trace_id": work_packet.header.trace_id,
+        }
+    # --- END OF ADDITION ---
+
     async def _load_configuration_async(self):
         """Load datasource and connector configuration asynchronously."""
         if self.datasource_config is None:
@@ -403,9 +415,28 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
         return query
 
     async def _discover_databases(self, scan_config: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Executes the database discovery query from the connector configuration."""
-        query = await self._get_discovery_query("database_discovery")
-        return await self.connection.execute_query_async(query)
+            """
+            Intelligently determines the list of databases to scan.
+            If a specific database is provided in the datasource configuration, it returns
+            only that one. Otherwise, it discovers all databases on the server.
+            """
+            # [cite_start]1. Check for a specific database in the data source configuration[cite: 1880, 686].
+            connection_config = self.datasource_config.configuration.get('connection', {})
+            specific_database = connection_config.get('database')
+
+            # 2. If a specific database is defined (and is not 'master'), use it exclusively.
+            if specific_database and specific_database.lower() != 'master':
+                self.logger.info(
+                    f"Honoring specific database from configuration: '{specific_database}'",
+                    datasource_id=self.datasource_id
+                )
+                # Return it in the expected format: a list of dictionaries
+                return [{'database_name': specific_database}]
+
+            # 3. If no specific database is set, fall back to the original discovery query.
+            self.logger.info("No specific database configured. Discovering all databases on the server.")
+            query = await self._get_discovery_query("database_discovery")
+            return await self.connection.execute_query_async(query)
 
     async def _discover_schemas(self, database_name: str, scan_config: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Executes the schema discovery query from the connector configuration."""
@@ -462,79 +493,50 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
 
 
 
-    def get_object_details(self, work_packet: WorkPacket) -> List[ObjectMetadata]:
+    async def get_object_details(self, work_packet: WorkPacket) -> List[ObjectMetadata]:
         """
         Fetches rich, detailed metadata for a batch of objects.
-        Interface method - sync for compatibility but internally uses async.
         """
-        # This wrapper method requires no changes as it just passes the work_packet through.
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            return asyncio.create_task(self._get_object_details_async(work_packet))
-        else:
-            return loop.run_until_complete(self._get_object_details_async(work_packet))
+        # Simply await the async helper method directly.
+        return await self._get_object_details_async(work_packet)
 
     async def _get_object_details_async(self, work_packet: WorkPacket) -> List[ObjectMetadata]:
         """Internal async implementation for get_object_details."""
+        context = self.job_context(work_packet)
         trace_id = work_packet.header.trace_id
         task_id = work_packet.header.task_id
         
-        # FIXED: The payload now contains a list of DiscoveredObject models
         payload: DiscoveryGetDetailsPayload = work_packet.payload
         
-        self.logger.log_database_operation(
-            "GET_DETAILS", "SQL_SERVER", "STARTED",
-            trace_id=trace_id,
-            task_id=task_id,
-            object_count=len(payload.discovered_objects)
-        )
+        self.logger.log_database_operation("GET_DETAILS", "SQL_SERVER", "STARTED", **context)
         
         try:
             await self._load_configuration_async()
             if not await self._ensure_connection_async(trace_id, task_id):
-                raise ProcessingError(
-                    "Failed to establish database connection",
-                    ErrorType.PROCESSING_LOGIC_ERROR,
-                    operation="get_object_details"
-                )
+                raise ProcessingError("Failed to establish database connection", ErrorType.PROCESSING_LOGIC_ERROR)
             
             metadata_results = []
             successful_count = 0
             
-            # FIXED: Iterate through the list of DiscoveredObject models
             for discovered_obj in payload.discovered_objects:
                 try:
-                    # NEW: Check that the object is a database table before processing
                     if discovered_obj.object_type == ObjectType.DATABASE_TABLE:
-                        # FIXED: Use the object_path from the discovered object
-                        metadata = await self._get_detailed_metadata_async(discovered_obj.object_path, trace_id, task_id)
+                        # This now correctly passes the full object down the chain.
+                        metadata = await self._get_detailed_metadata_async(discovered_obj, trace_id, task_id)
                         if metadata:
-                            # The helper now returns a full ObjectMetadata model
                             metadata_results.append(metadata)
                             successful_count += 1
-                    else:
-                        self.logger.warning(f"Skipping get_details for incorrect object_type '{discovered_obj.object_type}'",
-                                            object_path=discovered_obj.object_path, task_id=task_id)
-                        
                 except Exception as e:
                     error = self.error_handler.handle_error(
                         e, f"get_object_details_{discovered_obj.object_path}",
                         operation="fetch_object_metadata",
-                        object_id=discovered_obj.object_path,
+                        object_path=discovered_obj.object_path,
                         trace_id=trace_id
                     )
-                    self.logger.warning(f"Failed to get details for object {discovered_obj.object_path}", 
-                                      error_id=error.error_id)
+                    self.logger.warning(f"Failed to get details for object {discovered_obj.object_path}", error_id=error.error_id)
                     continue
             
-            self.logger.log_database_operation(
-                "GET_DETAILS", "SQL_SERVER", "COMPLETED",
-                trace_id=trace_id,
-                task_id=task_id,
-                successful_count=successful_count,
-                total_requested=len(payload.discovered_objects)
-            )
-            
+            self.logger.log_database_operation("GET_DETAILS", "SQL_SERVER", "COMPLETED", **context)
             return metadata_results
             
         except Exception as e:
@@ -637,6 +639,10 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
         """
         try:
             if not self.connection:
+
+                await self._load_configuration_async()
+
+                
                 connection_config = self.datasource_config.configuration.get('connection', {})
                 auth_config = connection_config.get('auth', {})
                 auth_method = auth_config.get('auth_method')
@@ -1013,47 +1019,30 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             self.logger.warning(f"Failed to get columns for table {database_name}.{schema_name}.{table_name}: {str(e)}")
             return []
 
-
-    async def _get_detailed_metadata_async(self, object_id: str, trace_id: str, task_id: int) -> Optional[ObjectMetadata]:
-        """Get detailed metadata for a specific object (async)."""
+    async def _get_detailed_metadata_async(self, discovered_obj: DiscoveredObject, trace_id: str, task_id: int) -> Optional[ObjectMetadata]:
+        """Routes a DiscoveredObject to the correct metadata helper (table, column, etc.)."""
         try:
-            # Get discovered object from database (async)
-            discovered_objects = await self.db.get_objects_for_classification([object_id])
-            
-            if not discovered_objects:
-                return None
-            
-            discovered_obj = discovered_objects[0]
             object_path = discovered_obj.object_path
-            
-            # Parse object path
             path_parts = object_path.split('.')
             
             if len(path_parts) >= 3:
                 database_name = path_parts[0]
                 schema_name = path_parts[1]
                 table_name = path_parts[2]
-                column_name = path_parts[3] if len(path_parts) > 3 else None
                 
-                # Get comprehensive metadata based on object type
-                if discovered_obj.ObjectType == "DATABASE_TABLE":
-                    metadata = await self._get_table_metadata_async(database_name, schema_name, table_name)
-                elif discovered_obj.ObjectType == "DATABASE_COLUMN":
-                    metadata = await self._get_column_metadata_async(database_name, schema_name, table_name, column_name)
-                else:
-                    metadata = None
+                if discovered_obj.object_type == ObjectType.DATABASE_TABLE:
+                    # This call now matches the new signature of the helper method.
+                    return await self._get_table_metadata_async(discovered_obj, database_name, schema_name, table_name)
                 
-                return metadata
-            
-            return None
+            return None # Return None for unhandled types or malformed paths
             
         except Exception as e:
             raise ProcessingError(
-                f"Failed to get detailed metadata for object {object_id}: {str(e)}",
+                f"Failed to get detailed metadata for object {discovered_obj.object_path}: {str(e)}",
                 ErrorType.PROCESSING_LOGIC_ERROR,
                 operation="get_detailed_metadata_async",
-                object_id=object_id
-            )
+                object_path=discovered_obj.object_path
+            ) from e
 
 
     async def _extract_content_for_classification_async(self, object_path: str, object_type: str, 
@@ -1120,97 +1109,108 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
 
 
 
-
     async def _sample_table_content_async(self, database_name: str, schema_name: str, table_name: str) -> List[Dict[str, Any]]:
-        """Samples content from a table and returns it as structured row data."""
-        try:
-            # FIXED: This logic now correctly uses the loaded connector configuration
-            environment_info = await self._get_environment_info_async()
-            queries = self.connector_config.get('sql_server_queries', {})
-            env_type = environment_info.get('environment_type', 'on_premise')
-            
-            sampling_query_template = (
-                queries.get('environments', {})
-                .get(env_type, {})
-                .get('row_sampling') or queries.get('fallback_queries', {}).get('row_sampling')
-            )
-            if not sampling_query_template:
-                raise ConfigurationError("Could not find a valid row_sampling query in connector configuration.")
-
-            sample_size = self.datasource_config.configuration.get('scan_config', {}).get('max_sample_rows', 1000)
-            formatted_query = sampling_query_template.format(
-                database_name=database_name,
-                schema_name=schema_name,
-                table_name=table_name,
-                sample_size=sample_size
-            )
-
-            # --- END OF NEW LOGGING ---            
-            result = await self.connection.execute_query_async(formatted_query)
-            # --- THIS IS THE NEW LOGGING ---
-            self.logger.info(
-                f"Successfully sampled {len(result)} rows from table {database_name}.{schema_name}.{table_name}",
-                row_count=len(result),
-                table=f"{database_name}.{schema_name}.{table_name}"
-            )            
-
-            return result
-                
-        except Exception as e:
-            raise ProcessingError(
-                f"Failed to sample table content {database_name}.{schema_name}.{table_name}: {str(e)}",
-                ErrorType.PROCESSING_LOGIC_ERROR,
-                operation="sample_table_content_async"
-            )
-
-
-
-
-    async def _get_table_metadata_async(self, database_name: str, schema_name: str, table_name: str) -> ObjectMetadata:
-        """Get comprehensive table metadata (async)."""
-        try:
-            # Get table size and row count
-            size_query = f"""
-                SELECT 
-                    SUM(a.total_pages) * 8 as total_size_kb,
-                    SUM(p.rows) as row_count
-                FROM [{database_name}].sys.tables t
-                INNER JOIN [{database_name}].sys.indexes i ON t.object_id = i.object_id
-                INNER JOIN [{database_name}].sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id
-                INNER JOIN [{database_name}].sys.allocation_units a ON p.partition_id = a.container_id
-                INNER JOIN [{database_name}].sys.schemas s ON t.schema_id = s.schema_id
-                WHERE s.name = '{schema_name}' AND t.name = '{table_name}'
             """
+            Samples content from a table. It first attempts the efficient percentage-based
+            TABLESAMPLE query and falls back to a fixed-count TOP N query if it fails.
+            """
+            try:
+                scan_config = self.datasource_config.configuration.get('scan_config', {})
+                queries = self.connector_config.get('sql_server_queries', {})
+                env_queries = queries.get('environments', {}).get('on_premise', {})
+
+                sample_percent = scan_config.get('sample_percent')
+                
+                # --- PRIMARY ATTEMPT: Use percentage-based sampling if configured ---
+                if sample_percent and sample_percent > 0:
+                    try:
+                        self.logger.info(f"Attempting percentage-based sampling ({sample_percent}%) for table {table_name}.")
+                        query_template = env_queries.get('row_sampling')
+                        if not query_template:
+                             raise ConfigurationError("Configuration is missing the 'row_sampling' (percentage) query.")
+
+                        formatted_query = query_template.format(
+                            database_name=database_name,
+                            schema_name=schema_name,
+                            table_name=table_name,
+                            sample_percent=sample_percent
+                        )
+                        result = await self.connection.execute_query_async(formatted_query)
+                        self.logger.info(f"Successfully sampled {len(result)} rows using TABLESAMPLE.")
+                        return result
+                    except Exception as e:
+                        self.logger.warning(
+                            f"Percentage-based sampling (TABLESAMPLE) failed for table {table_name}. This can happen on older SQL Server versions. Falling back to row count.",
+                            error=str(e)
+                        )
+                        # If the fast method fails, we deliberately fall through to the reliable fallback method below.
+
+                # --- FALLBACK: Use row-count-based sampling ---
+                sample_size = scan_config.get('max_sample_rows', 1000)
+                self.logger.info(f"Using row-count-based sampling ({sample_size} rows) for table {table_name}.")
+                
+                # Make sure your config has a 'row_sampling_by_count' query key
+                query_template = env_queries.get('row_sampling_by_count')
+                if not query_template:
+                     raise ConfigurationError("Configuration is missing the 'row_sampling_by_count' query.")
+
+                formatted_query = query_template.format(
+                    database_name=database_name,
+                    schema_name=schema_name,
+                    table_name=table_name,
+                    sample_size=sample_size
+                )
+                result = await self.connection.execute_query_async(formatted_query)
+                self.logger.info(f"Successfully sampled {len(result)} rows using TOP N.")
+                return result
+                    
+            except Exception as e:
+                raise ProcessingError(
+                    f"Failed to sample table content {database_name}.{schema_name}.{table_name}: {str(e)}",
+                    ErrorType.PROCESSING_LOGIC_ERROR,
+                    operation="sample_table_content_async"
+                )
+
+    async def _get_table_metadata_async(self, discovered_obj: DiscoveredObject, database_name: str, schema_name: str, table_name: str) -> ObjectMetadata:
+        """Gets the table's schema and correctly constructs the ObjectMetadata model."""
+        try:
+            query_template = self.connector_config.get('sql_server_queries', {}) \
+                .get('common_queries', {}).get('column_metadata')
             
-            size_result = await self.connection.execute_query_async(size_query)
-            
-            if size_result:
-                total_size_kb = size_result[0].get('total_size_kb', 0) or 0
-                row_count = size_result[0].get('row_count', 0) or 0
-            else:
-                total_size_kb = 0
-                row_count = 0
-            
-            return ObjectMetadata(
-                size_bytes=total_size_kb * 1024,
-                row_count=row_count,
-                schema_name=schema_name,
-                table_name=table_name,
-                database_name=database_name,
-                data_type='table',
-                content_type='database/table'
+            if not query_template:
+                raise ConfigurationError("Configuration is missing the 'column_metadata' query.")
+
+            formatted_query = query_template.format(
+                database_name=database_name, schema_name=schema_name, table_name=table_name
             )
             
-        except Exception:
-            # Return basic metadata on error
+            columns_result = await self.connection.execute_query_async(formatted_query)
+            
+            # This is the dictionary that will be stored in the final JSON field.
+            details = {
+                "schema_name": schema_name,
+                "table_name": table_name,
+                "database_name": database_name,
+                "columns": [
+                    {"name": col["COLUMN_NAME"], "type": col["DATA_TYPE"]} for col in columns_result
+                ]
+            }
+
+            # This now correctly builds the ObjectMetadata object with the required nested structure.
             return ObjectMetadata(
-                size_bytes=0,
-                row_count=0,
-                schema_name=schema_name,
-                table_name=table_name,
-                database_name=database_name,
-                data_type='table',
-                content_type='database/table'
+                base_object=discovered_obj,
+                detailed_metadata=details
+            )
+            
+        except Exception as e:
+            # The fallback logic is also corrected to build the object properly.
+            fallback_details = {
+                "schema_name": schema_name, "table_name": table_name, "database_name": database_name,
+                "error": f"Failed to fetch table schema: {str(e)}"
+            }
+            return ObjectMetadata(
+                base_object=discovered_obj,
+                detailed_metadata=fallback_details
             )
 
     async def _get_column_metadata_async(self, database_name: str, schema_name: str, table_name: str, column_name: str) -> ObjectMetadata:

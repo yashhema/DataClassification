@@ -230,6 +230,8 @@ class ClassificationError(Exception):
 # Specific Error Classes
 # =============================================================================
 
+
+
 class NetworkError(ClassificationError):
     """Network-related errors (connection, timeout, DNS, etc.)"""
     
@@ -239,19 +241,34 @@ class NetworkError(ClassificationError):
                  port: Optional[int] = None,
                  **kwargs):
         
-        # Network errors are typically retryable
-        kwargs.setdefault('retryable', True)
-        kwargs.setdefault('retry_delay_seconds', 30)
-        kwargs.setdefault('max_retries', 3)
-        kwargs.setdefault('severity', ErrorSeverity.HIGH)
-        
-        super().__init__(message, error_type, ErrorCategory.NETWORK, **kwargs)
-        
-        # Add network-specific context
+        # --- FIX STARTS HERE ---
+        # 1. Pop the standard arguments for the superclass from kwargs.
+        context = kwargs.pop('context', {})
+        cause = kwargs.pop('cause', None)
+        retryable = kwargs.pop('retryable', True)
+        severity = kwargs.pop('severity', ErrorSeverity.HIGH)
+
+        # 2. Add the arguments specific to this error type to the context.
         if host:
-            self.add_context('host', host)
+            context['host'] = host
         if port:
-            self.add_context('port', port)
+            context['port'] = port
+        
+        # 3. Any remaining items in kwargs (like the 'path') are extra context.
+        #    Merge them into the context dictionary.
+        context.update(kwargs)
+
+        # 4. Call the parent constructor with the specific arguments it expects.
+        super().__init__(
+            message=message,
+            error_type=error_type,
+            error_category=ErrorCategory.NETWORK,
+            context=context,
+            cause=cause,
+            retryable=retryable,
+            severity=severity
+        )
+        # --- FIX ENDS HERE ---
 
 
 class RightsError(ClassificationError):
@@ -301,6 +318,8 @@ class CorruptionError(ClassificationError):
             self.add_context('expected_format', expected_format)
 
 
+# In src/core/errors.py
+
 class ProcessingError(ClassificationError):
     """Processing and resource errors"""
     
@@ -308,23 +327,30 @@ class ProcessingError(ClassificationError):
                  error_type: ErrorType = ErrorType.PROCESSING_LOGIC_ERROR,
                  operation: Optional[str] = None,
                  **kwargs):
-        
-        # Processing errors may be retryable depending on type
-        if error_type in [ErrorType.PROCESSING_RESOURCE_EXHAUSTED, 
-                         ErrorType.RESOURCE_MEMORY_EXHAUSTED]:
-            kwargs.setdefault('retryable', True)
-            kwargs.setdefault('retry_delay_seconds', 120)
-        else:
-            kwargs.setdefault('retryable', False)
-        
-        kwargs.setdefault('severity', ErrorSeverity.MEDIUM)
-        
-        super().__init__(message, error_type, ErrorCategory.PROCESSING, **kwargs)
-        
-        # Add processing-specific context
-        if operation:
-            self.add_context('operation', operation)
 
+        # --- FIX STARTS HERE ---
+        # 1. Get the standard arguments intended for the parent class from kwargs.
+        context = kwargs.pop('context', {})
+        cause = kwargs.pop('cause', None)
+
+        # 2. Add the 'operation' specific to this error type to the context.
+        if operation:
+            context['operation'] = operation
+        
+        # 3. Any remaining items in kwargs (like your 'object_id') are extra context.
+        #    Merge them into the context dictionary.
+        context.update(kwargs)
+
+        # 4. Call the parent constructor with the specific arguments it expects.
+        #    All extra details are now correctly bundled inside the 'context' dictionary.
+        super().__init__(
+            message=message,
+            error_type=error_type,
+            error_category=ErrorCategory.PROCESSING,
+            context=context,
+            cause=cause
+        )
+        # --- FIX ENDS HERE ---
 
 class ConfigurationError(ClassificationError):
     """Configuration and setup errors"""

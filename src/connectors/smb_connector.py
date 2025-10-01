@@ -22,7 +22,7 @@ from typing import AsyncIterator, Optional, Dict, Any, List,Tuple
 from pathlib import Path
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from core.models.models import ContentExtractionConfig, FailedObject
+from core.models.models import ContentExtractionConfig, FailedObject,ObjectType
 # SMB protocol imports
 try:
     from smbprotocol.connection import Connection
@@ -104,9 +104,12 @@ class SMBConnection:
                 # Create connection
                 conn = Connection(uuid.uuid4(), host, port)
                 conn.connect()
-                
+                if domain and '\\' not in username:
+                    full_username = f"{domain}\\{username}"
+                else:
+                    full_username = username                
                 # Create session
-                session = Session(conn, username, password, domain)
+                session = Session(conn, full_username, password)
                 session.connect()
                 
                 # Connect to share
@@ -240,6 +243,40 @@ class SMBConnector(IFileDataSourceConnector):
         self.temp_dir = tempfile.gettempdir()
         self._is_connected = False
         self.db_interface = db_interface
+
+
+# In src/connectors/smb_connector.py, inside the SMBConnector class
+
+    async def tag_objects(self, 
+                          objects_with_tags: List[Tuple[str, List[str]]],
+                          context: Dict[str, Any]) -> RemediationResult:
+        """Applies metadata tags. Not implemented for SMBConnector."""
+        self.logger.warning(
+            "The 'tag_objects' method is not implemented for the SMBConnector. No action will be taken.", 
+            **context
+        )
+        return RemediationResult(succeeded_paths=[], failed_paths=[], success_count=0, failure_count=0)
+
+    async def apply_encryption(self, 
+                             object_paths: List[str], 
+                             encryption_key_id: str, 
+                             context: Dict[str, Any]) -> RemediationResult:
+        """Encrypts objects. Not implemented for SMBConnector."""
+        self.logger.warning(
+            "The 'apply_encryption' method is not implemented for the SMBConnector. No action will be taken.", 
+            **context
+        )
+        return RemediationResult(succeeded_paths=[], failed_paths=[], success_count=0, failure_count=len(object_paths))
+
+    async def apply_mip_labels(self, 
+                             objects_with_labels: List[Tuple[str, str]],
+                             context: Dict[str, Any]) -> RemediationResult:
+        """Applies MIP labels. Not implemented for SMBConnector."""
+        self.logger.warning(
+            "The 'apply_mip_labels' method is not implemented for the SMBConnector. No action will be taken.", 
+            **context
+        )
+        return RemediationResult(succeeded_paths=[], failed_paths=[], success_count=0, failure_count=len(objects_with_labels))
 
     # =============================================================================
     # Async IFileDataSourceConnector Interface Implementation
@@ -479,28 +516,37 @@ class SMBConnector(IFileDataSourceConnector):
                 directory_path=directory_path
             )
 
+
+
     async def get_object_content(self, work_packet: WorkPacket) -> AsyncIterator[ContentComponent]:
         """Get content components for classification - async interface method"""
         
-        # Extract object IDs from work packet
-        object_ids = work_packet.payload.object_ids
+        # --- FIX STARTS HERE ---
+
+        # 1. Access the correct attribute: 'discovered_objects'
+        discovered_objects = work_packet.payload.discovered_objects
         
         self.logger.info("Starting SMB content extraction",
                         task_id=work_packet.header.task_id,
-                        object_count=len(object_ids))
+                        object_count=len(discovered_objects))
         
-        # Ensure connection is established
-        if not self.smb_connection or not self.smb_connection.is_connected():
-            await self._ensure_connection_async()
-        
-        # Process each object ID
-        for object_id in object_ids:
+        # 2. Loop through the list of DiscoveredObject models
+        for discovered_obj in discovered_objects:
             try:
-                # Extract file path from object ID
-                file_path = self._extract_path_from_object_id(object_id)
+                # --- FIX: Add a check to ensure we only process files ---
+                if discovered_obj.object_type != ObjectType.FILE:
+                    self.logger.info(
+                        f"Skipping content extraction for non-file object: {discovered_obj.object_path}",
+                        object_path=discovered_obj.object_path,
+                        object_type=discovered_obj.object_type.value
+                    )
+                    continue
+                # --- END FIX ---                
+                # 3. Use the object_path from each object
+                file_path = discovered_obj.object_path
                 
                 if not file_path:
-                    self.logger.warning("Invalid object ID format", object_id=object_id)
+                    self.logger.warning("Discovered object is missing a file path", object_hash=discovered_obj.object_key_hash.hex())
                     continue
                 
                 # Download file to temp location (async)
@@ -510,13 +556,14 @@ class SMBConnector(IFileDataSourceConnector):
                     continue
                 
                 try:
-                    # Use ContentExtractor to process the downloaded file (ASYNC)
+                    # Use ContentExtractor to process the downloaded file
+                    # We can use the file_path as the unique object_id for extraction
                     async for component in self.content_extractor.extract_from_file(
                         temp_file_path, 
-                        object_id,
-                        work_packet.header.trace_id,  # job_id
-                        work_packet.header.task_id,   # task_id  
-                        self.datasource_id            # datasource_id
+                        file_path, # Use path as the object_id
+                        work_packet.header.job_id,
+                        work_packet.header.task_id,  
+                        self.datasource_id
                     ):
                         # Add SMB-specific metadata to components
                         if not hasattr(component, 'metadata') or component.metadata is None:
@@ -524,8 +571,8 @@ class SMBConnector(IFileDataSourceConnector):
                         
                         component.metadata.update({
                             "smb_source_path": file_path,
-                            "smb_server": self.smb_config.get('host'),
-                            "smb_share": self.smb_config.get('share_name'),
+                            "smb_server": self.smb_config.get('connection', {}).get('host'),
+                            "smb_share": self.smb_config.get('connection', {}).get('share_or_bucket'),
                             "downloaded_for_processing": True
                         })
                         
@@ -535,21 +582,21 @@ class SMBConnector(IFileDataSourceConnector):
                     # Clean up temp file (async)
                     if self.extraction_config.features.cleanup_temp_files:
                         await self._cleanup_temp_file_async(temp_file_path)
-                    
+            
             except Exception as e:
                 error = self.error_handler.handle_error(
-                    e, f"smb_content_extraction_{object_id}",
+                    e, f"smb_content_extraction_{discovered_obj.object_path}",
                     operation="get_object_content",
-                    object_id=object_id,
+                    object_path=discovered_obj.object_path,
                     task_id=work_packet.header.task_id
                 )
-                self.logger.warning("SMB content extraction failed", 
-                                   error_id=error.error_id, object_id=object_id)
+                self.logger.warning("SMB content extraction for a single object failed", 
+                                   error_id=error.error_id, object_path=discovered_obj.object_path)
                 
-                # Yield error component
-                yield self._create_extraction_error_component(object_id, str(e))
-
-
+                # Yield error component and continue to the next object
+                yield self._create_extraction_error_component(discovered_obj.object_path, str(e))
+        
+        # --- FIX ENDS HERE ---
 
 
     # =============================================================================
@@ -816,9 +863,8 @@ class SMBConnector(IFileDataSourceConnector):
             loop = asyncio.get_event_loop()
             
             def _download_file():
-                """Download file synchronously (in thread pool)"""
+                """Download file synchronously in chunks to respect server read limits."""
                 try:
-                    # Open file for reading
                     file_handle = Open(self.smb_connection.tree, normalized_path)
                     file_handle.create(
                         ImpersonationLevel.Impersonation,
@@ -829,32 +875,36 @@ class SMBConnector(IFileDataSourceConnector):
                         CreateOptions.FILE_NON_DIRECTORY_FILE
                     )
                     
-                    # Read content with size limit
-                    content = file_handle.read(0, self.max_file_size_bytes)
-                    file_handle.close()
+                    # --- CORRECTED CHUNKED DOWNLOAD LOGIC ---
+                    actual_file_size = file_handle.end_of_file
+                    size_to_download = min(actual_file_size, self.max_file_size_bytes)
                     
+                    # Use a safe, fixed chunk size (1MB) that is well below the server's 8MB limit.
+                    CHUNK_SIZE_BYTES = 1 * 1024 * 1024
+                    
+                    data_chunks = []
+                    bytes_read = 0
+                    while bytes_read < size_to_download:
+                        chunk = file_handle.read(offset=bytes_read, length=CHUNK_SIZE_BYTES)
+                        if not chunk:
+                            break # End of file reached
+                        
+                        data_chunks.append(chunk)
+                        bytes_read += len(chunk)
+                        
+                    content = b"".join(data_chunks)
+                    # --- END CORRECTION ---
+
+                    file_handle.close()
                     return content
                     
                 except SMBException as e:
                     if "STATUS_ACCESS_DENIED" in str(e):
-                        raise RightsError(
-                            f"Access denied reading file: {file_path}",
-                            ErrorType.RIGHTS_ACCESS_DENIED,
-                            resource=file_path
-                        )
+                        raise RightsError(f"Access denied reading file: {file_path}", ErrorType.RIGHTS_ACCESS_DENIED)
                     elif "STATUS_OBJECT_NAME_NOT_FOUND" in str(e):
-                        raise ProcessingError(
-                            f"File not found: {file_path}",
-                            ErrorType.PROCESSING_RESOURCE_NOT_FOUND,
-                            resource=file_path
-                        )
+                        raise ProcessingError(f"File not found: {file_path}", ErrorType.PROCESSING_RESOURCE_NOT_FOUND)
                     else:
-                        raise NetworkError(
-                            f"SMB file read failed: {str(e)}",
-                            ErrorType.NETWORK_SMB_ERROR,
-                            path=file_path
-                        )
-            
+                        raise NetworkError(f"SMB file read failed: {str(e)}", ErrorType.NETWORK_SMB_ERROR, path=file_path)            
             # Download file content asynchronously
             content = await loop.run_in_executor(None, _download_file)
             
@@ -871,8 +921,14 @@ class SMBConnector(IFileDataSourceConnector):
             return temp_file_path
             
         except Exception as e:
-            self.logger.error("File download failed",
-                             file_path=file_path, error=str(e))
+            # This will now log the specific error type (e.g., RightsError) and the full traceback.
+            self.logger.error(
+                "File download failed",
+                file_path=file_path,
+                error_type=type(e).__name__,
+                error_message=str(e),
+                exc_info=True # Adds the full traceback to the log for detailed debugging
+            )
             return None
 
     async def _cleanup_temp_file_async(self, temp_file_path: str):
@@ -901,7 +957,7 @@ class SMBConnector(IFileDataSourceConnector):
     # Async Connection Management
     # =============================================================================
 
-    async def _ensure_connection_async(self):
+    async def _ensure_connection_async(self, trace_id: str, task_id: str):
         """
         Ensures a connection is established by fetching credentials
         and connecting on the first call.
@@ -1060,25 +1116,17 @@ class SMBConnector(IFileDataSourceConnector):
     # Async Detailed Metadata Collection
     # =============================================================================
 
-    def get_object_details(self, work_packet: WorkPacket) -> List[Dict[str, Any]]:
+
+    async def get_object_details(self, work_packet: WorkPacket) -> List[ObjectMetadata]:
         """
-        Get detailed metadata for objects including security information.
-        Returns list of dicts compatible with ObjectMetadata model structure.
-        
-        This is a sync wrapper that handles the async operation properly.
+        Gets detailed metadata for objects. This is now a proper async method.
         """
+        # The payload contains the full DiscoveredObject models
         discovered_objects = work_packet.payload.discovered_objects
-        results = []
         
-        # Run async operation in event loop
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # If called from async context, create task
-            future = asyncio.ensure_future(self._get_details_batch_async(discovered_objects))
-            # This will block until complete - not ideal but maintains sync interface
-            results = loop.run_until_complete(future)
-        else:
-            results = loop.run_until_complete(self._get_details_batch_async(discovered_objects))
+        # Simply await the async helper method directly.
+        # There is no need for any complex event loop management.
+        results = await self._get_details_batch_async(discovered_objects)
         
         return results
 
@@ -1096,12 +1144,14 @@ class SMBConnector(IFileDataSourceConnector):
                 )
                 
                 # Construct result in ObjectMetadata-compatible format
-                result = {
-                    "base_object": obj.dict(),
-                    "detailed_metadata": detailed_metadata,
-                    "metadata_fetch_timestamp": datetime.now(timezone.utc).isoformat()
-                }
-                results.append(result)
+                # This creates the actual Pydantic ObjectMetadata object
+                # instead of a plain dictionary.
+                metadata_obj = ObjectMetadata(
+                    base_object=obj,
+                    detailed_metadata=detailed_metadata
+                )
+                results.append(metadata_obj)
+                
                 
             except Exception as e:
                 self.logger.warning(

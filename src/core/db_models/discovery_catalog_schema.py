@@ -63,6 +63,10 @@ class ObjectMetadata(Base):
     # (e.g., file permissions, table schema, field statistics).
     detailed_metadata: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
 
+    # A single JSON column to flexibly store type-specific discovered object
+    # (e.g., file permissions, table schema, field statistics).
+    base_object: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=True)
+
     # System timestamp for when the detailed metadata was last fetched or updated
     metadata_fetch_timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), 

@@ -984,14 +984,15 @@ class DatabaseInterface:
             raise
 
 
+
     async def upsert_object_metadata(
         self,
-        records: List[Dict[str, Any]],
+        records: List[Any],  # Expects a list of Pydantic ObjectMetadata models
         context: Optional[Dict[str, Any]] = None
     ) -> None:
         """
-        Performs a bulk-safe "upsert" on the ObjectMetadata table. It either inserts
-        new records or updates existing ones using object_key_hash as the primary key.
+        Performs a bulk-safe "upsert" on the ObjectMetadata table using the SQL Server
+        MERGE statement via a temporary table.
         """
         context = context or {}
         if not records:
@@ -999,25 +1000,56 @@ class DatabaseInterface:
             
         self.logger.log_database_operation("UPSERT", "ObjectMetadata", "STARTED", record_count=len(records), **context)
         
+        # 1. Prepare the data for bulk insertion
+        processed_records = []
+        for pydantic_obj in records:
+            processed_records.append({
+                "object_key_hash": pydantic_obj.object_key_hash,
+                "base_object": json.dumps(pydantic_obj.base_object),
+                "detailed_metadata": json.dumps(pydantic_obj.detailed_metadata), # Serialize the JSON part
+                "metadata_fetch_timestamp": pydantic_obj.metadata_fetch_timestamp
+            })
+
         try:
             async with self.get_async_session() as session:
-                # This uses a PostgreSQL-specific "INSERT ... ON CONFLICT DO UPDATE"
-                # for a highly efficient and atomic bulk upsert operation.
-                stmt = pg_insert(ObjectMetadata).values(records)
                 
-                # Define what to do if the object_key_hash already exists
-                update_dict = {
-                    col.name: getattr(stmt.excluded, col.name)
-                    for col in ObjectMetadata.__table__.columns
-                    if not col.primary_key
-                }
+                def sync_merge(sync_session):
+                    # Use a session-local temporary table for the MERGE source
+                    temp_table_name = f"#metadata_upsert_{int(time.time() * 1000)}"
+                    
+                    # Create the temp table
+                    sync_session.execute(text(f"""
+                    CREATE TABLE {temp_table_name} (
+                        object_key_hash VARBINARY(32) PRIMARY KEY,
+                        detailed_metadata NVARCHAR(MAX),
+                        metadata_fetch_timestamp DATETIME2
+                    )
+                    """))
 
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=['object_key_hash'],  # Changed: Use hash-based primary key
-                    set_=update_dict
-                )
+                    # Bulk insert the processed data into the temp table
+                    if processed_records:
+                        insert_sql = text(f"""
+                        INSERT INTO {temp_table_name} (object_key_hash, detailed_metadata, metadata_fetch_timestamp)
+                        VALUES (:object_key_hash, :detailed_metadata, :metadata_fetch_timestamp)
+                        """)
+                        sync_session.execute(insert_sql, processed_records)
+
+                    # Execute the MERGE statement
+                    merge_sql = text(f"""
+                    MERGE object_metadata AS target
+                    USING {temp_table_name} AS source
+                    ON target.object_key_hash = source.object_key_hash
+                    WHEN MATCHED THEN
+                        UPDATE SET
+                            detailed_metadata = source.detailed_metadata,
+                            metadata_fetch_timestamp = source.metadata_fetch_timestamp
+                    WHEN NOT MATCHED THEN
+                        INSERT (object_key_hash, detailed_metadata, metadata_fetch_timestamp)
+                        VALUES (source.object_key_hash, source.detailed_metadata, source.metadata_fetch_timestamp);
+                    """)
+                    sync_session.execute(merge_sql)
                 
-                await session.execute(stmt)
+                await session.run_sync(sync_merge)
                 await session.commit()
                 
             self.logger.log_database_operation("UPSERT", "ObjectMetadata", "SUCCESS", record_count=len(records), **context)
@@ -1189,6 +1221,42 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, context="get_datasource_configuration", 
                                           datasource_id=datasource_id, **context)
             raise
+
+# In src/core/db/database_interface.py, inside the DatabaseInterface class
+
+    async def get_credential_by_id_async(self, credential_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[Credential]:
+        """
+        Fetches a single credential record by its unique string ID.
+        """
+        context = context or {}
+        self.logger.log_database_operation(
+            "SELECT", "Credentials", "STARTED",
+            operation="get_by_id",
+            credential_id=credential_id,
+            **context
+        )
+        try:
+            async with self.get_async_session() as session:
+                stmt = select(Credential).where(Credential.credential_id == credential_id)
+                result = await session.scalars(stmt)
+                credential = result.one_or_none()
+
+                self.logger.log_database_operation(
+                    "SELECT", "Credentials", "SUCCESS",
+                    operation="get_by_id",
+                    found=(credential is not None),
+                    **context
+                )
+                return credential
+        except Exception as e:
+            self.error_handler.handle_error(
+                e,
+                context="get_credential_by_id_async",
+                credential_id=credential_id,
+                **context
+            )
+            raise
+
 
     async def get_credential_for_datasource(self, datasource_id: str, context: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """Get credential information for a datasource."""
@@ -1438,7 +1506,6 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, context="get_objects_by_datasource", 
                                           datasource_id=datasource_id, **context)
             raise
-
 
     async def insert_discovered_object_batch(self, objects: List[Dict[str, Any]], 
                                          staging_table_name: str,
