@@ -31,10 +31,11 @@ from core.utils.hash_utils import generate_task_id
 # =============================================================================
 
 # Choose which datasource to test. The script will run the full workflow for it.
-TEST_DATASOURCE_ID: str = "ds_smb_finance_dept"  # Options: "ds_local_test_files", "ds_smb_finance_dept", "ds_sql_localhost"
+TEST_DATASOURCE_ID: str = "ds_local_test_files"  # Options: "ds_local_test_files", "ds_smb_finance_dept", "ds_sql_localhost"
 
 # --- Static Configuration (values from your request) ---
-CLASSIFIER_TEMPLATE_ID: str = "general_corporate_v1.0"
+#CLASSIFIER_TEMPLATE_ID: str = "general_corporate_v1.0"
+CLASSIFIER_TEMPLATE_ID: str = "unstructured"
 CONFIG_FILE_PATH: str = "config/system_default.yaml"
 MOCK_JOB_ID: int = 83
 

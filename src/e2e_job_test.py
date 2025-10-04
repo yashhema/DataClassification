@@ -33,7 +33,7 @@ from core.models.models import WorkPacket
 # TEST CONFIGURATION
 # =============================================================================
 
-TEST_DATASOURCE_ID: str = "ds_smb_finance_dept"  # Options: "ds_local_test_files", "ds_smb_finance_dept", "ds_sql_localhost"
+TEST_DATASOURCE_ID: str = "ds_local_test_files"  # Options: "ds_local_test_files", "ds_smb_finance_dept", "ds_sql_localhost"
 
 GROUND_TRUTH_CONFIG = {
     "ds_sql_localhost": {
@@ -50,7 +50,8 @@ GROUND_TRUTH_CONFIG = {
     }
 }
 
-CLASSIFIER_TEMPLATE_ID: str = "general_corporate_v1.0"
+#CLASSIFIER_TEMPLATE_ID: str = "general_corporate_v1.0"
+CLASSIFIER_TEMPLATE_ID: str = "unstructured"
 CONFIG_FILE_PATH: str = "config/system_default.yaml"
 MOCK_JOB_ID: int = 999
 

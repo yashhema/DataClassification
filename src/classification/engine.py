@@ -3,9 +3,21 @@ Enhanced Microsoft Presidio with a full post-processing pipeline to
 dynamically apply all database-driven classifier rules.
 """
 
-import re
+import sys
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 import threading
 from typing import List, Dict, Any, Optional
+
+try:
+    import regex as re
+    REGEX_MODULE = True
+    print("✓ Using 'regex' module (Presidio-compatible)")
+except ImportError:
+    import re
+    REGEX_MODULE = False
+    print("⚠️  WARNING: Using standard 're' module - install 'regex' for full compatibility!")
+    print("   Run: pip install regex")
 
 try:
     from presidio_analyzer import AnalyzerEngine, PatternRecognizer, Pattern
@@ -64,13 +76,13 @@ class ClassificationEngine:
                                 print(f"  Pattern regex repr: {repr(pattern.regex)}")
                                 
                                 # Test the pattern directly
-                                import re
+                                
                                 test_data = "CCNO:5234792011936522 | SSN:574-18-0576 | EMAIL:PATSY_AAMODT@AOL.COM | PHONE:907-236-2793"
                                 try:
                                     matches = re.findall(pattern.regex, test_data)
                                     print(f"  Direct regex test on sample data: {matches}")
                                 except Exception as e:
-                                    print(f"  Regex error: {e}")                            
+                                    print(f"Hello Why are throwing error  Regex error: {e}")                            
                 
                 self.analyzer = AnalyzerEngine(nlp_engine=nlp_engine, registry=registry)
                 self._initialized = True
