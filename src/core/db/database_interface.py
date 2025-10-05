@@ -33,6 +33,8 @@ from ..db_models.discovery_catalog_schema import DiscoveredObjectClassificationD
 from ..db_models.findings_schema import ScanFindingSummary
 from ..db_models.system_parameters_schema import SystemParameter
 from ..db_models.datasource_schema import NodeGroup, DataSource,DataSourceMetadata
+from ..db_models.compliance_schemas import OverrideGroup, QuerySet, Query
+from ..db_models.association_tables import DatasourceToOverrideGroupLink
 from ..db_models.connector_config_schema import ConnectorConfiguration
 from ..db_models.calendar_schema import Calendar
 from ..db_models.job_schema import JobStatus, ScanTemplate, JobType

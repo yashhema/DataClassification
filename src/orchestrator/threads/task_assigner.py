@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 from orchestrator.orchestrator_state import JobState
 
 from core.db_models.job_schema import JobType
-from core.models.models import TaskType, PolicySelectorPlanPayload, PolicyConfiguration, WorkPacketHeader, TaskConfig, WorkPacket, DiscoveryEnumeratePayload
+from core.models.models import TaskType, PolicySelectorPlanPayload, PolicyConfiguration, WorkPacketHeader, TaskConfig, WorkPacket, DiscoveryEnumeratePayload,BenchmarkExecutePayload,EntitlementExtractPayload
 from core.errors import ErrorCategory
 from core.utils.hash_utils import generate_task_id
 
@@ -153,7 +153,7 @@ class TaskAssigner:
                     staging_table_name=staging_table
                 )
                 task_type = TaskType.DISCOVERY_ENUMERATE
-            if job_to_claim.template_type == JobType.DB_PROFILE:
+            elif job_to_claim.template_type == JobType.DB_PROFILE:
                 task_type = TaskType.DATASOURCE_PROFILE
                 payload = DatasourceProfilePayload(datasource_id=datasource_id)
 
@@ -165,8 +165,8 @@ class TaskAssigner:
 
                 payload = BenchmarkExecutePayload(
                     datasource_id=datasource_id,
-                    cycle_id=job_config.get("cycle_id"),
-                    benchmark_name=job_config.get("benchmark_name"),
+                    cycle_id=job_to_claim.get("cycle_id"),
+                    benchmark_name=job_to_claim.get("benchmark_name"),
                     
                 )
 

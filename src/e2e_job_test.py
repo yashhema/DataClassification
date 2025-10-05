@@ -33,7 +33,7 @@ from core.models.models import WorkPacket
 # TEST CONFIGURATION
 # =============================================================================
 
-TEST_DATASOURCE_ID: str = "ds_local_test_files"  # Options: "ds_local_test_files", "ds_smb_finance_dept", "ds_sql_localhost"
+TEST_DATASOURCE_ID: str = "ds_sql_localhost"  # Options: "ds_local_test_files", "ds_smb_finance_dept", "ds_sql_localhost"
 
 GROUND_TRUTH_CONFIG = {
     "ds_sql_localhost": {
@@ -50,8 +50,8 @@ GROUND_TRUTH_CONFIG = {
     }
 }
 
-#CLASSIFIER_TEMPLATE_ID: str = "general_corporate_v1.0"
-CLASSIFIER_TEMPLATE_ID: str = "unstructured"
+CLASSIFIER_TEMPLATE_ID: str = "general_corporate_v1.0"
+#CLASSIFIER_TEMPLATE_ID: str = "unstructured"
 CONFIG_FILE_PATH: str = "config/system_default.yaml"
 MOCK_JOB_ID: int = 999
 
@@ -131,6 +131,7 @@ async def run_job_simulation():
                 root_logger.removeHandler(handler)
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(JsonFormatter())
+        #console_handler.setFormatter()
         root_logger.addHandler(console_handler)
         root_logger.setLevel(logging.ERROR)
         
@@ -392,9 +393,9 @@ async def setup_test_job(job_id: int, datasource_id: str, orchestrator, db: Data
             template_type=JobType.SCANNING,
             status=JobStatus.QUEUED,
             trigger_type='e2e_test',  # CORRECTED: Added missing required field
-            orchestrator_id=orchestrator.instance_id,
+            #orchestrator_id=orchestrator.instance_id,
             node_group=orchestrator.settings.system.node_group,
-            orchestrator_lease_expiry=datetime.now(timezone.utc) + timedelta(hours=2),  # CORRECTED: Renamed field
+            #orchestrator_lease_expiry=datetime.now(timezone.utc) + timedelta(hours=2),  # CORRECTED: Renamed field
             configuration={
                 'datasource_targets': [{'datasource_id': datasource_id}],
                 'classifier_template_id': CLASSIFIER_TEMPLATE_ID,

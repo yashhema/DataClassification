@@ -7,13 +7,13 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any
 
 from sqlalchemy import (
-    String, ForeignKey, JSON
+    String, ForeignKey, JSON,Integer
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base
 
-from sqlalchemy.dialects.mssql import NVARCHAR, DATETIMEOFFSET
+from sqlalchemy.dialects.mssql import NVARCHAR,VARCHAR, DATETIMEOFFSET
 from typing import TYPE_CHECKING
 from .association_tables import DataSourceTagLink, DatasourceToOverrideGroupLink
 if TYPE_CHECKING:

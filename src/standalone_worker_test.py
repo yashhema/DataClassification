@@ -5,6 +5,7 @@ import json
 from typing import List, Any, Optional, Dict
 
 # --- Core Component Imports ---
+
 from core.config.configuration_manager import ConfigurationManager
 from core.db.database_interface import DatabaseInterface
 from core.errors import ErrorHandler
@@ -30,10 +31,10 @@ from core.utils.hash_utils import generate_task_id
 # =============================================================================
 
 # Choose which datasource to test.
-TEST_DATASOURCE_ID: str = "ds_sql_localhost" # Options: "ds_local_test_files", "ds_smb_finance_dept", "ds_sql_localhost"
+TEST_DATASOURCE_ID: str = "ds_local_test_files" # Options: "ds_local_test_files", "ds_smb_finance_dept", "ds_sql_localhost"
 
 # Choose which task type to simulate for the worker.
-TEST_TASK_TYPE: TaskType = TaskType.CLASSIFICATION # Options: TaskType.DISCOVERY_ENUMERATE, TaskType.CLASSIFICATION, TaskType.DISCOVERY_GET_DETAILS
+TEST_TASK_TYPE: TaskType = TaskType.DISCOVERY_ENUMERATE # Options: TaskType.DISCOVERY_ENUMERATE, TaskType.CLASSIFICATION, TaskType.DISCOVERY_GET_DETAILS
 
 # --- Static Configuration ---
 CLASSIFIER_TEMPLATE_ID: str = "general_corporate_v1.0"
@@ -75,6 +76,7 @@ async def run_worker_simulation():
         root_logger.setLevel(logging.INFO)
         error_handler = ErrorHandler()
         config_manager = ConfigurationManager(CONFIG_FILE_PATH)
+        
         mock_ambient_context = {"component_name": "StandaloneWorkerTest", "machine_name": "test_host", "node_group": "default", "deployment_model": "single_process"}
         logger = SystemLogger(logging.getLogger(__name__), "TEXT", mock_ambient_context)
         config_manager.set_core_services(logger, error_handler)

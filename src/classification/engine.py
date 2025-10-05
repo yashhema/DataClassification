@@ -72,23 +72,23 @@ class ClassificationEngine:
                         if recognizer:
                             registry.add_recognizer(recognizer)
                             for pattern in recognizer.patterns:
-                                print(f"  Presidio Pattern: name='{pattern.name}', regex='{pattern.regex}', score={pattern.score}")
-                                print(f"  Pattern regex repr: {repr(pattern.regex)}")
+                                #print(f"  Presidio Pattern: name='{pattern.name}', regex='{pattern.regex}', #score={pattern.score}")
+                                #print(f"  Pattern regex repr: {repr(pattern.regex)}")
                                 
                                 # Test the pattern directly
                                 
                                 test_data = "CCNO:5234792011936522 | SSN:574-18-0576 | EMAIL:PATSY_AAMODT@AOL.COM | PHONE:907-236-2793"
                                 try:
                                     matches = re.findall(pattern.regex, test_data)
-                                    print(f"  Direct regex test on sample data: {matches}")
+                                    #print(f"  Direct regex test on sample data: {matches}")
                                 except Exception as e:
                                     print(f"Hello Why are throwing error  Regex error: {e}")                            
                 
                 self.analyzer = AnalyzerEngine(nlp_engine=nlp_engine, registry=registry)
                 self._initialized = True
                 print("Loaded recognizers:")
-                for recognizer in self.analyzer.registry.recognizers:
-                    print(f"  - {recognizer.name}: {recognizer.supported_entities}")              
+                #for recognizer in self.analyzer.registry.recognizers:
+                #    print(f"  - {recognizer.name}: {recognizer.supported_entities}")              
             except Exception as e:
                 raise self.error_handler.handle_error(e, "presidio_initialization")
 
@@ -109,7 +109,7 @@ class ClassificationEngine:
                 context=support_keywords,
                 name=config['classifier_id']
             )
-            print(f"SUCCESS: Created recognizer for {config['classifier_id']} with {len(patterns)} patterns and {len(support_keywords)} context rules")
+            #print(f"SUCCESS: Created recognizer for {config['classifier_id']} with {len(patterns)} patterns #and {len(support_keywords)} context rules")
             return recognizer
             
         except Exception as e:
@@ -135,13 +135,13 @@ class ClassificationEngine:
 
                 # 1. Get initial raw findings from Presidio
                 raw_results = self.analyzer.analyze(text=content, entities=entity_types, language='en')
-                for i, result in enumerate(raw_results):
-                    print(f"Result {i}: {result.entity_type}")
-                    print(f"  analysis_explanation: {result.analysis_explanation}")
-                    print(f"  recognition_metadata: {getattr(result, 'recognition_metadata', 'Not present')}")
-                    print(f"  hasattr analysis_explanation: {hasattr(result, 'analysis_explanation')}")
-                    if hasattr(result, 'analysis_explanation') and result.analysis_explanation:
-                        print(f"  recognizer: {result.analysis_explanation.recognizer}")                
+                #for i, result in enumerate(raw_results):
+                #    print(f"Result {i}: {result.entity_type}")
+                    #print(f"  analysis_explanation: {result.analysis_explanation}")
+                    #print(f"  recognition_metadata: {getattr(result, 'recognition_metadata', 'Not present')}")
+                    #print(f"  hasattr analysis_explanation: {hasattr(result, 'analysis_explanation')}")
+                    #if hasattr(result, 'analysis_explanation') and result.analysis_explanation:
+                    #    print(f"  recognizer: {result.analysis_explanation.recognizer}")                
                 print(f"CRITICAL DEBUG: Presidio returned {len(raw_results)} results in real app")
                 # 2. Run the post-processing pipeline
                 processed_findings = []
@@ -156,11 +156,11 @@ class ClassificationEngine:
                         print(f"  CONTINUE: No recognizer name found for {result.entity_type}")
                         continue
 
-                    print(f"  Recognizer name from metadata: {recognizer_name}")
+                    #print(f"  Recognizer name from metadata: {recognizer_name}")
                     
                     classifier_config = self.classifier_configs.get(recognizer_name)
                     if not classifier_config:
-                        print(f"  CONTINUE: No classifier config found for recognizer: {recognizer_name}")
+                        #print(f"  CONTINUE: No classifier config found for recognizer: {recognizer_name}")
                         continue
 
                     
@@ -169,18 +169,18 @@ class ClassificationEngine:
                     
                     # The pipeline: if any check fails, the finding is discarded.
                     if not self._check_negative_support(result, content, classifier_config):
-                        print(f"  CONTINUE: Failed negative support check for {result.entity_type}")
+                        #print(f"  CONTINUE: Failed negative support check for {result.entity_type}")
                         continue
                         
                     if not self._check_validations(result, content, classifier_config):
-                        print(f"  CONTINUE: Failed validation check for {result.entity_type}")
+                        #print(f"  CONTINUE: Failed validation check for {result.entity_type}")
                         continue
                         
                     if not self._check_exclude_list(result, content, classifier_config):
-                        print(f"  CONTINUE: Failed exclude list check for {result.entity_type}")
+                        #print(f"  CONTINUE: Failed exclude list check for {result.entity_type}")
                         continue
                     
-                    print(f"  SUCCESS: All checks passed for {result.entity_type}")
+                    #print(f"  SUCCESS: All checks passed for {result.entity_type}")
 
                     # 3. If all checks pass, create the final PIIFinding object
                     finding = PIIFinding(

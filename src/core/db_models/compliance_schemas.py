@@ -7,7 +7,7 @@ from sqlalchemy import (
     UniqueConstraint, Text
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy.dialects.mssql import NVARCHAR, DATETIMEOFFSET
+from sqlalchemy.dialects.mssql import NVARCHAR, VARCHAR,DATETIMEOFFSET
 from .association_tables import DatasourceToOverrideGroupLink
 from typing import TYPE_CHECKING  # ADDED
 if TYPE_CHECKING:

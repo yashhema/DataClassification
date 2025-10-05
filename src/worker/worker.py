@@ -37,7 +37,7 @@ from core.models.models import (
     PolicySelectorExecutePayload,
     PolicyActionExecutePayload,
     PolicyCommitPlanPayload,
-    PolicyReconcilePayload,RemediationResult,ClassificationPayload
+    PolicyReconcilePayload,RemediationResult,ClassificationPayload,SystemProfile
 )
 from .search_provider import create_search_provider
 from core.db_models.remediation_ledger_schema import LedgerStatus
