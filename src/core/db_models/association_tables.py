@@ -32,3 +32,12 @@ DataSourceTagLink = Table(
     Column("tag_id", Integer, ForeignKey("tags.id"), primary_key=True),
     extend_existing=True 
 )
+
+# Links DataSource and OverrideGroup models
+DatasourceToOverrideGroupLink = Table(
+    "datasource_to_override_group_link",
+    Base.metadata,
+    Column("datasource_id", String(255), ForeignKey("datasources.datasource_id"), primary_key=True),
+    Column("override_group_id", Integer, ForeignKey("override_groups.id"), primary_key=True),
+    extend_existing=True
+)

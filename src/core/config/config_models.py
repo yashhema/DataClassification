@@ -119,20 +119,22 @@ class DataClassificationProfile(BaseProfile):
 
 class EntitlementProfile(BaseProfile):
     """Defines a scan for analyzing user permissions and entitlements."""
-    profile_type: Literal["entitlement"]
-    # A list of query names from the ConnectorConfiguration to execute
-    entitlement_query_names: List[str] = ["server_roles", "object_permissions"]
-    target_users: List[str] = Field(default_factory=list, description="If not empty, limits scan to these users.")
-    target_roles: List[str] = Field(default_factory=list, description="If not empty, limits scan to these roles.")
+    profile_type: Literal["entitlement"] = "entitlement"
+    # Flag to enable/disable saving of raw, untransformed connector output
+    save_raw_data: bool = Field(False, description="If true, saves the raw connector output for audit.")
 
 class BenchmarkProfile(BaseProfile):
     """Defines a scan for checking system configuration against a security benchmark."""
-    profile_type: Literal["benchmark"]
-    benchmark_name: str = Field(..., description="The name of the benchmark to use (e.g., 'CIS_SQL_SERVER_v1.5').")
-    # The benchmark queries will be stored in the ConnectorConfiguration
+    profile_type: Literal["benchmark"] = "benchmark"
+    # The name of the benchmark to use (e.g., 'CIS_SQL_SERVER_v1.5')
+    benchmark_name: str = Field(..., description="The name of the benchmark query set to execute.")
 
-# A union of all possible profile types
-ScanProfile = Annotated[Union[DataClassificationProfile, EntitlementProfile, BenchmarkProfile], Field(discriminator="profile_type")]
+
+# The union is updated to include the new profile types
+ScanProfile = Annotated[
+    Union[DataClassificationProfile, EntitlementProfile, BenchmarkProfile],
+    Field(discriminator="profile_type")
+]
 
 # --- Helper models for the DataClassificationProfile ---
 

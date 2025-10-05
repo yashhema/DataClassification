@@ -28,12 +28,13 @@ except ImportError as e:
     raise ImportError("SQL Server datasource requires sqlalchemy[asyncio]: pip install 'sqlalchemy[asyncio]' aiodbc") from e
 
 # Core system imports
-from core.interfaces.worker_interfaces import IDatabaseDataSourceConnector
-from core.models.models import WorkPacket, DiscoveredObject, ObjectMetadata,ObjectType,DiscoveryGetDetailsPayload,ClassificationPayload,BoundaryType, DiscoveryBatch
+from core.interfaces.worker_interfaces import IDatabaseDataSourceConnector,IComplianceConnector
+from core.models.models import WorkPacket, DiscoveredObject, ObjectMetadata,ObjectType,DiscoveryGetDetailsPayload,ClassificationPayload,BoundaryType, DiscoveryBatch,SystemProfile, SQLServerProfileExtension
 from core.logging.system_logger import SystemLogger
 from core.errors import ErrorHandler, NetworkError, RightsError, ProcessingError, ConfigurationError, ErrorType
 from core.db.database_interface import DatabaseInterface
 from core.utils.hash_utils import generate_object_key_hash
+
 
 
 class AsyncSQLServerConnection:
@@ -215,7 +216,7 @@ class AsyncSQLServerConnection:
         return self.async_session_factory()
 
 
-class SQLServerConnector(IDatabaseDataSourceConnector):
+class SQLServerConnector(IDatabaseDataSourceConnector, IComplianceConnector):
     """
     SQL Server connector implementing async IDatabaseDataSourceConnector interface.
     Integrates with async database operations and logging systems.
@@ -253,6 +254,81 @@ class SQLServerConnector(IDatabaseDataSourceConnector):
             "trace_id": work_packet.header.trace_id,
         }
     # --- END OF ADDITION ---
+
+
+    async def get_system_profile(self) -> SystemProfile:
+        """
+        Executes queries against SQL Server to discover its precise version,
+        edition, patch level, and other key identifiers.
+        """
+        context = {"datasource_id": self.datasource_id}
+        self.logger.info("Fetching system profile for SQL Server.", **context)
+        
+        # This query is designed to be run from the 'master' database context
+        query = await self._get_discovery_query("system_profile")
+        
+        results = await self.connection.execute_query_async(query)
+        if not results:
+            raise ProcessingError("System profile query returned no results.", context=context)
+
+        profile_data = results[0]
+        raw_version = profile_data.get('ProductVersion')
+        
+        normalized_version, version_parts = self._normalize_version(raw_version)
+
+        vendor_details = SQLServerProfileExtension(
+            edition=profile_data.get('Edition'),
+            engine_edition=profile_data.get('EngineEdition'),
+            host_platform=profile_data.get('HostPlatform'),
+            product_level=profile_data.get('ProductLevel'),
+            collation=profile_data.get('ServerCollation'),
+            is_clustered=bool(profile_data.get('IsClustered')),
+            is_hadr_enabled=bool(profile_data.get('IsHadrEnabled')),
+            compatibility_level=profile_data.get('CompatibilityLevel')
+        )
+        
+        # Assuming a self-managed model for now. This could be enhanced later
+        # by checking for specific cloud provider metadata.
+        deployment_model = "SELF_MANAGED"
+        if "azure" in profile_data.get('Edition', '').lower():
+            deployment_model = "CLOUD_MANAGED"
+
+        return SystemProfile(
+            product_name="sqlserver",
+            full_version=raw_version,
+            normalized_version=normalized_version,
+            version_parts=version_parts,
+            patch_identifier=profile_data.get('ProductLevel'),
+            # Release date is not easily available via SQL, would require a lookup table
+            release_date=None,
+            deployment_model=deployment_model,
+            vendor_specific_details=vendor_details
+        )
+
+    def _normalize_version(self, version_string: str) -> tuple[str, dict]:
+        """
+        Normalizes a SQL Server version string into a zero-padded format
+        and a structured dictionary.
+        Example: "15.0.4280.7" -> ("015.000.04280.007", {"major": 15, ...})
+        """
+        parts = version_string.split('.')
+        
+        major = int(parts[0]) if len(parts) > 0 else 0
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        build = int(parts[2]) if len(parts) > 2 else 0
+        revision = int(parts[3]) if len(parts) > 3 else 0
+
+        version_parts_dict = {
+            "major": major,
+            "minor": minor,
+            "build": build,
+            "revision": revision
+        }
+
+        # Format: 3-digit major/minor, 5-digit build, 4-digit revision
+        normalized_str = f"{major:03}.{minor:03}.{build:05}.{revision:04}"
+
+        return normalized_str, version_parts_dict
 
     async def _load_configuration_async(self):
         """Load datasource and connector configuration asynchronously."""

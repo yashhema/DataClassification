@@ -588,11 +588,12 @@ class Worker:
                 await self._process_policy_selector_plan_async(work_packet)
             elif work_packet.payload.task_type == TaskType.POLICY_SELECTOR_EXECUTE:
                 await self._process_policy_selector_execute_async(work_packet)
-            elif work_packet.payload.task_type == TaskType.POLICY_ACTION_PLAN: # Assuming this new task type is added
+            elif work_packet.payload.task_type == TaskType.POLICY_ACTION_PLAN: # Assuming this new task type is 
                 await self._process_policy_action_plan_async(work_packet)
             elif work_packet.payload.task_type == TaskType.POLICY_ACTION_EXECUTE:
                 await self._process_policy_action_execute_async(work_packet)
-
+            elif work_packet.payload.task_type == TaskType.DATASOURCE_PROFILE:
+                await self._process_datasource_profile_async(work_packet)
 
 
             else:
@@ -624,6 +625,53 @@ class Worker:
         finally:
             self.current_task = None
             self.status = WorkerStatus.IDLE
+
+
+    async def _process_datasource_profile_async(self, work_packet: WorkPacket):
+        """
+        Handles the DATASOURCE_PROFILE task. It calls the connector to get the
+        system profile, saves it to the database, and creates an output record
+        to signal the Pipeliner.
+        """
+        try:
+            context = self.job_context(work_packet)
+            datasource_id = work_packet.payload.datasource_id
+            self.logger.info(f"Starting DATASOURCE_PROFILE for {datasource_id}", **context)
+
+            # 1. Create the connector
+            connector = await self.connector_factory.create_connector(datasource_id)
+
+            # 2. Verify the connector has compliance capabilities
+            if not isinstance(connector, IComplianceConnector):
+                raise TypeError(f"Connector for datasource '{datasource_id}' does not support compliance scanning.")
+
+            # 3. Get the profile from the connector
+            profile: SystemProfile = await connector.get_system_profile()
+
+            # 4. Save the profile to the datasource_metadata table (this method will be added to the DB interface later)
+            await self.db_interface.update_datasource_metadata(datasource_id=datasource_id, system_profile=profile, context=context)
+            self.logger.info(f"Successfully saved profile for {datasource_id}", **context)
+
+            # 5. Create an output record to signal the Pipeliner
+            output_record = TaskOutputRecord(
+                output_type="PROFILE_COMPLETED",
+                output_payload=profile.model_dump(mode='json')
+            )
+
+            await self._report_task_progress_async(
+                work_packet.header.job_id,
+                work_packet.header.task_id,
+                output_record
+            )
+        except Exception as e:
+            error = self.error_handler.handle_error(
+                e, "get_system_profile",
+                operation="connector_profiling",
+                datasource_id=datasource_id,
+                **context
+            )
+            raise        
+        
 
 
     async def _process_discovery_enumerate_async(self, work_packet: WorkPacket):

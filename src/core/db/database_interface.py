@@ -32,7 +32,7 @@ from ..db_models.discovery_catalog_schema import DiscoveredObject as OrmDiscover
 from ..db_models.discovery_catalog_schema import DiscoveredObjectClassificationDateInfo
 from ..db_models.findings_schema import ScanFindingSummary
 from ..db_models.system_parameters_schema import SystemParameter
-from ..db_models.datasource_schema import NodeGroup, DataSource
+from ..db_models.datasource_schema import NodeGroup, DataSource,DataSourceMetadata
 from ..db_models.connector_config_schema import ConnectorConfiguration
 from ..db_models.calendar_schema import Calendar
 from ..db_models.job_schema import JobStatus, ScanTemplate, JobType
@@ -48,7 +48,7 @@ from ..db_models.enumeration_progress_schema import EnumerationProgress, Enumera
 from ..logging.system_logger import SystemLogger
 from ..errors import ErrorHandler
 from ..db_models.job_schema import MasterJob
-
+from ..models.models import SystemProfile
 
 
 
@@ -152,6 +152,8 @@ class DatabaseInterface:
         """Validates table name to prevent SQL injection."""
         if not self._safe_table_name_pattern.match(table_name):
             raise ValueError(f"Invalid characters in table name: {table_name}")
+
+
 
 
 
@@ -652,6 +654,8 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, "renew_lease_and_process_command", job_id=job_id, **context)
             # Return a specific error outcome
             return LeaseRenewalResult("ERROR")
+
+
 
     # =================================================================
     # Startup Validation Method
@@ -3094,3 +3098,76 @@ class DatabaseInterface:
         if self.async_engine:
             self.logger.info("Closing database connection pool.")
             await self.async_engine.dispose()
+            
+            
+# =============================================================================
+# Compliance Related Methods
+# =============================================================================
+    async def update_datasource_metadata(
+        self,
+        datasource_id: str,
+        system_profile: SystemProfile,
+        context: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Upserts the full system profile into the datasource_metadata table,
+        incrementing the profile_version on each update.
+        """
+        context = context or {}
+        self.logger.log_database_operation(
+            "UPSERT", "datasource_metadata", "STARTED",
+            datasource_id=datasource_id, **context
+        )
+        try:
+            # Extract data from the SystemProfile object
+            product_version_string = system_profile.full_version
+            capabilities_dict = system_profile.model_dump(mode='json')
+            deployment_model = system_profile.deployment_model
+            
+            async with self.get_async_session() as session:
+                # Use a MERGE statement for an atomic UPSERT on datasource_metadata
+                def sync_merge(sync_session):
+                    merge_sql = text("""
+                        MERGE INTO datasource_metadata AS target
+                        USING (SELECT :ds_id AS datasource_id) AS source
+                        ON (target.datasource_id = source.datasource_id)
+                        WHEN MATCHED THEN
+                            UPDATE SET
+                                profile_version = target.profile_version + 1,
+                                product_version = :prod_ver,
+                                deployment_model = :deploy_model,
+                                capabilities = :caps,
+                                last_profiled_timestamp = :ts
+                        WHEN NOT MATCHED THEN
+                            INSERT (datasource_id, profile_version, product_version, deployment_model, capabilities, last_profiled_timestamp)
+                            VALUES (:ds_id, 1, :prod_ver, :deploy_model, :caps, :ts);
+                    """)
+                    sync_session.execute(
+                        merge_sql,
+                        {
+                            "ds_id": datasource_id,
+                            "prod_ver": product_version_string,
+                            "deploy_model": deployment_model,
+                            "caps": json.dumps(capabilities_dict),
+                            "ts": datetime.now(timezone.utc)
+                        }
+                    )
+                
+                await session.run_sync(sync_merge)
+                await session.commit()
+                
+            self.logger.log_database_operation(
+                "UPSERT", "datasource_metadata", "SUCCESS",
+                datasource_id=datasource_id, **context
+            )
+        except Exception as e:
+            self.error_handler.handle_error(e, "update_datasource_metadata", datasource_id=datasource_id, **context)
+            raise
+
+
+
+# =============================================================================
+#  Compliance Related Methods
+# =============================================================================
+
+

@@ -153,7 +153,29 @@ class TaskAssigner:
                     staging_table_name=staging_table
                 )
                 task_type = TaskType.DISCOVERY_ENUMERATE
+            if job_to_claim.template_type == JobType.DB_PROFILE:
+                task_type = TaskType.DATASOURCE_PROFILE
+                payload = DatasourceProfilePayload(datasource_id=datasource_id)
+
+            elif job_to_claim.template_type == JobType.BENCHMARK:
+                task_type = TaskType.BENCHMARK_EXECUTE
+                profile_record = await self.db.get_datasource_metadata(datasource_id)
                 
+
+
+                payload = BenchmarkExecutePayload(
+                    datasource_id=datasource_id,
+                    cycle_id=job_config.get("cycle_id"),
+                    benchmark_name=job_config.get("benchmark_name"),
+                    
+                )
+
+            elif job_to_claim.template_type == JobType.ENTITLEMENT:
+                task_type = TaskType.ENTITLEMENT_EXTRACT
+                payload = EntitlementExtractPayload(
+                    datasource_id=datasource_id,
+                    cycle_id=job_config.get("cycle_id")
+                )                
             elif job_to_claim.template_type == JobType.POLICY:
                 plan_id = f"plan_{job_to_claim.execution_id}"
                 policy_config = PolicyConfiguration(**job_to_claim.configuration.get("policy_definition", {}))

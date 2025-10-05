@@ -20,6 +20,10 @@ class JobType(str, enum.Enum):
     """Defines the overall goal or workflow of a job."""
     SCANNING = "SCANNING"
     POLICY = "POLICY"
+    DB_PROFILE = "DB_PROFILE"
+    BENCHMARK = "BENCHMARK"
+    ENTITLEMENT = "ENTITLEMENT"
+    VULNERABILITY = "VULNERABILITY"
 
 class JobStatus(str, enum.Enum):
     QUEUED = "QUEUED"

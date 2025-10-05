@@ -9,7 +9,7 @@ from typing import List, AsyncIterator, Optional, Dict, Any, Tuple
 
 # Import the strongly-typed Pydantic models
 from core.models.models import DiscoveredObject, ObjectMetadata, RemediationResult
-from core.models.models import WorkPacket, ContentComponent, TombstoneConfig,BoundaryType, DiscoveryBatch
+from core.models.models import WorkPacket, ContentComponent, TombstoneConfig,BoundaryType, DiscoveryBatch,SystemProfile
 
 """
     Interface for data source connectors that interact with structured databases.
@@ -205,3 +205,17 @@ class IFileDataSourceConnector(IRemediationConnector):
         Retrieves and extracts content components from files for classification.
         """
 
+class IComplianceConnector(ABC):
+    """
+    Interface for connectors that support advanced compliance and security scanning.
+    Connectors can implement both IDatabaseDataSourceConnector AND
+    IComplianceConnector to provide full functionality.
+    """
+    @abstractmethod
+    async def get_system_profile(self) -> SystemProfile:
+        """
+        Returns a standardized SystemProfile object containing the target's
+        full version, patch level, OS, deployment model, and other key
+        identifiers.
+        """
+        pass
