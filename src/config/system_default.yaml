@@ -68,7 +68,7 @@ connector:
   discovery_batch_write_size: 1000
   
   # Master switch for OCR. If false, OCR is disabled system-wide.
-  easyocr_support_enabled: true
+  easyocr_support_enabled: false
   
   # Master switch for Tika. If false, Tika fallback is disabled system-wide.
   tika_fallback_enabled: false

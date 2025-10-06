@@ -5,10 +5,14 @@ End-to-End Job Test Script
 Tests the complete job lifecycle: Discovery → Classification → Verification
 Uses production Orchestrator components (TaskAssigner, Pipeliner) without starting background coroutines.
 """
+import sys
 
+import os
+sys.stdout.reconfigure(line_buffering=True)
 import asyncio
 import logging
-import os
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 from typing import Set, Dict, Any
 from datetime import datetime, timezone, timedelta
 
@@ -33,7 +37,7 @@ from core.models.models import WorkPacket
 # TEST CONFIGURATION
 # =============================================================================
 
-TEST_DATASOURCE_ID: str = "ds_sql_localhost"  # Options: "ds_local_test_files", "ds_smb_finance_dept", "ds_sql_localhost"
+TEST_DATASOURCE_ID: str = "ds_local_test_files"  # Options: "ds_local_test_files", "ds_smb_finance_dept", "ds_sql_localhost"
 
 GROUND_TRUTH_CONFIG = {
     "ds_sql_localhost": {
@@ -50,8 +54,8 @@ GROUND_TRUTH_CONFIG = {
     }
 }
 
-CLASSIFIER_TEMPLATE_ID: str = "general_corporate_v1.0"
-#CLASSIFIER_TEMPLATE_ID: str = "unstructured"
+#CLASSIFIER_TEMPLATE_ID: str = "general_corporate_v1.0"
+CLASSIFIER_TEMPLATE_ID: str = "unstructured"
 CONFIG_FILE_PATH: str = "config/system_default.yaml"
 MOCK_JOB_ID: int = 999
 
@@ -133,7 +137,7 @@ async def run_job_simulation():
         console_handler.setFormatter(JsonFormatter())
         #console_handler.setFormatter()
         root_logger.addHandler(console_handler)
-        root_logger.setLevel(logging.ERROR)
+        root_logger.setLevel(logging.INFO)
         
         # Initialize core components
         error_handler = ErrorHandler()
@@ -170,7 +174,7 @@ async def run_job_simulation():
         )
         
         # Create orchestrator (WITHOUT starting coroutines)
-        print("\n[INIT] Creating orchestrator instance...")
+        print("\n[INIT] Creating orchestrator instance...", flush=True)
         orchestrator = Orchestrator(
             settings=settings,
             db=db_interface,
@@ -208,8 +212,8 @@ async def run_job_simulation():
         # =====================================================================
         # PHASE 1: MAIN ORCHESTRATION LOOP
         # =====================================================================
-        print("\n" + "="*60)
-        print("PHASE 1: ORCHESTRATION LOOP")
+        print("\n" + "="*60, flush=True)
+        print("PHASE 1: ORCHESTRATION LOOP", flush=True)
         print("="*60)
         
         max_iterations = 20
@@ -217,9 +221,9 @@ async def run_job_simulation():
         
         while iteration < max_iterations:
             iteration += 1
-            print(f"\n{'='*60}")
-            print(f"ITERATION {iteration}")
-            print(f"{'='*60}")
+            print(f"\n{'='*60}", flush=True)
+            print(f"ITERATION {iteration}", flush=True)
+            print(f"{'='*60}", flush=True)
             
             # STEP 1: Task Assignment
             print("\n[STEP 1: TASK ASSIGNMENT]")
@@ -231,7 +235,7 @@ async def run_job_simulation():
                 await orchestrator.task_assigner._dispatch_task(task)
                 dispatched += 1
             
-            print(f"  Dispatched: {dispatched} tasks to queue")
+            print(f"  Dispatched: {dispatched} tasks to queue", flush=True)
             
             # STEP 2: Worker Processing
             print("\n[STEP 2: WORKER PROCESSING]")
@@ -242,12 +246,12 @@ async def run_job_simulation():
                     work_packet = WorkPacket(**work_packet_dict)
                     task_type = work_packet.payload.task_type
                     task_id_short = work_packet.header.task_id[:8]
-                    print(f"  Processing: {task_type} | Task ID: {task_id_short}...")
+                    print(f"  Processing: {task_type} | Task ID: {task_id_short}...", flush=True)
                     
                     await worker._process_task_async(work_packet)
                     tasks_processed += 1
             
-            print(f"  Processed: {tasks_processed} tasks")
+            print(f"  Processed: {tasks_processed} tasks", flush=True)
             
             # STEP 3: Pipelining
             print("\n[STEP 3: PIPELINING]")
@@ -269,23 +273,23 @@ async def run_job_simulation():
                 pending_count = result[0]['cnt'] if result else 0
                 
                 if pending_count > 0:
-                    print(f"  WARNING: {pending_count} tasks still PENDING")
-                    print("  (likely blocked by resource/schedule constraints)")
+                    print(f"  WARNING: {pending_count} tasks still PENDING", flush=True)
+                    print("  (likely blocked by resource/schedule constraints)", flush=True)
                 else:
-                    print("  All tasks completed successfully")
+                    print("  All tasks completed successfully", flush=True)
                 
                 break
         
-        print(f"\n{'='*60}")
-        print(f"ORCHESTRATION COMPLETE - {iteration} iterations")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}", flush=True)
+        print(f"ORCHESTRATION COMPLETE - {iteration} iterations", flush=True)
+        print(f"{'='*60}", flush=True)
         
         # =====================================================================
         # PHASE 2: VERIFICATION
         # =====================================================================
-        print("\n" + "="*60)
-        print("PHASE 2: VERIFICATION")
-        print("="*60)
+        print("\n" + "="*60, flush=True)
+        print("PHASE 2: VERIFICATION", flush=True)
+        print("="*60, flush=True)
         
         # Gather actual results
         actual_objects = await db_interface.get_objects_by_datasource(
@@ -326,51 +330,51 @@ async def run_job_simulation():
 
 
         # Print results
-        print(f"\n{'='*60}")
-        print("VERIFICATION RESULTS")
-        print(f"{'='*60}")
-        print(f"Expected objects:    {len(expected_normalized)}")
-        print(f"Discovered objects:  {len(actual_normalized)}")
-        print(f"Matched:             {len(matched)}")
-        print(f"Missing:             {len(missing)}")
-        print(f"Unexpected:          {len(unexpected)}")
-        print(f"With metadata:       {metadata_count}")
-        print(f"Total Findings:      {findings_count}")
+        print(f"\n{'='*60}", flush=True)
+        print("VERIFICATION RESULTS", flush=True)
+        print(f"{'='*60}", flush=True)
+        print(f"Expected objects:    {len(expected_normalized)}", flush=True)
+        print(f"Discovered objects:  {len(actual_normalized)}", flush=True)
+        print(f"Matched:             {len(matched)}", flush=True)
+        print(f"Missing:             {len(missing)}", flush=True)
+        print(f"Unexpected:          {len(unexpected)}", flush=True)
+        print(f"With metadata:       {metadata_count}", flush=True)
+        print(f"Total Findings:      {findings_count}", flush=True)
         
         # Pass/Fail determination
         if not missing and not unexpected:
-            print(f"\n{'='*60}")
-            print("RESULT: PASS")
+            print(f"\n{'='*60}", flush=True)
+            print("RESULT: PASS", flush=True)
             print(f"{'='*60}")
         else:
-            print(f"\n{'='*60}")
-            print("RESULT: FAIL")
-            print(f"{'='*60}")
+            print(f"\n{'='*60}", flush=True)
+            print("RESULT: FAIL", flush=True)
+            print(f"{'='*60}", flush=True)
             
             if missing:
                 print(f"\nMissing objects (showing up to 10):")
                 for path in sorted(list(missing))[:10]:
-                    print(f"  - {path}")
+                    print(f"  - {path}", flush=True)
                 if len(missing) > 10:
-                    print(f"  ... and {len(missing) - 10} more")
+                    print(f"  ... and {len(missing) - 10} more", flush=True)
             
             if unexpected:
-                print(f"\nUnexpected objects (showing up to 10):")
+                print(f"\nUnexpected objects (showing up to 10):", flush=True)
                 for path in sorted(list(unexpected))[:10]:
-                    print(f"  - {path}")
+                    print(f"  - {path}", flush=True)
                 if len(unexpected) > 10:
-                    print(f"  ... and {len(unexpected) - 10} more")
+                    print(f"  ... and {len(unexpected) - 10} more", flush=True)
     
     except Exception as e:
-        print(f"\n[FATAL ERROR] {e}")
+        print(f"\n[FATAL ERROR] {e}", flush=True)
         logging.exception("An unhandled exception occurred during test execution")
     
     finally:
         if db_interface:
             await db_interface.close_async()
-        print("\n" + "="*60)
-        print("TEST SCRIPT COMPLETE")
-        print("="*60)
+        print("\n" + "="*60, flush=True)
+        print("TEST SCRIPT COMPLETE", flush=True)
+        print("="*60, flush=True)
 
 
 async def setup_test_job(job_id: int, datasource_id: str, orchestrator, db: DatabaseInterface):

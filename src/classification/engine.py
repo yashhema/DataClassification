@@ -142,7 +142,7 @@ class ClassificationEngine:
                     #print(f"  hasattr analysis_explanation: {hasattr(result, 'analysis_explanation')}")
                     #if hasattr(result, 'analysis_explanation') and result.analysis_explanation:
                     #    print(f"  recognizer: {result.analysis_explanation.recognizer}")                
-                print(f"CRITICAL DEBUG: Presidio returned {len(raw_results)} results in real app")
+                #print(f"CRITICAL DEBUG: Presidio returned {len(raw_results)} results in real app")
                 # 2. Run the post-processing pipeline
                 processed_findings = []
                 for result in raw_results:

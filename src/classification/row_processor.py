@@ -44,10 +44,10 @@ class RowProcessor:
             )
             # --- ADD THIS LOGGING ---
             # This will print the exact string sent to the classification engine for each row.
-            print("-" * 25, " ROW PROCESSOR DEBUG ", "-" * 25)
-            print(f"Row PK: {row_pk}")
-            print(f"Combined Text Sent to Engine: '{combined_text}'")
-            print("-" * 75)
+            #print("-" * 25, " ROW PROCESSOR DEBUG ", "-" * 25)
+            #print(f"Row PK: {row_pk}")
+            #print(f"Combined Text Sent to Engine: '{combined_text}'")
+            #print("-" * 75)
             # --- END OF LOGGING ---            
             # Skip empty rows
             if not combined_text.strip():
@@ -124,7 +124,7 @@ class RowProcessor:
             raise ProcessingError(f"Error processing row {row_pk}: {str(e)}") from e
             
     
-    async def process_document_content(self,
+    async def process_document_content_nottouse(self,
                                      content: str,
                                      file_metadata: Dict[str, Any],
                                      classifier) -> List[Dict[str, Any]]:
@@ -171,6 +171,86 @@ class RowProcessor:
             return findings
 
             
+        except Exception as e:
+            print(f"Error processing document {file_metadata.get('file_path')}: {str(e)}")
+            return []
+
+    async def process_document_content(self,
+                                     content: str,
+                                     file_metadata: Dict[str, Any],
+                                     classifier) -> List[Dict[str, Any]]:
+        """
+        Process document content for PII detection with chunking for large files
+        """
+        try:
+            # Presidio recommended maximum: 50K-100K chars per analysis
+            MAX_CHUNK_SIZE = 50000
+            
+            # Prepare context for classification
+            context_info = {
+                "object_type": "document",
+                "file_path": file_metadata.get('file_path'),
+                "file_name": file_metadata.get('file_name'),
+                "file_size": file_metadata.get('file_size', 0),
+                "file_extension": file_metadata.get('file_extension'),
+                "content_extracted_size": len(content)
+            }
+            
+            all_findings = []
+            
+            # If content is small enough, process in one go
+            if len(content) <= MAX_CHUNK_SIZE:
+                # --- FIX IS HERE ---
+                # Run the synchronous, CPU-bound classification in a separate thread
+                # to prevent blocking the worker's async event loop.
+                loop = asyncio.get_running_loop()
+                findings = await loop.run_in_executor(
+                    None,  # Use the default thread pool executor
+                    classifier.classify_content,  # The synchronous function to run
+                    content,       # The first argument
+                    context_info   # The second argument
+                )
+                all_findings.extend(findings)
+            else:
+                # Chunk large content
+                offset = 0
+                chunk_num = 0
+                
+                while offset < len(content):
+                    chunk = content[offset:offset + MAX_CHUNK_SIZE]
+                    chunk_num += 1
+                    
+                    chunk_context = {
+                        **context_info,
+                        "chunk_number": chunk_num,
+                        "chunk_offset": offset,
+                        "is_chunked": True
+                    }
+                    
+                    loop = asyncio.get_running_loop()
+                    chunk_findings = await loop.run_in_executor(
+                        None,
+                        classifier.classify_content,
+                        chunk,
+                        chunk_context
+                    )
+                    
+                    # Adjust positions for chunk offset
+                    for finding in chunk_findings:
+                        finding.start_position += offset
+                        finding.end_position += offset
+                    
+                    all_findings.extend(chunk_findings)
+                    offset += MAX_CHUNK_SIZE
+            
+            # Enrich findings with context data before returning
+            for finding in all_findings:
+                if not hasattr(finding, 'context_data') or finding.context_data is None:
+                    finding.context_data = {}
+                finding.context_data.update(context_info)
+            
+            return all_findings
+        
         except Exception as e:
             print(f"Error processing document {file_metadata.get('file_path')}: {str(e)}")
             return []

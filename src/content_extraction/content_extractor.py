@@ -128,7 +128,8 @@ class ContentExtractor:
                            file_type=file_type,
                            file_size_mb=round(file_size_mb, 2),
                            extraction_id=extraction_id)
-            
+            if "large_file.txt" in file_path:
+                print("Hello")            
             # Route to appropriate extractor
             if file_type in ['zip', 'tar']:
                 async for component in self._process_archive(file_path, object_id, file_type, 
@@ -1655,7 +1656,7 @@ class ContentExtractor:
     # Simple File Type Extractors - Signatures Updated for Context IDs
     # =============================================================================
 
-    async def extract_txt_components(self, file_path: str, object_id: str,
+    async def extract_txt_components_old(self, file_path: str, object_id: str,
                                    job_id: int, task_id: str, datasource_id: str) -> AsyncIterator[ContentComponent]:
         """Extract text file content"""
         try:
@@ -2478,19 +2479,50 @@ class ContentExtractor:
 
     async def extract_txt_components(self, file_path: str, object_id: str,
                                    job_id: int, task_id: str, datasource_id: str) -> AsyncIterator[ContentComponent]:
-        """Extract text file content"""
+        """Extract text file content with chunked reading and size limits"""
         try:
+            max_chars = self.extraction_config.limits.max_text_chars
+            chunks = []
+            total_chars = 0
+            if "large_file.txt" in file_path:
+                print("heloo")             
             async with aiofiles.open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                text_content = await f.read()
+                while total_chars < max_chars:
+                    try:
+                        # Read 64KB chunks with timeout
+                        chunk = await asyncio.wait_for(f.read(65536), timeout=5.0)
+                        if not chunk:
+                            break
+                        
+                        chunks.append(chunk)
+                        total_chars += len(chunk)
+                        
+                        # Stop reading if we have enough characters
+                        if total_chars >= max_chars:
+                            break
+                            
+                    except asyncio.TimeoutError:
+                        self.logger.warning(f"Timeout reading text file chunk", 
+                                           file_path=file_path, chars_read=total_chars)
+                        break
+            
+            text_content = ''.join(chunks)
+            
+            # Truncate to exact character limit if we read too much
+            is_truncated = len(text_content) > max_chars
+            text_content = text_content[:max_chars]
             
             text_component = self._create_text_component(
                 object_id, f"{self._get_base_name(file_path)}_txt_text_1", file_path,
-                text_content, {"encoding": "utf-8"}, "text_file_read"
+                text_content, 
+                {"encoding": "utf-8", "was_truncated": is_truncated}, 
+                "text_file_read"
             )
             yield text_component
             
         except Exception as e:
             yield self._create_error_component(object_id, f"Text file extraction failed: {str(e)}")
+
 
     async def extract_json_components(self, file_path: str, object_id: str,
                                     job_id: int, task_id: str, datasource_id: str) -> AsyncIterator[ContentComponent]:

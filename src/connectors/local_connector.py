@@ -53,7 +53,8 @@ class LocalConnector(IFileDataSourceConnector):
         """
         paths_to_scan = work_packet.payload.paths or [self.root_path]
         
-        for directory_path in paths_to_scan:
+        for mdirectory_path in paths_to_scan:
+            directory_path = os.path.normpath(mdirectory_path)
             boundary_id = generate_object_key_hash(
                 self.datasource_id, 
                 directory_path, 

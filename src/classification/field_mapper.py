@@ -146,7 +146,7 @@ def filter_fields_for_classification(table_metadata: Dict[str, Any]) -> List[str
     Filter table columns to include only those likely to contain PII,
     now with detailed logging for debugging purposes.
     """
-    print("\n" + "-"*20 + " Running Field Filter " + "-"*20)
+    #print("\n" + "-"*20 + " Running Field Filter " + "-"*20)
     included_fields = []
     excluded_count = 0
     
