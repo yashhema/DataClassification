@@ -196,7 +196,7 @@ ocr_cache/
 classification_results/
 
 # Machine learning models (if any)
-models/
+
 *.pkl
 *.joblib
 *.h5
