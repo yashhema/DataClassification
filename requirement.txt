@@ -1,0 +1,61 @@
+# ----------------------------------
+# --- Core System Requirements ---
+# ----------------------------------
+
+# Database ORM and async driver for SQL Server
+sqlalchemy
+aioodbc
+
+# Data modeling, validation, and configuration
+pydantic
+PyYAML
+
+# Asynchronous operations for networking and file I/O
+aiohttp
+aiofiles
+
+# State management for distributed (EKS) mode
+redis
+
+# Core PII classification engine and its regex dependency
+presidio-analyzer
+regex
+
+# Connector for SMB/CIFS file shares
+smbprotocol
+
+
+# -------------------------------------------
+# --- Optional Content Extraction Libraries ---
+# -------------------------------------------
+# Uncomment the libraries you need based on the file types you want to process.
+
+# For PDF files (.pdf)
+# PyMuPDF
+
+# For Microsoft Word files (.docx)
+# python-docx
+
+# For Microsoft Excel files (.xlsx)
+# pandas
+# openpyxl
+
+# For Microsoft PowerPoint files (.pptx)
+# python-pptx
+
+# For HTML files (.html, .htm)
+# beautifulsoup4
+
+# For Image Text Extraction (OCR) for .png, .jpeg, etc.
+# Note: torch installation can be complex (CPU vs GPU). 
+# Refer to the official PyTorch website for specific installation commands.
+# easyocr
+# torch
+# torchvision
+# Pillow
+
+# For advanced file type detection using MIME types
+# python-magic
+
+# For fallback extraction of various formats (e.g., .rtf, older .doc/.xls)
+# tika
