@@ -3,7 +3,7 @@
 Complete usage example showing how file-based connectors integrate
 with the ContentExtractor module for content extraction and classification.
 """
-
+import os
 from typing import Iterator, List
 from core.models.models import WorkPacket, ContentComponent, ContentExtractionConfig
 from core.interfaces.worker_interfaces import IFileDataSourceConnector

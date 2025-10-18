@@ -46,7 +46,7 @@ GROUND_TRUTH_CONFIG = {
     },
     "ds_local_test_files": {
         "type": "file",
-        "path": "C:/TestDataClassification"
+        "path": "C:/temp_testclassification"
     },
     "ds_smb_finance_dept": {
         "type": "file",

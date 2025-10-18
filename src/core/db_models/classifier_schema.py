@@ -7,7 +7,7 @@ import enum
 from typing import List, Optional
 
 from sqlalchemy import (
-    String, Float, Integer, ForeignKey, Enum as SQLAlchemyEnum
+    String, Float, Integer, ForeignKey, Enum as SQLAlchemyEnum, Boolean
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -17,6 +17,7 @@ from .association_tables import ClassifierTemplateLink
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .classifiertemplate_schema import ClassifierTemplate
+    from .dictionary_schema import Dictionary
 
 
 class Category(Base):
@@ -40,6 +41,12 @@ class Classifier(Base):
     entity_type: Mapped[str] = mapped_column(String(100), nullable=False)
     category_id: Mapped[int] = mapped_column(ForeignKey('classifier_categories.id'), nullable=False)
     category: Mapped["Category"] = relationship(back_populates="classifiers")
+    # --- NEW FIELDS TO ADD ---
+    dictionary_id: Mapped[Optional[int]] = mapped_column(ForeignKey('dictionaries.id'))
+    requires_row_context: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    
+    # --- NEW RELATIONSHIP TO ADD ---
+    dictionary: Mapped[Optional["Dictionary"]] = relationship(back_populates="classifiers")    
     patterns: Mapped[List["ClassifierPattern"]] = relationship(back_populates="classifier", cascade="all, delete-orphan")
     context_rules: Mapped[List["ClassifierContextRule"]] = relationship(back_populates="classifier", cascade="all, delete-orphan")
     validation_rules: Mapped[List["ClassifierValidationRule"]] = relationship(back_populates="classifier", cascade="all, delete-orphan")

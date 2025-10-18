@@ -77,7 +77,7 @@ connector:
 logging:
   # This level is for the CONSOLE
   format: TEXT
-  level: DEBUG
+  level: ERROR
   progress_sampling_rate: 0.1
   
   #  for file logging
@@ -85,7 +85,7 @@ logging:
     enabled: true
     path: "logs/application.log"
     # This level is for the FILE, allowing you to capture more detail
-    level: "DEBUG"
+    level: "ERROR"
     format: "JSON"
 errors:
   persistence_enabled: true

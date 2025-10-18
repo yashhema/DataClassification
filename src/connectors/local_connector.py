@@ -152,7 +152,7 @@ class LocalConnector(IFileDataSourceConnector):
 
 
                 file_path = discovered_obj.object_path
-
+                print (f"  File Path Is: {file_path}")
                 async for component in self.content_extractor.extract_from_file(
                     file_path=file_path,
                     object_id=file_path,

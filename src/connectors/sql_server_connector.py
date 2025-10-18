@@ -154,7 +154,7 @@ class AsyncSQLServerConnection:
             
             encoded_username = quote_plus(username)
             encoded_password = quote_plus(password)
-            base_string = f"mssql+aiodbc://{encoded_username}:{encoded_password}@{host_part}/{database}?driver={encoded_driver}"
+            base_string = f"mssql+aioodbc://{encoded_username}:{encoded_password}@{host_part}/{database}?driver={encoded_driver}"
 
         if tls_config.get('trust_server_certificate', False):
             base_string += "&TrustServerCertificate=yes"

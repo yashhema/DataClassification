@@ -8,7 +8,7 @@ handling frameworks and contains the complete schema for all system components.
 
 import socket
 from typing import List, Dict, Any, Optional
-
+from dataclasses import dataclass, field
 import yaml
 from pydantic import BaseModel, Field, ValidationError as PydanticValidationError
 
@@ -109,19 +109,108 @@ class ErrorHandlingConfig(BaseModel):
     persistence_enabled: bool = Field(True)
     circuit_breaker_threshold: int = Field(5)
 
+@dataclass
 class ClassificationConfidenceConfig(BaseModel):
     """Defines thresholds for aggregated confidence scoring."""
-    low_threshold: int = Field(30, description="Upper bound for LOW confidence score (e.g., 0-30).")
-    medium_threshold: int = Field(60, description="Upper bound for MEDIUM confidence score (e.g., 31-60).")
-    # Anything above medium is considered HIGH
-    high_confidence_min_score: float = Field(0.8, description="Minimum score to be considered a high-confidence finding.")
+    
+    # ============================================================
+    # INDIVIDUAL FINDING TIERS (0.0 to 1.0 scale)
+    # ============================================================
+    high_confidence_min_score: float = Field(
+        0.7,  # ✅ CHANGED from 0.8 to 0.7 per design doc
+        description="Minimum score for a finding to be HIGH tier (design doc: ≥0.7)"
+    )
+    medium_confidence_min_score: float = Field(
+        0.4,  # ✅ NEW
+        description="Minimum score for a finding to be MEDIUM tier (design doc: 0.4-0.69)"
+    )
+    
+    # ============================================================
+    # COLUMN-LEVEL AGGREGATION (percentage scale)
+    # For database columns: % of high-confidence rows
+    # ============================================================
+    low_threshold: int = Field(
+        20,  # ✅ ADJUSTED from 30 (more sensitive)
+        description="Percentage threshold for column to be MEDIUM (e.g., >20% high-conf rows)"
+    )
+    medium_threshold: int = Field(
+        50,  # ✅ ADJUSTED from 60 (more sensitive)
+        description="Percentage threshold for column to be HIGH (e.g., >50% high-conf rows)"
+    )
+    
+    # ============================================================
+    # QUICK FILTERS (automatic LOW) - NEW
+    # ============================================================
+    min_regex_match_rate: float = Field(
+        10.0,
+        description="Minimum regex match rate to avoid automatic LOW (design doc Section 3.4)"
+    )
+    max_null_percentage: float = Field(
+        80.0,
+        description="Maximum null percentage to avoid automatic LOW (design doc Section 3.4)"
+    )
+    min_distinct_percentage: float = Field(
+        1.0,
+        description="Minimum distinct percentage to avoid automatic LOW (design doc Section 3.4)"
+    )
+    
+    # ============================================================
+    # FORMULA WEIGHTS - DATABASE/STRUCTURED DATA - NEW
+    # ============================================================
+    database_match_rate_weight: float = Field(
+        0.3,
+        description="Weight for regex match rate in database formula (design doc Section 3.1)"
+    )
+    database_data_quality_weight: float = Field(
+        0.2,
+        description="Weight for data quality in database formula (design doc Section 3.1)"
+    )
+    database_column_name_weight: float = Field(
+        0.3,
+        description="Weight for column name match in database formula (design doc Section 3.1)"
+    )
+    database_words_weight: float = Field(
+        0.1,
+        description="Weight for words context in database formula (design doc Section 3.1)"
+    )
+    database_exact_match_weight: float = Field(
+        0.1,
+        description="Weight for exact match in database formula (design doc Section 3.1)"
+    )
+    
+    # ============================================================
+    # FORMULA WEIGHTS - FILE/UNSTRUCTURED DATA - NEW
+    # ============================================================
+    file_words_weight: float = Field(
+        0.4,
+        description="Weight for words context in file formula (design doc Section 3.1)"
+    )
+    file_exact_match_weight: float = Field(
+        0.4,
+        description="Weight for exact match in file formula (design doc Section 3.1)"
+    )
+    file_pattern_weight: float = Field(
+        0.2,
+        description="Weight for pattern match in file formula (design doc Section 3.1)"
+    )
+    
+    # ============================================================
+    # VALIDATION BOOST - NEW
+    # ============================================================
+    validation_passed_boost: float = Field(
+        0.3,
+        description="Confidence boost when validation rules pass (e.g., Luhn, NIST)"
+    )
 
 class ClassificationConfig(BaseModel):
     """Expanded configuration for the classification subsystem."""
     max_content_size_mb: int = Field(100)
     default_row_limit: int = Field(1000)
-    max_samples_per_finding: int = Field(100, description="Max sample occurrences to store in the DB for each summary.")
+    max_samples_per_finding: int = Field(20, description="Max sample occurrences to store in the DB for each summary.")
     confidence_scoring: ClassificationConfidenceConfig = Field(default_factory=ClassificationConfidenceConfig)
+    table_quality_min_row_count: int = 50
+    table_quality_min_column_consistency_percent: int = 95
+
 
 class TaskCostEstimationConfig(BaseModel):
     classification_mb_per_gb_file: int = Field(128)

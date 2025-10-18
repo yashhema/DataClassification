@@ -14,7 +14,7 @@ from typing import Optional
 
 
 from sqlalchemy import (
-    String, Integer, Float, LargeBinary, Text, Index
+    String, Integer, Float, LargeBinary, Text, Index,Boolean
 )
 
 from sqlalchemy.orm import Mapped, mapped_column
@@ -27,15 +27,15 @@ class ScanFindingSummary(Base):
     __table_args__ = (
         Index('ix_scan_finding_summaries_scan_job_id', 'scan_job_id'),
         Index('ix_scan_finding_summaries_data_source_id', 'data_source_id'),
+        Index('ix_scan_finding_summaries_confidence_tier', 'confidence_tier'),
+        Index('ix_scan_finding_summaries_entity_type', 'entity_type'),
         {'extend_existing': True}
     )
     __doc__ = """
-    Stores an aggregated summary of findings. A SHA-256 hash of the core
-    context fields (finding_key_hash) is used to uniquely identify a finding
-    for a specific object and classifier, avoiding index length issues.
+    Stores an aggregated summary of findings with complete statistics.
     """
 
-    # A SHA-256 hash (32 bytes) of the core context fields - now PRIMARY KEY
+    # === Primary Key ===
     finding_key_hash: Mapped[bytes] = mapped_column(LargeBinary(32), primary_key=True)
 
     # === Core Context Fields ===
@@ -50,21 +50,41 @@ class ScanFindingSummary(Base):
     field_name: Mapped[Optional[str]] = mapped_column(String(255))
 
     # === Fields for Unstructured Data (e.g., Files) ===
-    file_path: Mapped[Optional[str]] = mapped_column(String(4000))
-    file_name: Mapped[Optional[str]] = mapped_column(String(255))
+    file_path: Mapped[Optional[str]] = mapped_column(Text)  # Changed to Text for unlimited length
+    file_name: Mapped[Optional[str]] = mapped_column(String(5000))  # Increased from 255
     file_extension: Mapped[Optional[str]] = mapped_column(String(50))
 
     # === Aggregated Finding Statistics ===
     finding_count: Mapped[int] = mapped_column(Integer, nullable=False)
     average_confidence: Mapped[float] = mapped_column(Float, nullable=False)
     max_confidence: Mapped[float] = mapped_column(Float, nullable=False)
-    # Stores a JSON string of sample findings
+    confidence_tier: Mapped[Optional[str]] = mapped_column(String(10))  # NEW: HIGH/MEDIUM/LOW
     sample_findings: Mapped[Optional[str]] = mapped_column(Text)
 
     # === Data Quality and Source Statistics ===
     total_rows_in_source: Mapped[Optional[int]] = mapped_column(Integer)
     non_null_rows_scanned: Mapped[Optional[int]] = mapped_column(Integer)
-
+    
+    # === Column Statistics (NULL for files) ===
+    null_percentage: Mapped[Optional[float]] = mapped_column(Float)
+    min_length: Mapped[Optional[int]] = mapped_column(Integer)
+    max_length: Mapped[Optional[int]] = mapped_column(Integer)
+    mean_length: Mapped[Optional[float]] = mapped_column(Float)
+    distinct_value_count: Mapped[Optional[int]] = mapped_column(Integer)
+    distinct_value_percentage: Mapped[Optional[float]] = mapped_column(Float)
+    
+    # === Match Statistics ===
+    total_regex_matches: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    regex_match_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    distinct_regex_matches: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    distinct_match_percentage: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    column_name_matched: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    words_match_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    words_match_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    exact_match_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    exact_match_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    negative_match_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    negative_match_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
 
 class ScanFindingOccurrence(Base):
     __tablename__ = 'scan_finding_occurrences'

@@ -1,0 +1,562 @@
+# PII Classification Strategy - Design Decisions
+
+## Document Purpose
+This document captures the strategic decisions made for the PII classification system, including dictionary design, statistics calculation, confidence scoring, and file vs. database handling.
+
+---
+
+## 1. Dictionary Structure
+
+### 1.1 Four-Field Dictionary Design
+
+Each entity type (US_SSN, EMAIL, CREDIT_CARD, etc.) has a dictionary with **four fields**:
+
+```yaml
+ENTITY_DICTIONARY:
+  column_names: [...]    # For column name matching (structured data)
+  words: [...]           # For Presidio NLP context matching
+  exact_match: [...]     # For exact phrase matching (your custom logic)
+  negative: [...]        # For exclusion/suppression
+```
+
+### 1.2 Field Usage
+
+| Field | Used By | Purpose | Example |
+|-------|---------|---------|---------|
+| `column_names` | Your pre-filter code | Quick column identification | `['ssn', 'social_security', 'tax_id']` |
+| `words` | Presidio (flat list only) | NLP lemma-based context | `['ssn', 'social', 'security']` |
+| `exact_match` | Your post-processing | Phrase precision boost | `['social security number', 'ssn:']` |
+| `negative` | Your filtering | Detect test data / false positives | `['test', 'sample', '123-45-6789']` |
+
+### 1.3 Key Constraints
+
+- **Presidio limitation**: The `words` field MUST be a flat list of single words (no phrases)
+- **Presidio behavior**: Matches if ANY word appears (not all words required)
+- **Your enhancement**: Use `exact_match` for phrase-level precision
+
+---
+
+## 2. Statistics Collection
+
+### 2.1 Processing Approach
+
+**Column-by-Column Processing** (for structured data):
+- Scan max 30,000 rows per column
+- Calculate statistics ONCE per column
+- Test MULTIPLE classifiers against same column
+- Each classifier gets its own match statistics
+
+### 2.2 Statistics Categories
+
+#### A. Column-Level Statistics (Shared)
+Calculated once per column, regardless of classifier:
+
+```yaml
+column_stats:
+  total_rows_scanned: 30000
+  null_count: 1500
+  null_percentage: 5.0
+  min_value_length: 9
+  max_value_length: 11
+  mean_value_length: 9.8
+  distinct_value_count: 28450
+  distinct_value_percentage: 99.8
+  most_common_value: "123-45-6789"
+  most_common_value_percentage: 0.05
+```
+
+#### B. Classifier Match Statistics (Per-Classifier)
+Calculated separately for EACH classifier tested against the column:
+
+```yaml
+match_stats:
+  # Regex matches for THIS classifier
+  total_regex_matches: 28400
+  regex_match_rate: 99.6
+  distinct_regex_matches: 28350
+  distinct_match_percentage: 99.8
+  
+  # Dictionary-based context matches
+  column_name_matched: true
+  words_match_count: 380
+  words_match_rate: 1.3
+  exact_match_count: 285
+  exact_match_rate: 1.0
+  negative_match_count: 45
+  negative_match_rate: 0.16
+```
+
+### 2.3 Storage Strategy
+
+**Store in PIIFinding.context_data**:
+- All statistics stored in the existing `context_data: Dict[str, Any]` field
+- No model changes required
+- Extracted during `convert_findings_to_db_format()`
+
+---
+
+## 3. Confidence Calculation
+
+### 3.1 Database vs File Strategy
+
+**Different confidence formulas based on source type:**
+
+#### Database/Structured Data
+```
+Confidence factors:
+  - Column name match: Heavy weight (0.3)
+  - Match rate: Heavy weight (0.3)
+  - Data quality: Medium weight (0.2)
+  - Context words: Light weight (0.1)
+  - Exact phrases: Light weight (0.1)
+```
+
+#### File/Unstructured Text
+```
+Confidence factors:
+  - Context words: Heavy weight (0.4)
+  - Exact phrases: Heavy weight (0.4)
+  - Pattern match: Medium weight (0.2)
+  - Column names: Ignored (not applicable)
+```
+
+### 3.2 Table Quality Assessment
+
+**For tables extracted from files (Word/PDF/Excel):**
+
+#### Step 1: Always Assess Quality
+```yaml
+quality_assessment:
+  strategy: "HARD_RULES"  # System-wide setting
+  
+  hard_rules:
+    min_row_count: 50
+    min_column_consistency_percent: 95
+```
+
+#### Step 2: Decide Classification Approach
+```
+IF table passes quality rules:
+  → Store with structured stats (for audit)
+  → BUT use text-based confidence for file-level reporting
+  
+ELSE:
+  → Use text-based classification
+  → Text-based confidence
+```
+
+**Rationale**: File-level aggregation uses text-based approach, but we preserve structured stats for individual tables for debugging/audit purposes.
+
+### 3.3 Confidence Tiers
+
+**Three-tier system:**
+
+| Tier | Score Range | Criteria |
+|------|-------------|----------|
+| **HIGH** | ≥ 0.7 | Strong signals across multiple factors |
+| **MEDIUM** | 0.4 - 0.69 | Moderate signals, some uncertainty |
+| **LOW** | < 0.4 | Weak signals, likely false positives |
+
+### 3.4 Quick Filters (Automatic LOW)
+
+Before calculating confidence, check for deal-breakers:
+
+```python
+Automatic LOW confidence if:
+  - null_percentage > 80%        (sparse column)
+  - distinct_percentage < 1%     (test data - all same value)
+  - regex_match_rate < 10%       (mostly false positives)
+  - most_common_value is known test value (e.g., "123-45-6789")
+```
+
+---
+
+## 4. File-Level Aggregation
+
+### 4.1 Configuration (System-Wide)
+
+```yaml
+file_level_aggregation:
+  high_confidence_threshold:
+    min_match_count: 100
+    # If ≥100 high-confidence matches → File = HIGH
+  
+  medium_confidence_threshold:
+    min_match_count: 50
+    # If ≥50 medium-confidence matches → File = MEDIUM
+```
+
+### 4.2 Aggregation Logic
+
+```
+For a complete file:
+  Count matches by confidence tier
+  
+  IF high_confidence_matches ≥ 100:
+    File confidence = HIGH
+  ELIF medium_confidence_matches ≥ 50:
+    File confidence = MEDIUM
+  ELSE:
+    File confidence = LOW
+```
+
+### 4.3 Future Enhancement (Not Implemented Yet)
+
+```yaml
+# Planned for future:
+validation_rule_multiplier: 0.5
+# If classifier has validation (Luhn, NIST), reduce threshold by 50%
+```
+
+---
+
+## 5. Data Flow Summary
+
+### 5.1 Structured Data (Database) Flow
+
+```
+1. Worker receives classification task
+   ↓
+2. Process column-by-column (up to 30K rows)
+   ↓
+3. Calculate column statistics ONCE
+   ↓
+4. For EACH classifier:
+   a. Run regex pattern matching
+   b. Calculate match statistics
+   c. Calculate confidence tier (LOW/MEDIUM/HIGH)
+   d. Store in PIIFinding.context_data
+   ↓
+5. convert_findings_to_db_format()
+   a. Extract statistics from context_data
+   b. Aggregate findings per (column + classifier)
+   c. Create database records
+   ↓
+6. Store one record per (column + classifier) combination
+```
+
+### 5.2 File Data Flow
+
+```
+1. Worker receives classification task
+   ↓
+2. Content extractor processes file
+   ↓
+3. For each extracted component (table/text):
+   a. If table: Assess quality
+   b. Classify content
+   c. Calculate component-level confidence
+   ↓
+4. Aggregate all components to file level
+   ↓
+5. Apply file-level thresholds (100/50 matches)
+   ↓
+6. Store one record per (file + classifier) combination
+```
+
+---
+
+## 6. Database Schema Implications
+
+### 6.1 Findings Table Structure
+
+```sql
+CREATE TABLE scan_findings (
+  finding_key_hash BINARY(32) PRIMARY KEY,
+  scan_job_id INTEGER,
+  classifier_id VARCHAR(100),
+  entity_type VARCHAR(50),
+  
+  -- Location (structured)
+  schema_name VARCHAR(100),
+  table_name VARCHAR(100),
+  column_name VARCHAR(100),
+  
+  -- Location (files)
+  file_path VARCHAR(500),
+  file_name VARCHAR(255),
+  
+  -- Match counts
+  finding_count INTEGER,
+  total_rows_in_source INTEGER,
+  
+  -- Confidence metrics
+  average_confidence DECIMAL(5,4),
+  max_confidence DECIMAL(5,4),
+  confidence_tier VARCHAR(10),  -- LOW/MEDIUM/HIGH
+  
+  -- Column statistics
+  null_percentage DECIMAL(5,2),
+  min_length INTEGER,
+  max_length INTEGER,
+  mean_length DECIMAL(10,2),
+  distinct_value_count INTEGER,
+  distinct_value_percentage DECIMAL(5,2),
+  
+  -- Match statistics
+  regex_match_rate DECIMAL(5,2),
+  distinct_regex_matches INTEGER,
+  column_name_matched BOOLEAN,
+  words_match_rate DECIMAL(5,2),
+  exact_match_rate DECIMAL(5,2),
+  negative_match_rate DECIMAL(5,2),
+  
+  -- Sample data
+  sample_findings JSON,
+  
+  created_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+### 6.2 One Record Per Finding
+
+**Key principle**: One database record represents one (object + classifier) pair
+
+- For databases: One record per (column + classifier)
+- For files: One record per (file + classifier)
+- Same column can have multiple records (one per classifier tested)
+
+---
+
+## 7. Configuration Management
+
+### 7.1 Scope Decision
+
+**System-wide configuration** (for initial implementation):
+- All datasources use same rules
+- Can be overridden at job level later
+- Simpler to manage and reason about
+
+### 7.2 Configuration Hierarchy (Future)
+
+```
+Priority order (highest to lowest):
+1. Job-level config (not implemented yet)
+2. Datasource-level config (not implemented yet)
+3. System-wide config (current implementation)
+```
+
+---
+
+## 8. Key Design Principles
+
+### 8.1 Flexibility
+- Use `context_data` Dict for extensibility
+- No model changes required for new statistics
+- Configuration-driven behavior
+
+### 8.2 Separation of Concerns
+- Presidio handles pattern matching + NLP
+- Your code handles phrase matching + confidence calculation
+- Clear boundaries between components
+
+### 8.3 Multi-Classifier Support
+- Same column/file can match multiple classifiers
+- Each gets independent statistics and confidence
+- Natural handling through per-classifier loops
+
+### 8.4 Progressive Enhancement
+- Start simple (hard rules, system-wide config)
+- Can add complexity later (score-based, per-datasource config)
+- Preserve backward compatibility
+
+---
+
+## 9. Open Questions / Future Enhancements
+
+### 9.1 Not Yet Decided
+- Validation rule multiplier (reduce thresholds for validated classifiers)
+- Per-datasource configuration overrides
+- Score-based table quality assessment (vs hard rules)
+- Confidence formula configurability
+
+### 9.2 Future Improvements
+- Machine learning for confidence calculation
+- User feedback loop (mark false positives)
+- Pattern performance analytics
+- Auto-tuning thresholds based on historical data
+
+Should or should not
+Move from row based to column based for structured (keeping in mind the 50 k char limit of presidio)
+
+---
+
+## 10. Example Scenarios
+
+### 10.1 Database Column Classification
+
+```
+Table: customers
+Column: "employee_ssn" (VARCHAR)
+Rows scanned: 30,000
+
+Classifier: US_SSN
+
+Results:
+  Column stats:
+    - Nulls: 2%
+    - Length: 9-11 chars (consistent)
+    - Distinct: 99.8% (high uniqueness)
+  
+  Match stats:
+    - Regex matches: 29,400 (98% match rate)
+    - Column name matched: TRUE ("ssn" keyword)
+    - Words context: 125 matches (0.4%)
+    - Exact phrases: 45 matches (0.15%)
+    - Negatives: 12 matches (0.04%)
+  
+  Confidence calculation:
+    - Pattern match: 0.3 (98% match rate)
+    - Data quality: 0.2 (consistent, unique)
+    - Column name: 0.3 (matched)
+    - Context: 0.004 (low but present)
+    - Exclusion penalty: -0.0004
+    
+    Total: 0.804 → HIGH confidence
+```
+
+### 10.2 File with Multiple Tables
+
+```
+File: employee_report.pdf
+
+Table 1 (Page 5):
+  - 200 SSN matches
+  - Quality: PASS (250 rows, 100% column consistency)
+  - Individual confidence: HIGH (0.85)
+
+Table 2 (Page 12):
+  - 50 SSN matches
+  - Quality: FAIL (8 rows, 75% column consistency)
+  - Treated as text, confidence: MEDIUM (0.55)
+
+Text section (Page 20):
+  - 5 SSN matches
+  - Confidence: LOW (0.25)
+
+File-level aggregation:
+  - HIGH confidence matches: 200
+  - 200 ≥ 100 threshold
+  - File confidence = HIGH
+```
+
+---
+
+Addendum :
+Of course. Here is a design document that synthesizes our discussion about the improved dictionary, the five processing strategies, and the dynamic, rule-based approach to classification.
+
+-----
+
+## **Design Document: Enhanced Classification & Dynamic Processing Strategy**
+
+### **1. Introduction**
+
+This document outlines an enhanced, flexible strategy for PII classification. The core of this design is a move to a centralized, reusable dictionary model and a dynamic processing engine that can select the optimal classification strategy (e.g., row-based vs. columnar) based on the requirements of the active classifiers. This provides a tunable balance between performance and accuracy.
+
+-----
+
+### **2. The Centralized Dictionary Model**
+
+To improve reusability and control, the classification dictionary will be moved into its own database table and linked directly to a classifier.
+
+#### **2.1. Standalone `dictionaries` Table**
+
+A new `dictionaries` table will be created. This allows a single dictionary (e.g., "US State Names") to be created once and reused by multiple classifiers (e.g., `US_STATE`, `US_DRIVER_LICENSE`).
+
+#### **2.2. Dictionary-to-Classifier Link**
+
+The dictionary is tied to the overall concept of a classifier, not a single regex pattern. Therefore, a new foreign key column, **`dictionary_id`**, will be added to the **`classifiers`** table to create this link.
+
+#### **2.3. Rule-Based Dictionary Structure**
+
+The dictionary fields (`column_names`, `words`, `exact_match`, `negative`) will be enhanced to become explicit rules, each with its own confidence boost. Instead of storing a simple list of strings, these columns will store a JSON object containing the list and its associated boost.
+
+**Example `dictionaries` Record (as JSON):**
+
+```json
+{
+  "name": "US_SSN_Dictionary",
+  "description": "Keywords and rules for detecting US Social Security Numbers.",
+  "column_names": {
+    "vallst": ["ssn", "social_security", "tax_id"],
+    "boost": 0.3
+  },
+  "words": {
+    "vallst": ["social", "security", "ssn"],
+    "boost": 0.1
+  },
+  "exact_match": {
+    "vallst": ["social security number", "social security no"],
+    "boost": 0.4
+  },
+  "negative": {
+    "vallst": ["test", "sample", "example"],
+    "boost": -0.5
+  },
+  "cross_column_support": {
+     "enabled": true,
+     "rules": [ ... ]
+  }
+}
+```
+
+-----
+
+### **3. Dynamic Classification Strategy**
+
+The system will dynamically choose the most appropriate processing strategy to balance performance and accuracy.
+
+#### **3.1. The `requires_row_context` Flag**
+
+A new boolean column, **`requires_row_context`**, will be added to the `classifiers` table. This flag serves as a declaration:
+
+  * **`true`**: This classifier's accuracy depends on seeing data from other columns in the same row (e.g., a Bank Account classifier that looks for a bank name).
+  * **`false`**: This classifier can operate on a value in isolation (e.g., a simple email regex).
+
+#### **3.2. Dynamic Strategy Selection Logic**
+
+The `RowProcessor` will be updated with the following logic before it processes a table:
+
+1.  It will get the list of all classifiers active for the current job.
+2.  It will check if **any** of those classifiers has `requires_row_context` set to `true`.
+3.  **If `true`**, it **must** use the accurate **Row-Based** processing strategy.
+4.  **If `false`**, it can default to the more performant **Columnar** strategy.
+
+-----
+
+### **4. The Five Processing Strategies**
+
+The system will be designed to support the following five strategies, which can be selected for A/B testing and optimization.
+
+| Strategy | Description | Pros | Cons |
+| :--- | :--- | :--- | :--- |
+| **1. Row-Based**<br>*(No Names)* | Concatenates values from a single row.<br>`"John Doe | j@e.com"` | ✅ Preserves cross-column context. | ❌ Unreliable mapping; impossible to know which column a finding came from. |
+| **2. Row-Based**<br>*(With Names)* | Concatenates values and column names from a single row.<br>`"name:John Doe"` | ✅ Preserves cross-column context.<br>✅ **Reliable Mapping** back to the source column. | ⚠️ Lower performance (one engine call per row). |
+| **3. Multi-Row**<br>*(With Names)* | Batches multiple rows, including column names.<br>`"name:John...||name:Jane..."` | ✅ Higher performance. | ❌ Pollutes context between rows, risking false positives. |
+| **4. Multi-Row**<br>*(No Names)* | Batches multiple rows, values only.<br>`"John...||Jane..."` | ✅ Highest theoretical performance. | ❌ Unreliable mapping.<br>❌ Pollutes context between rows. |
+| **5. Columnar** | Concatenates all values from a single column.<br>`"John | Jane | ..."` | ✅ Good for single, self-contained columns. | ❌ **Destroys All Cross-Column Context**. |
+
+-----
+
+### **5. Recommended Hybrid Approach & Text Blob Handling**
+
+Based on the analysis, the recommended implementation is a hybrid approach controlled by the dynamic selection logic.
+
+  * **Default for Accuracy**: When any active classifier has `requires_row_context = true`, the system will use **Strategy \#2 (Row-Based with Column Names)**. This remains the best method for guaranteeing accuracy and reliable mapping.
+
+  * **Default for Performance**: When no active classifiers require row context, the system will use **Strategy \#5 (Columnar)** to maximize throughput.
+
+  * **Handling Text Blobs**: Large text blob columns (e.g., `NVARCHAR(MAX)`) will always be handled as a special case. They will be extracted from their row and processed individually using **Strategy \#5 (Columnar)**. This prevents a single large field from breaking the character limits of the row-based methods and allows for efficient chunking of the large text.
+  
+  Yes, that is exactly correct.
+
+ `requires_row_context = true` flag on a classifier serves as a signal that its accuracy depends on rules defined in the `cross_column_support` section of its dictionary.
+
+Here is the complete workflow:
+1.  You define a dictionary that contains a `cross_column_support` rule (e.g., a rule to look for a bank name in another column).
+2.  You attach this dictionary to your **Bank Account Number** classifier.
+3.  Because this classifier now uses cross-column logic, you set its `requires_row_context` flag to **`true`**.
+4.  When a job runs, the `RowProcessor` checks all active classifiers. It sees that the **Bank Account Number** classifier has its flag set to `true`.
+5.  Therefore, the `RowProcessor` knows it **must** use the **row-based** processing strategy to ensure it can evaluate the cross-column rules correctly.
+
+This is the perfect way to link the needs of a specific classifier to the behavior of the processing engine.

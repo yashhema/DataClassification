@@ -24,6 +24,9 @@ regex
 # Connector for SMB/CIFS file shares
 smbprotocol
 
+tzdata
+python-magic
+python-magic-bin
 
 # -------------------------------------------
 # --- Optional Content Extraction Libraries ---

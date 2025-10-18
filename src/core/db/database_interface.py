@@ -1373,7 +1373,10 @@ class DatabaseInterface:
                         # --- THIS IS THE FIX ---
                         # Eagerly load the exclude_list relationship as well.
                         joinedload(ClassifierTemplate.classifiers)
-                        .joinedload(Classifier.exclude_list)
+                        .joinedload(Classifier.exclude_list),
+                        # Eagerly load the dictionary relationship as well.
+                        joinedload(ClassifierTemplate.classifiers)
+                        .joinedload(Classifier.dictionary)                       
                         # --- END OF FIX ---
                         
                     )
@@ -1697,128 +1700,165 @@ class DatabaseInterface:
                                               object_count=len(objects), **context)
                 raise
 
-    async def insert_scan_findings(self, findings: List[Dict[str, Any]], context: Optional[Dict[str, Any]] = None) -> int:
-        """Insert scan findings into the findings tables using hash-based primary keys with upsert logic."""
 
+    async def insert_scan_findings(self, findings: List[Dict[str, Any]], context: Optional[Dict[str, Any]] = None) -> int:
+        """Insert scan findings with statistics into the findings table using hash-based primary keys with upsert logic."""
         
         context = context or {}
         if not findings:
             return 0
-            
-        self.logger.log_database_operation("BULK ", "ScanFindingSummaries", "STARTED", 
+        print(f"[DATABASE] insert_scan_findings called with {len(findings)} records")
+        for i, f in enumerate(findings):
+            print(f"  Record {i}: finding_count={f.get('finding_count')}, "
+                  f"file={f.get('file_name')}, classifier={f.get('classifier_id')}")            
+        self.logger.log_database_operation("BULK INSERT", "ScanFindingSummaries", "STARTED", 
                                          record_count=len(findings), **context)
         try:
             async with self.get_async_session() as session:
-                # Convert findings to ORM format with hash-based primary keys
+                # Convert findings to database format with truncation handling
                 summaries = []
                 for i, finding in enumerate(findings):
-                        # Create finding key hash - this becomes the primary key
-                    # Debug logging to check field names and values
-                    self.logger.info(f"Processing finding {i+1}/{len(findings)}")
-                    self.logger.info(f"Keys in finding dict: {list(finding.keys())}")
+                    # Truncate file_name if needed
+                    file_name = finding.get('file_name')
+                    if file_name and len(file_name) > 4000:
+                        self.logger.warning(f"Truncating file_name from {len(file_name)} to 4000 chars")
+                        file_name = file_name[:4000]
                     
-                    # Check both possible field names
-                    datasource_id_value = finding.get('datasource_id')
-                    data_source_id_value = finding.get('data_source_id') 
-                    
-                    self.logger.info(f"finding.get('datasource_id'): {datasource_id_value}")
-                    self.logger.info(f"finding.get('data_source_id'): {data_source_id_value}")
-                    
-                    # Create a safe copy of finding for logging (remove datetime objects)
-                    safe_finding = {}
-                    for key, value in finding.items():
-                        if hasattr(value, 'isoformat'):  # datetime object
-                            safe_finding[key] = str(value)
-                        else:
-                            safe_finding[key] = value
-                    
-                    self.logger.info(f"Full finding dict (safe): {safe_finding}")
-
-
-                    key_components = [
-                        finding.get('scan_job_id', ''),
-                        finding.get('data_source_id', ''),
-                        finding.get('classifier_id', ''),
-                        finding.get('entity_type', ''),
-                        finding.get('schema_name', '') or '',
-                        finding.get('table_name', '') or '',
-                        finding.get('field_name', '') or '',
-                        finding.get('file_path', '') or '',
-                        finding.get('file_name', '') or ''
-                    ]
-                    key_string = '|'.join(str(comp) for comp in key_components)
-                    finding_key_hash = hashlib.sha256(key_string.encode()).digest()
+                    # file_path can be unlimited (NVARCHAR(MAX)), but log if very large
+                    file_path = finding.get('file_path')
+                    if file_path and len(file_path) > 10000:
+                        self.logger.info(f"Large file_path: {len(file_path)} chars")
                     
                     summary = {
-                        'finding_key_hash': finding_key_hash,  # Primary key
+                        # Core fields
+                        'finding_key_hash': finding.get('finding_key_hash'),
                         'scan_job_id': finding.get('scan_job_id'),
                         'data_source_id': finding.get('data_source_id'),
                         'classifier_id': finding.get('classifier_id'),
                         'entity_type': finding.get('entity_type'),
+                        
+                        # Location fields
                         'schema_name': finding.get('schema_name'),
                         'table_name': finding.get('table_name'),
                         'field_name': finding.get('field_name'),
-                        'file_path': finding.get('file_path'),
-                        'file_name': finding.get('file_name'),
+                        'file_path': file_path,  # Unlimited length
+                        'file_name': file_name,  # Truncated to 5000
                         'file_extension': finding.get('file_extension'),
+                        
+                        # Finding metrics
                         'finding_count': finding.get('finding_count', 1),
                         'average_confidence': finding.get('average_confidence', 0.0),
                         'max_confidence': finding.get('max_confidence', 0.0),
+                        'confidence_tier': finding.get('confidence_tier', 'LOW'),  # NEW
                         'sample_findings': finding.get('sample_findings'),
                         'total_rows_in_source': finding.get('total_rows_in_source'),
-                        'non_null_rows_scanned': finding.get('non_null_rows_scanned')
+                        'non_null_rows_scanned': finding.get('non_null_rows_scanned'),
+                        
+                        # Column statistics (NEW)
+                        'null_percentage': finding.get('null_percentage'),
+                        'min_length': finding.get('min_length'),
+                        'max_length': finding.get('max_length'),
+                        'mean_length': finding.get('mean_length'),
+                        'distinct_value_count': finding.get('distinct_value_count'),
+                        'distinct_value_percentage': finding.get('distinct_value_percentage'),
+                        
+                        # Match statistics (NEW)
+                        'total_regex_matches': finding.get('total_regex_matches', 0),
+                        'regex_match_rate': finding.get('regex_match_rate', 0.0),
+                        'distinct_regex_matches': finding.get('distinct_regex_matches', 0),
+                        'distinct_match_percentage': finding.get('distinct_match_percentage', 0.0),
+                        'column_name_matched': finding.get('column_name_matched', False),
+                        'words_match_count': finding.get('words_match_count', 0),
+                        'words_match_rate': finding.get('words_match_rate', 0.0),
+                        'exact_match_count': finding.get('exact_match_count', 0),
+                        'exact_match_rate': finding.get('exact_match_rate', 0.0),
+                        'negative_match_count': finding.get('negative_match_count', 0),
+                        'negative_match_rate': finding.get('negative_match_rate', 0.0)
                     }
                     summaries.append(summary)
                 
                 def sync_upsert(sync_session):
                     try:
-                        # Use session-local temporary table (single #) with timestamp for uniqueness
+                        # Use session-local temporary table
                         temp_table_name = f"#temp_scan_findings_{int(time.time() * 1000)}"
                         
-                        # Create session-local temporary table
+                        # Create temporary table with ALL new fields
                         create_temp_sql = f"""
                         CREATE TABLE {temp_table_name} (
                             finding_key_hash VARBINARY(32) PRIMARY KEY,
-                            scan_job_id BIGINT,
+                            scan_job_id NVARCHAR(255),
                             data_source_id NVARCHAR(255),
                             classifier_id NVARCHAR(255),
                             entity_type NVARCHAR(255),
                             schema_name NVARCHAR(255),
                             table_name NVARCHAR(255),
                             field_name NVARCHAR(255),
-                            file_path NVARCHAR(4000),
-                            file_name NVARCHAR(255),
+                            file_path NVARCHAR(MAX),
+                            file_name NVARCHAR(4000),
                             file_extension NVARCHAR(50),
                             finding_count INT,
                             average_confidence FLOAT,
                             max_confidence FLOAT,
+                            confidence_tier VARCHAR(10),
                             sample_findings NVARCHAR(MAX),
-                            total_rows_in_source BIGINT,
-                            non_null_rows_scanned BIGINT
+                            total_rows_in_source INT,
+                            non_null_rows_scanned INT,
+                            
+                            -- Column statistics
+                            null_percentage DECIMAL(5,2),
+                            min_length INT,
+                            max_length INT,
+                            mean_length DECIMAL(10,2),
+                            distinct_value_count INT,
+                            distinct_value_percentage DECIMAL(5,2),
+                            
+                            -- Match statistics
+                            total_regex_matches INT,
+                            regex_match_rate DECIMAL(5,2),
+                            distinct_regex_matches INT,
+                            distinct_match_percentage DECIMAL(5,2),
+                            column_name_matched BIT,
+                            words_match_count INT,
+                            words_match_rate DECIMAL(5,2),
+                            exact_match_count INT,
+                            exact_match_rate DECIMAL(5,2),
+                            negative_match_count INT,
+                            negative_match_rate DECIMAL(5,2)
                         )
                         """
                         
                         sync_session.execute(text(create_temp_sql))
                         
-                        # Insert data into temp table using direct SQL with named parameters
+                        # Insert data into temp table
                         if summaries:
                             insert_sql = f"""
                             INSERT INTO {temp_table_name} 
                             (finding_key_hash, scan_job_id, data_source_id, classifier_id, entity_type,
                              schema_name, table_name, field_name, file_path, file_name, file_extension,
-                             finding_count, average_confidence, max_confidence, sample_findings,
-                             total_rows_in_source, non_null_rows_scanned)
+                             finding_count, average_confidence, max_confidence, confidence_tier, sample_findings,
+                             total_rows_in_source, non_null_rows_scanned,
+                             null_percentage, min_length, max_length, mean_length,
+                             distinct_value_count, distinct_value_percentage,
+                             total_regex_matches, regex_match_rate, distinct_regex_matches,
+                             distinct_match_percentage, column_name_matched, words_match_count,
+                             words_match_rate, exact_match_count, exact_match_rate,
+                             negative_match_count, negative_match_rate)
                             VALUES 
                             (:finding_key_hash, :scan_job_id, :data_source_id, :classifier_id, :entity_type,
                              :schema_name, :table_name, :field_name, :file_path, :file_name, :file_extension,
-                             :finding_count, :average_confidence, :max_confidence, :sample_findings,
-                             :total_rows_in_source, :non_null_rows_scanned)
+                             :finding_count, :average_confidence, :max_confidence, :confidence_tier, :sample_findings,
+                             :total_rows_in_source, :non_null_rows_scanned,
+                             :null_percentage, :min_length, :max_length, :mean_length,
+                             :distinct_value_count, :distinct_value_percentage,
+                             :total_regex_matches, :regex_match_rate, :distinct_regex_matches,
+                             :distinct_match_percentage, :column_name_matched, :words_match_count,
+                             :words_match_rate, :exact_match_count, :exact_match_rate,
+                             :negative_match_count, :negative_match_rate)
                             """
                             
-                            # Execute the bulk insert with named parameters
                             sync_session.execute(text(insert_sql), summaries)
                         
-                        # MERGE from temp table to permanent table
+                        # MERGE with ALL new fields
                         merge_sql = f"""
                         MERGE scan_finding_summaries AS target
                         USING {temp_table_name} AS source
@@ -1828,20 +1868,50 @@ class DatabaseInterface:
                                 finding_count = source.finding_count,
                                 average_confidence = source.average_confidence,
                                 max_confidence = source.max_confidence,
+                                confidence_tier = source.confidence_tier,
                                 sample_findings = source.sample_findings,
                                 total_rows_in_source = source.total_rows_in_source,
-                                non_null_rows_scanned = source.non_null_rows_scanned
+                                non_null_rows_scanned = source.non_null_rows_scanned,
+                                null_percentage = source.null_percentage,
+                                min_length = source.min_length,
+                                max_length = source.max_length,
+                                mean_length = source.mean_length,
+                                distinct_value_count = source.distinct_value_count,
+                                distinct_value_percentage = source.distinct_value_percentage,
+                                total_regex_matches = source.total_regex_matches,
+                                regex_match_rate = source.regex_match_rate,
+                                distinct_regex_matches = source.distinct_regex_matches,
+                                distinct_match_percentage = source.distinct_match_percentage,
+                                column_name_matched = source.column_name_matched,
+                                words_match_count = source.words_match_count,
+                                words_match_rate = source.words_match_rate,
+                                exact_match_count = source.exact_match_count,
+                                exact_match_rate = source.exact_match_rate,
+                                negative_match_count = source.negative_match_count,
+                                negative_match_rate = source.negative_match_rate
                         WHEN NOT MATCHED THEN
                             INSERT (finding_key_hash, scan_job_id, data_source_id, classifier_id, entity_type,
                                     schema_name, table_name, field_name, file_path, file_name, file_extension,
-                                    finding_count, average_confidence, max_confidence, sample_findings,
-                                    total_rows_in_source, non_null_rows_scanned)
+                                    finding_count, average_confidence, max_confidence, confidence_tier, sample_findings,
+                                    total_rows_in_source, non_null_rows_scanned,
+                                    null_percentage, min_length, max_length, mean_length,
+                                    distinct_value_count, distinct_value_percentage,
+                                    total_regex_matches, regex_match_rate, distinct_regex_matches,
+                                    distinct_match_percentage, column_name_matched, words_match_count,
+                                    words_match_rate, exact_match_count, exact_match_rate,
+                                    negative_match_count, negative_match_rate)
                             VALUES (source.finding_key_hash, source.scan_job_id, source.data_source_id,
                                     source.classifier_id, source.entity_type, source.schema_name,
                                     source.table_name, source.field_name, source.file_path, source.file_name,
                                     source.file_extension, source.finding_count, source.average_confidence,
-                                    source.max_confidence, source.sample_findings, source.total_rows_in_source,
-                                    source.non_null_rows_scanned);
+                                    source.max_confidence, source.confidence_tier, source.sample_findings,
+                                    source.total_rows_in_source, source.non_null_rows_scanned,
+                                    source.null_percentage, source.min_length, source.max_length, source.mean_length,
+                                    source.distinct_value_count, source.distinct_value_percentage,
+                                    source.total_regex_matches, source.regex_match_rate, source.distinct_regex_matches,
+                                    source.distinct_match_percentage, source.column_name_matched, source.words_match_count,
+                                    source.words_match_rate, source.exact_match_count, source.exact_match_rate,
+                                    source.negative_match_count, source.negative_match_rate);
                         """
                         
                         sync_session.execute(text(merge_sql))
@@ -1849,7 +1919,6 @@ class DatabaseInterface:
                     except Exception as e:
                         raise
                 
-                # Execute the upsert using the same pattern as your existing code
                 await session.run_sync(sync_upsert)
                 await session.commit()
                 
@@ -1861,7 +1930,6 @@ class DatabaseInterface:
             self.error_handler.handle_error(e, context="insert_scan_findings", 
                                           finding_count=len(findings), **context)
             raise
-
 
 
 

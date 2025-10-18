@@ -8,20 +8,19 @@ a clean, simple API to the rest of the application (e.g., the Orchestrator).
 
 import asyncio
 import json
-
 from typing import Dict, Any, List, Tuple, Optional
 from collections import defaultdict
+
 from core.errors import ProcessingError
-# Import from project structure
 from .engine import ClassificationEngine
 from .row_processor import RowProcessor
 from core.db.database_interface import DatabaseInterface
 from core.config.configuration_manager import ConfigurationManager, ClassificationConfidenceConfig
 from core.logging.system_logger import SystemLogger
 from core.errors import ErrorHandler, ClassificationError, ErrorType
-from core.models.models import PIIFinding
+from core.models.models import PIIFinding, ContentComponent  
 from core.utils.hash_utils import generate_finding_key_hash
-from core.errors import ProcessingError, ErrorType, ErrorHandler
+from classification.generic_enums import ProcessingStrategy  
 # =============================================================================
 # Helper Class: Configuration Loader (Internal to the Interface)
 # =============================================================================
@@ -36,7 +35,7 @@ class _ConfigurationLoader:
         self.job_context = job_context
 
     async def load_and_assemble(self, template_id: str, system_logger: SystemLogger, error_handler: ErrorHandler) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        orm_template =await self.db_interface.get_classifier_template_full(template_id, context=self.job_context)
+        orm_template = await self.db_interface.get_classifier_template_full(template_id, context=self.job_context)
         if not orm_template:
             raise ClassificationError(f"Template '{template_id}' not found.", ErrorType.CONFIGURATION_MISSING)
 
@@ -50,20 +49,35 @@ class _ConfigurationLoader:
 
         classifier_configs = {}
         for orm_classifier in orm_template.classifiers:
-            classifier_configs[orm_classifier.classifier_id] = {
-                "classifier_id": orm_classifier.classifier_id, "entity_type": orm_classifier.entity_type,
+            # Build base classifier config
+            config = {
+                "classifier_id": orm_classifier.classifier_id,
+                "entity_type": orm_classifier.entity_type,
                 "name": orm_classifier.name,
+                "requires_row_context": orm_classifier.requires_row_context,  # NEW: Added boolean flag
                 "patterns": [{"name": p.name, "regex": p.regex, "score": p.score} for p in orm_classifier.patterns],
                 "context_rules": [{"rule_type": p.rule_type.value, "regex": p.regex, "window_before": p.window_before, "window_after": p.window_after} for p in orm_classifier.context_rules],
                 "validation_rules": [{"validation_fn_name": v.validation_fn_name} for v in orm_classifier.validation_rules],
-                # Assumes an 'exclude_list' relationship exists on the ORM model
                 "exclude_list": [e.term_to_exclude for e in getattr(orm_classifier, 'exclude_list', [])]
             }
+            
+            # NEW: Add dictionary if present (optional field)
+            if orm_classifier.dictionary is not None:
+                dict_orm = orm_classifier.dictionary
+                config["dictionary"] = {
+                    "column_names": dict_orm.column_names,      # Already a dict from JSON column
+                    "words": dict_orm.words,                    # Already a dict from JSON column
+                    "exact_match": dict_orm.exact_match,        # Already a dict from JSON column
+                    "negative": dict_orm.negative,              # Already a dict from JSON column
+                    "cross_column_support": dict_orm.cross_column_support  # Already a dict from JSON column
+                }
+            
+            classifier_configs[orm_classifier.classifier_id] = config
+        
         system_logger.debug(f"Assembled template configuration: {json.dumps(template_config, indent=2)}")
         system_logger.debug(f"Assembled classifier configurations: {json.dumps(classifier_configs, indent=2)}")
             
         return template_config, classifier_configs
-
 # =============================================================================
 # The Main Engine Interface
 # =============================================================================
@@ -153,163 +167,614 @@ class EngineInterface:
             return []
 
     def convert_findings_to_db_format(self, all_findings: List[PIIFinding], total_rows_scanned: int) -> List[Dict[str, Any]]:
-            """
-            Converts a list of PIIFinding objects from a data object into the
-            aggregated dictionary format required for database storage.
+        """
+        Converts findings with improved tier-aware aggregation.
+        """
+        import os  # ✅ ADD: Need for file path operations
+        
+        safe_job_context = {k: str(v) if hasattr(v, 'isoformat') else v for k, v in self.job_context.items()}
+        self.logger.info(f"DEBUG: job_context in convert_findings_to_db_format: {safe_job_context}")
+        
+        if not all_findings:
+            return []
+        
+        # Determine source type
+        first_finding_context = all_findings[0].context_data or {}
+        is_file_source = 'file_path' in first_finding_context
 
-            It applies different aggregation logic for structured (database) and
-            unstructured (file) sources.
-
-            Args:
-                all_findings: A list of all PIIFinding objects from a single data object.
-                total_rows_scanned: For structured data, the total rows processed. For
-                                    unstructured data, this should be the total number of
-                                    components processed within the file.
-
-            Returns:
-                A list of dictionaries, each ready for `insert_scan_findings`.
-            """
-            safe_job_context = {k: str(v) if hasattr(v, 'isoformat') else v for k, v in self.job_context.items()}; self.logger.info(f"DEBUG: job_context in convert_findings_to_db_format: {safe_job_context}")
+        # ======================================================================
+        # FILE AGGREGATION LOGIC - FIXED
+        # ======================================================================
+        if is_file_source:
+            # ✅ FIXED: Group by (classifier_id, file_path) instead of just classifier_id
+            summary_map = defaultdict(list)
+            for finding in all_findings:
+                context = finding.context_data or {}
+                file_path = context.get('file_path', '') or ''  # Handle None
+                key = (finding.classifier_id, file_path)
+                summary_map[key].append(finding)
             
-            if not all_findings:
-                return []
-            
-            # --- Determine Source Type from the first finding's context ---
-            first_finding_context = all_findings[0].context_data or {}
-            is_file_source = 'file_path' in first_finding_context
-
-            # ======================================================================
-            # FILE AGGREGATION LOGIC (NEW)
-            # Goal: One summary record per classifier for the entire file.
-            # ======================================================================
-            if is_file_source:
-                # Group all findings from all components by classifier_id
-                summary_map = defaultdict(list)
-                for finding in all_findings:
-                    summary_map[finding.classifier_id].append(finding)
+            db_records = []
+            for (classifier_id, file_path), findings_list in summary_map.items():
+                first_finding = findings_list[0]
+                context = first_finding.context_data or {}
+                scores = [f.confidence_score for f in findings_list]
                 
-                db_records = []
-                for classifier_id, findings_list in summary_map.items():
-                    first_finding = findings_list[0]
-                    context = first_finding.context_data or {}
-                    scores = [f.confidence_score for f in findings_list]
+                # ✅ FIXED: Tier aggregation using percentage-based logic
+                tiers = [f.context_data.get('confidence_tier', 'LOW') if f.context_data else 'LOW' 
+                         for f in findings_list]
+                
+                # Count tier distribution
+                high_count = tiers.count('HIGH')
+                medium_count = tiers.count('MEDIUM')
+                low_count = tiers.count('LOW')
+                total = len(tiers)
+                
+                # Calculate percentages
+                if total > 0:
+                    high_percent = (high_count / total * 100)
+                    medium_percent = (medium_count / total * 100)
+                    combined_high_medium_percent = ((high_count + medium_count) / total * 100)
                     
-                    # --- Aggregated Confidence Score Logic for Files ---
-                    # A file is "HIGH" if it contains any high-confidence findings.
-                    high_conf_score = self.config.confidence_scoring.high_confidence_min_score
-                    has_high_confidence_finding = any(s >= high_conf_score for s in scores)
-                    avg_confidence = sum(scores) / len(scores) if scores else 0
-                    
-                    agg_conf = "LOW"
-                    if has_high_confidence_finding:
-                        agg_conf = "HIGH"
-                    elif avg_confidence > (self.config.confidence_scoring.low_threshold / 100):
-                         agg_conf = "MEDIUM"
+                    # File-level tier logic (more lenient than columns)
+                    if high_percent >= 60:
+                        aggregated_tier = "HIGH"
+                    elif combined_high_medium_percent >= 70:
+                        aggregated_tier = "HIGH"
+                    elif high_percent >= 20 or combined_high_medium_percent >= 40:
+                        aggregated_tier = "MEDIUM"
+                    else:
+                        aggregated_tier = "LOW"
+                else:
+                    aggregated_tier = "LOW"
+                
+                # ✅ FIXED: Calculate distinct matches for file-level stats
+                unique_texts = set()
+                for f in findings_list:
+                    unique_texts.add(f.text)
+                
+                distinct_match_count = len(unique_texts)
+                total_match_count = len(findings_list)
+                
+                samples = [{"text": f.text, "confidence": f.confidence_score} 
+                          for f in findings_list[:self.config.max_samples_per_finding]]
 
-                    samples = [{"text": f.text, "confidence": f.confidence_score} for f in findings_list[:self.config.max_samples_per_finding]]
-
-                    finding_context = {
-                        "data_source_id": self.job_context.get("datasource_id"),
-                        "classifier_id": classifier_id,
-                        "entity_type": first_finding.entity_type,
-                        "schema_name": context.get("table_metadata", {}).get("schema_name"),
-                        "table_name": None,
-                        "field_name": None,
-                        "file_path": context.get("file_path"),
-                        "file_name": context.get("file_name")
-                    } 
-                    finding_key_hash = generate_finding_key_hash(finding_context)
+                # Match statistics from first finding (template for structure)
+                match_stats = context.get('match_statistics')
+                
+                # ✅ FIXED: Extract file metadata properly
+                if file_path:
+                    file_name = os.path.basename(file_path)
+                    file_extension = os.path.splitext(file_name)[1] if file_name else None
+                else:
+                    file_name = None
+                    file_extension = None
+                
+                finding_context = {
+                    "data_source_id": self.job_context.get("datasource_id"),
+                    "classifier_id": classifier_id,
+                    "entity_type": first_finding.entity_type,
+                    "schema_name": context.get("table_metadata", {}).get("schema_name"),
+                    "table_name": None,
+                    "field_name": None,
+                    "file_path": file_path,
+                    "file_name": file_name
+                } 
+                finding_key_hash = generate_finding_key_hash(finding_context)
+                
+                record = {
+                    'finding_key_hash': finding_key_hash,
+                    "scan_job_id": self.job_context.get("job_id"),
+                    "data_source_id": self.job_context.get("datasource_id"),
+                    "classifier_id": classifier_id,
+                    "entity_type": first_finding.entity_type,
+                    "schema_name": None,
+                    "table_name": None,
+                    "field_name": None,
+                    "file_path": file_path,  # ✅ Full path
+                    "file_name": file_name,  # ✅ Basename only
+                    "file_extension": file_extension,  # ✅ Extracted
+                    "finding_count": len(findings_list),
+                    "average_confidence": sum(scores) / len(scores) if scores else 0,
+                    "max_confidence": max(scores) if scores else 0,
+                    "confidence_tier": aggregated_tier,
+                    "sample_findings": json.dumps(samples),
+                    "total_rows_in_source": total_rows_scanned,
                     
-                    record = {
-                        'finding_key_hash': finding_key_hash,
-                        "scan_job_id": self.job_context.get("job_id"),
-                        "data_source_id": self.job_context.get("datasource_id"),
-                        "classifier_id": classifier_id,
-                        "entity_type": first_finding.entity_type,
-                        "schema_name": None,
-                        "table_name": None,
-                        "field_name": None,
-                        "file_path": context.get("file_path"),
-                        "file_name": context.get("file_name"),
-                        "finding_count": len(findings_list),
-                        "average_confidence": avg_confidence,
-                        "max_confidence": max(scores) if scores else 0,
-                        "sample_findings": json.dumps(samples),
-                        "total_rows_in_source": total_rows_scanned,
-                        "aggregated_confidence": agg_conf
-                    }                    
-                    db_records.append(record)
-                return db_records
-
-            # ======================================================================
-            # STRUCTURED DATA AGGREGATION LOGIC (EXISTING)
-            # Goal: One summary record per classifier per field (column).
-            # ======================================================================
-            else:
-                summary_map = defaultdict(lambda: {"findings": [], "high_confidence_rows": set()})
-                high_conf_score = self.config.confidence_scoring.high_confidence_min_score
-
-                for finding in all_findings:
-                    context = finding.context_data or {}
-                    key = (finding.classifier_id, context.get('field_name', ''))
+                    # Column Statistics (NULL for files)
+                    "null_percentage": None,
+                    "min_length": None,
+                    "max_length": None,
+                    "mean_length": None,
+                    "distinct_value_count": None,
+                    "distinct_value_percentage": None,
                     
-                    summary_map[key]["findings"].append(finding)
-                    if finding.confidence_score >= high_conf_score:
-                        row_id_tuple = tuple(sorted(context.get("row_identifier", {}).items()))
-                        if row_id_tuple:
-                            summary_map[key]["high_confidence_rows"].add(row_id_tuple)
-
-                db_records = []
-                for (classifier_id, field_name), data in summary_map.items():
-                    findings_list = data["findings"]
-                    first_finding = findings_list[0]
-                    context = first_finding.context_data or {}
-                    scores = [f.confidence_score for f in findings_list]
-                    
-                    # --- Aggregated Confidence Score Logic for Structured Data ---
-                    high_conf_rows = len(data["high_confidence_rows"])
-                    confidence_percent = (high_conf_rows / total_rows_scanned * 100) if total_rows_scanned > 0 else 0
-                    
-                    agg_conf = "LOW"
-                    if confidence_percent > self.config.confidence_scoring.medium_threshold:
-                        agg_conf = "HIGH"
-                    elif confidence_percent > self.config.confidence_scoring.low_threshold:
-                        agg_conf = "MEDIUM"
-
-                    samples = [{"text": f.text, "confidence": f.confidence_score, "row": f.context_data.get("row_identifier")} for f in findings_list[:self.config.max_samples_per_finding]]
-                    finding_context = {
-                        "data_source_id": self.job_context.get("datasource_id"),
-                        "classifier_id": classifier_id,
-                        "entity_type": first_finding.entity_type,
-                        "schema_name": context.get("table_metadata", {}).get("schema_name"),
-                        "table_name": context.get("table_name"),
-                        "field_name": field_name,
-                        "file_path": None,
-                        "file_name": None
-                    } 
-                    finding_key_hash = generate_finding_key_hash(finding_context)                    
-                    
-                    record = {
-                        'finding_key_hash': finding_key_hash,
-                        "scan_job_id": self.job_context.get("job_id"),
-                        "data_source_id": self.job_context.get("datasource_id"),
-                        "classifier_id": classifier_id,
-                        "entity_type": first_finding.entity_type,
-                        "schema_name": context.get("table_metadata", {}).get("schema_name"),
-                        "table_name": context.get("table_name"),
-                        "field_name": field_name,
-                        "file_path": None,
-                        "file_name": None,
-                        "finding_count": len(findings_list),
-                        "average_confidence": sum(scores) / len(scores) if scores else 0,
-                        "max_confidence": max(scores) if scores else 0,
-                        "sample_findings": json.dumps(samples),
-                        "total_rows_in_source": total_rows_scanned,
-                        # Note: "AggregatedConfidence" is not a column in the ScanFindingSummary table
-                        # and has been omitted to prevent insertion errors.
-                    }                    
-                    db_records.append(record)
+                    # ✅ FIXED: Match Statistics (calculated for file)
+                    "total_regex_matches": total_match_count,  # Total findings
+                    "regex_match_rate": 0.0,  # N/A for files
+                    "distinct_regex_matches": distinct_match_count,  # Unique texts
+                    "distinct_match_percentage": 0.0,  # N/A for files
+                    "column_name_matched": match_stats.column_name_matched if match_stats else False,
+                    "words_match_count": match_stats.words_match_count if match_stats else 0,
+                    "words_match_rate": 0.0,  # N/A for files
+                    "exact_match_count": match_stats.exact_match_count if match_stats else 0,
+                    "exact_match_rate": 0.0,  # N/A for files
+                    "negative_match_count": match_stats.negative_match_count if match_stats else 0,
+                    "negative_match_rate": 0.0  # N/A for files
+                }                    
+                db_records.append(record)
             return db_records
+
+        # ======================================================================
+        # STRUCTURED DATA AGGREGATION LOGIC - UNCHANGED
+        # ======================================================================
+        else:
+            summary_map = defaultdict(lambda: {
+                "findings": [],
+                "high_tier_rows": set(),
+                "medium_tier_rows": set(),
+                "low_tier_rows": set()
+            })
+
+            for finding in all_findings:
+                context = finding.context_data or {}
+                key = (finding.classifier_id, context.get('field_name', ''))
+                
+                summary_map[key]["findings"].append(finding)
+                
+                # Get tier from finding
+                tier = context.get('confidence_tier', 'LOW')
+                
+                # Get row identifier (use confidence score as fallback if no row_id)
+                row_id = context.get("row_identifier", {})
+                
+                # ✅ FIX: If no row_identifier, create one from row_idx
+                if not row_id:
+                    row_idx = context.get('row_idx')
+                    if row_idx is not None:
+                        row_id = {'row_idx': row_idx}
+                
+                # Convert to tuple for set storage
+                row_id_tuple = tuple(sorted(row_id.items())) if row_id else None
+                
+                # Track by tier
+                if row_id_tuple:
+                    if tier == 'HIGH':
+                        summary_map[key]["high_tier_rows"].add(row_id_tuple)
+                    elif tier == 'MEDIUM':
+                        summary_map[key]["medium_tier_rows"].add(row_id_tuple)
+                    else:
+                        summary_map[key]["low_tier_rows"].add(row_id_tuple)
+
+            db_records = []
+            for (classifier_id, field_name), data in summary_map.items():
+                findings_list = data["findings"]
+                first_finding = findings_list[0]
+                context = first_finding.context_data or {}
+                scores = [f.confidence_score for f in findings_list]
+                
+                # ✅ NEW: Calculate tier distribution
+                high_count = len(data["high_tier_rows"])
+                medium_count = len(data["medium_tier_rows"])
+                low_count = len(data["low_tier_rows"])
+                total_finding_rows = high_count + medium_count + low_count
+                
+                # Use total_rows_scanned if we have it, otherwise use finding count
+                denominator = total_rows_scanned if total_rows_scanned > 0 else total_finding_rows
+                
+                if denominator > 0:
+                    high_percent = (high_count / denominator * 100)
+                    medium_percent = (medium_count / denominator * 100)
+                    combined_high_medium_percent = ((high_count + medium_count) / denominator * 100)
+                else:
+                    high_percent = 0
+                    medium_percent = 0
+                    combined_high_medium_percent = 0
+                
+                # ✅ NEW: Tier decision logic
+                # Priority 1: If >60% HIGH tier → Column is HIGH
+                if high_percent > 60:
+                    aggregated_tier = "HIGH"
+                # Priority 2: If >80% are HIGH or MEDIUM → Column is HIGH
+                elif combined_high_medium_percent > 80:
+                    aggregated_tier = "HIGH"
+                # Priority 3: If >30% HIGH or >50% HIGH+MEDIUM → Column is MEDIUM
+                elif high_percent > 30 or combined_high_medium_percent > 50:
+                    aggregated_tier = "MEDIUM"
+                # Otherwise: Column is LOW
+                else:
+                    aggregated_tier = "LOW"
+
+                samples = [{"text": f.text, "confidence": f.confidence_score, "row": f.context_data.get("row_identifier")} 
+                          for f in findings_list[:self.config.max_samples_per_finding]]
+                
+                # Extract statistics
+                column_stats = context.get('column_statistics')
+                match_stats = context.get('match_statistics')
+                
+                finding_context = {
+                    "data_source_id": self.job_context.get("datasource_id"),
+                    "classifier_id": classifier_id,
+                    "entity_type": first_finding.entity_type,
+                    "schema_name": context.get("table_metadata", {}).get("schema_name"),
+                    "table_name": context.get("table_name"),
+                    "field_name": field_name,
+                    "file_path": None,
+                    "file_name": None
+                } 
+                finding_key_hash = generate_finding_key_hash(finding_context)                    
+                
+                record = {
+                    'finding_key_hash': finding_key_hash,
+                    "scan_job_id": self.job_context.get("job_id"),
+                    "data_source_id": self.job_context.get("datasource_id"),
+                    "classifier_id": classifier_id,
+                    "entity_type": first_finding.entity_type,
+                    "schema_name": context.get("table_metadata", {}).get("schema_name"),
+                    "table_name": context.get("table_name"),
+                    "field_name": field_name,
+                    "file_path": None,
+                    "file_name": None,
+                    "finding_count": len(findings_list),
+                    "average_confidence": sum(scores) / len(scores) if scores else 0,
+                    "max_confidence": max(scores) if scores else 0,
+                    "confidence_tier": aggregated_tier,
+                    "sample_findings": json.dumps(samples),
+                    "total_rows_in_source": total_rows_scanned,
+                    
+                    # Column Statistics
+                    "null_percentage": column_stats.null_percentage if column_stats else None,
+                    "min_length": column_stats.min_value_length if column_stats else None,
+                    "max_length": column_stats.max_value_length if column_stats else None,
+                    "mean_length": column_stats.mean_value_length if column_stats else None,
+                    "distinct_value_count": column_stats.distinct_value_count if column_stats else None,
+                    "distinct_value_percentage": column_stats.distinct_value_percentage if column_stats else None,
+                    
+                    # Match Statistics
+                    "total_regex_matches": match_stats.total_regex_matches if match_stats else 0,
+                    "regex_match_rate": match_stats.regex_match_rate if match_stats else 0.0,
+                    "distinct_regex_matches": match_stats.distinct_matches if match_stats else 0,
+                    "distinct_match_percentage": match_stats.distinct_match_percentage if match_stats else 0.0,
+                    "column_name_matched": match_stats.column_name_matched if match_stats else False,
+                    "words_match_count": match_stats.words_match_count if match_stats else 0,
+                    "words_match_rate": match_stats.words_match_rate if match_stats else 0.0,
+                    "exact_match_count": match_stats.exact_match_count if match_stats else 0,
+                    "exact_match_rate": match_stats.exact_match_rate if match_stats else 0.0,
+                    "negative_match_count": match_stats.negative_match_count if match_stats else 0,
+                    "negative_match_rate": match_stats.negative_match_rate if match_stats else 0.0
+                }                    
+                db_records.append(record)
+            
+            return db_records
+
+
+    async def classify_database_table(
+        self, 
+        table_data: List[Dict[str, Any]], 
+        table_metadata: Dict[str, Any]
+    ) -> List[PIIFinding]:
+        """
+        Classifies an entire database table using strategy-based processing.
+        
+        This is the entry point for database table classification. It:
+        1. Selects the appropriate processing strategy
+        2. Gets the list of active classifiers
+        3. Delegates to RowProcessor.process_table()
+        
+        Args:
+            table_data: List of row dictionaries
+            table_metadata: Table schema information
+            
+        Returns:
+            List of PIIFinding objects with full statistics
+        """
+        if not self._engine or not self._row_processor:
+            raise ProcessingError("EngineInterface not initialized.", ErrorType.SYSTEM_INTERNAL_ERROR)
+        
+        try:
+            # Select processing strategy based on classifier requirements
+            strategy = self._select_processing_strategy()
+            
+            # Get active classifiers from engine
+            active_classifiers = list(self._engine.classifier_configs.values())
+            
+            self.logger.info(
+                f"Starting table classification with strategy: {strategy.value}",
+                table_name=table_metadata.get("table_name"),
+                row_count=len(table_data),
+                classifier_count=len(active_classifiers),
+                **self.job_context
+            )
+            
+            # Delegate to RowProcessor
+            findings = await self._row_processor.process_table(
+                table_data=table_data,
+                table_metadata=table_metadata,
+                strategy=strategy,
+                classifier_engine=self._engine,
+                active_classifiers=active_classifiers
+            )
+            
+            self.logger.info(
+                f"Table classification completed",
+                findings_count=len(findings),
+                **self.job_context
+            )
+            
+            return findings
+            
+        except Exception as e:
+            context = {
+                **self.job_context,
+                "table_name": table_metadata.get("table_name"),
+                "schema_name": table_metadata.get("schema_name")
+            }
+            self.logger.error(
+                "Table classification failed",
+                exc_info=True,
+                **context
+            )
+            self.error_handler.handle_error(e, "classify_database_table", **context)
+            return []
+
+
+    async def classify_table_component(
+        self,
+        component: ContentComponent
+    ) -> List[PIIFinding]:
+        """
+        Classifies a table extracted from a file (PDF/Word/Excel) with quality assessment.
+        
+        Flow:
+        1. Assess table quality (row count, column consistency)
+        2. If PASS → Use strategy-based table processing
+        3. If FAIL → Fall back to text-based processing
+        
+        Args:
+            component: ContentComponent with component_type="table"
+            
+        Returns:
+            List of PIIFinding objects
+        """
+        if not self._engine or not self._row_processor:
+            raise ProcessingError("EngineInterface not initialized.", ErrorType.SYSTEM_INTERNAL_ERROR)
+        
+        try:
+            # Extract table data from component
+            table_schema = component.schema
+            
+            if not table_schema or not isinstance(table_schema, dict):
+                self.logger.warning(
+                    "Table component missing valid schema, falling back to text processing",
+                    component_id=component.component_id,
+                    **self.job_context
+                )
+                # Fall back to text processing
+                file_metadata = {
+                    "file_path": component.parent_path,
+                    "file_name": component.parent_path.split('/')[-1] if component.parent_path else component.component_id,
+                    "component_type": component.component_type,
+                    "component_id": component.component_id
+                }
+                return await self.classify_document_content(
+                    content=component.content or "",
+                    file_metadata=file_metadata
+                )
+            
+            # Step 1: Assess table quality
+            quality_passed = self._assess_table_quality(table_schema)
+            
+            if not quality_passed:
+                self.logger.info(
+                    "Table failed quality assessment, using text-based processing",
+                    component_id=component.component_id,
+                    row_count=table_schema.get("row_count", 0),
+                    **self.job_context
+                )
+                # Serialize table to text and process as document
+                serialized_content = table_schema.get("serialized_rows", "")
+                file_metadata = {
+                    "file_path": component.parent_path,
+                    "file_name": component.parent_path.split('/')[-1] if component.parent_path else component.component_id,
+                    "component_type": "table_fallback",
+                    "component_id": component.component_id,
+                    "quality_failed": True
+                }
+                return await self.classify_document_content(
+                    content=serialized_content,
+                    file_metadata=file_metadata
+                )
+            
+            # Step 2: Table passed quality - use strategy-based processing
+            self.logger.info(
+                "Table passed quality assessment, using strategy-based processing",
+                component_id=component.component_id,
+                row_count=table_schema.get("row_count", 0),
+                **self.job_context
+            )
+            
+            # Convert table schema to format expected by process_table()
+            headers = table_schema.get("headers", [])
+            rows = table_schema.get("rows", [])
+            
+            # Build table_metadata
+            table_metadata = {
+                "table_name": component.component_id,
+                "columns": {header: {"data_type": "VARCHAR"} for header in headers},
+                "source_file": component.parent_path,
+                "component_type": component.component_type,
+                "extraction_method": component.extraction_method,
+                "schema_name": None
+            }
+            
+            # Get strategy and active classifiers
+            strategy = self._select_processing_strategy()
+            active_classifiers = list(self._engine.classifier_configs.values())
+            
+            # Process table
+            findings = await self._row_processor.process_table(
+                table_data=rows,
+                table_metadata=table_metadata,
+                strategy=strategy,
+                classifier_engine=self._engine,
+                active_classifiers=active_classifiers
+            )
+            
+            # Enrich findings with file context
+            for finding in findings:
+                if not hasattr(finding, 'context_data') or finding.context_data is None:
+                    finding.context_data = {}
+                finding.context_data.update({
+                    "file_path": component.parent_path,
+                    "file_name": component.parent_path.split('/')[-1] if component.parent_path else component.component_id,
+                    "component_id": component.component_id,
+                    "component_type": component.component_type,
+                    "extraction_method": component.extraction_method,
+                    "table_quality_passed": True
+                })
+            
+            return findings
+            
+        except Exception as e:
+            context = {
+                **self.job_context,
+                "component_id": component.component_id,
+                "parent_path": component.parent_path
+            }
+            self.logger.error(
+                "Table component classification failed",
+                exc_info=True,
+                **context
+            )
+            self.error_handler.handle_error(e, "classify_table_component", **context)
+            return []
+
+
+    def _assess_table_quality(self, table_schema: Dict[str, Any]) -> bool:
+        """
+        Assess if extracted table meets quality thresholds.
+        
+        Uses hard rules from configuration:
+        - Minimum row count
+        - Minimum column consistency percentage
+        
+        Args:
+            table_schema: The schema dict from ContentComponent
+            
+        Returns:
+            True if table passes all quality checks
+        """
+        try:
+            # Get thresholds from config
+            min_row_count = getattr(
+                self.config, 
+                'table_quality_min_row_count', 
+                50  # Default from design doc
+            )
+            min_consistency_percent = getattr(
+                self.config,
+                'table_quality_min_column_consistency_percent',
+                95  # Default from design doc
+            )
+            
+            # Check 1: Minimum row count
+            row_count = table_schema.get('row_count', 0)
+            if row_count < min_row_count:
+                self.logger.debug(
+                    f"Table failed quality check: insufficient rows ({row_count} < {min_row_count})",
+                    **self.job_context
+                )
+                return False
+            
+            # Check 2: Column consistency
+            headers = table_schema.get('headers', [])
+            rows = table_schema.get('rows', [])
+            
+            if not headers or not rows:
+                self.logger.debug(
+                    "Table failed quality check: missing headers or rows",
+                    **self.job_context
+                )
+                return False
+            
+            # Count rows with consistent column structure
+            consistent_rows = sum(
+                1 for row in rows 
+                if isinstance(row, dict) and set(row.keys()) == set(headers)
+            )
+            
+            consistency_percent = (consistent_rows / row_count * 100) if row_count > 0 else 0
+            
+            if consistency_percent < min_consistency_percent:
+                self.logger.debug(
+                    f"Table failed quality check: low column consistency ({consistency_percent:.1f}% < {min_consistency_percent}%)",
+                    **self.job_context
+                )
+                return False
+            
+            # All checks passed
+            self.logger.debug(
+                f"Table passed quality checks: {row_count} rows, {consistency_percent:.1f}% consistency",
+                **self.job_context
+            )
+            return True
+            
+        except Exception as e:
+            self.logger.warning(
+                f"Table quality assessment failed with error: {str(e)}",
+                exc_info=True,
+                **self.job_context
+            )
+            # Default to False on error (fail safe)
+            return False
+
+
+    def _select_processing_strategy(self) -> ProcessingStrategy:
+        """
+        Select processing strategy based on classifier requirements.
+        
+        Logic:
+        - If ANY classifier has requires_row_context=true → MULTI_ROW_WITH_NAMES
+        - Otherwise → COLUMNAR (best performance)
+        
+        Returns:
+            ProcessingStrategy enum value
+        """
+        try:
+            # Get active classifiers
+            active_classifiers = list(self._engine.classifier_configs.values())
+            
+            # Check if any classifier requires row context
+            requires_row_context = any(
+                classifier.get('requires_row_context', False)
+                for classifier in active_classifiers
+            )
+            
+            if requires_row_context:
+                strategy = ProcessingStrategy.MULTI_ROW_WITH_NAMES
+                self.logger.debug(
+                    "Selected MULTI_ROW_WITH_NAMES strategy (row context required)",
+                    **self.job_context
+                )
+            else:
+                strategy = ProcessingStrategy.COLUMNAR
+                self.logger.debug(
+                    "Selected COLUMNAR strategy (no row context required)",
+                    **self.job_context
+                )
+            
+            return strategy
+            
+        except Exception as e:
+            self.logger.warning(
+                f"Strategy selection failed, defaulting to MULTI_ROW_WITH_NAMES: {str(e)}",
+                exc_info=True,
+                **self.job_context
+            )
+            # Default to safe strategy on error
+            return ProcessingStrategy.MULTI_ROW_WITH_NAMES
+
+
 
 # =============================================================================
 # DEMONSTRATION OF USAGE

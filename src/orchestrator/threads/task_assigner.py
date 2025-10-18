@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 from orchestrator.orchestrator_state import JobState
 
 from core.db_models.job_schema import JobType
-from core.models.models import TaskType, PolicySelectorPlanPayload, PolicyConfiguration, WorkPacketHeader, TaskConfig, WorkPacket, DiscoveryEnumeratePayload,BenchmarkExecutePayload,EntitlementExtractPayload
+from core.models.models import TaskType, PolicySelectorPlanPayload, PolicyConfiguration, WorkPacketHeader, TaskConfig, WorkPacket, DiscoveryEnumeratePayload,BenchmarkExecutePayload,EntitlementExtractPayload,DatasourceProfilePayload
 from core.errors import ErrorCategory
 from core.utils.hash_utils import generate_task_id
 
@@ -174,7 +174,7 @@ class TaskAssigner:
                 task_type = TaskType.ENTITLEMENT_EXTRACT
                 payload = EntitlementExtractPayload(
                     datasource_id=datasource_id,
-                    cycle_id=job_config.get("cycle_id")
+                    cycle_id=job_to_claim.configuration.get("cycle_id")
                 )                
             elif job_to_claim.template_type == JobType.POLICY:
                 plan_id = f"plan_{job_to_claim.execution_id}"

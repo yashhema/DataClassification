@@ -111,6 +111,62 @@ class SystemProfile(BaseModel):
     release_date: Optional[str] = Field(None, description="Release date of this version/patch if known, ISO format")
     deployment_model: str = Field(..., description="e.g., 'SELF_MANAGED', 'CLOUD_MANAGED', 'SAAS'")
     vendor_specific_details: Optional[VendorProfileExtension] = None
+
+class DictionaryRule(BaseModel):
+    """A rule consisting of a list of values and an associated confidence boost. used by dictionary table fields"""
+    vallst: List[str] = Field(..., description="The list of keywords or values to match.")
+    boost: float = Field(..., description="The confidence boost to apply if a match is found.")
+    
+
+
+# --- Sub-models for Rule Parameters ---
+
+class BoostTier(BaseModel):
+    """Defines a confidence boost for a specific number of categories found."""
+    categories_found: int
+    confidence_boost: float
+
+class ValueMatchKeyword(BaseModel):
+    """Defines a specific boost for an individual keyword."""
+    value: str
+    boost: float
+
+# --- Main Rule Models ---
+
+class ColNameMatchRule(BaseModel):
+    """Rule to boost confidence if the column's name matches a keyword."""
+    rule_type: Literal["COL_NAME_MATCH"]
+    rule_scope: Literal["all"]
+    description: Optional[str] = None
+    parameters: dict[Literal["keywords", "confidence_boost"], Union[List[str], float]]
+
+class CategoryCoOccurrenceRule(BaseModel):
+    """Rule to boost confidence if other PII categories are in the same row."""
+    rule_type: Literal["CATEGORY_CO_OCCURRENCE"]
+    rule_scope: Literal["row"]
+    description: Optional[str] = None
+    parameters: dict[Literal["target_categories", "boost_tiers"], Union[List[str], List[BoostTier]]]
+
+class ValueMatchRule(BaseModel):
+    """Rule to boost confidence if specific keywords are in other columns of the same row."""
+    rule_type: Literal["VALUE_MATCH_IN_COLUMN_VALUE"]
+    rule_scope: Literal["row"]
+    description: Optional[str] = None
+    parameters: dict[Literal["keywords"], List[ValueMatchKeyword]]
+
+# --- The Discriminated Union and Final Container ---
+
+# This tells Pydantic to use the "rule_type" field to determine which model to use
+CrossColumnRule = Annotated[
+    Union[ColNameMatchRule, CategoryCoOccurrenceRule, ValueMatchRule],
+    Field(discriminator="rule_type")
+]
+
+class CrossColumnSupport(BaseModel):
+    """The top-level model for the cross_column_support field."""
+    enabled: bool
+    rules: List[CrossColumnRule]
+
 # =============================================================================
 # Core Data Contracts (Used across multiple components)
 # =============================================================================

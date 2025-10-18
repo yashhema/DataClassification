@@ -135,13 +135,10 @@ class ClassificationEngine:
 
                 # 1. Get initial raw findings from Presidio
                 raw_results = self.analyzer.analyze(text=content, entities=entity_types, language='en')
-                #for i, result in enumerate(raw_results):
-                #    print(f"Result {i}: {result.entity_type}")
-                    #print(f"  analysis_explanation: {result.analysis_explanation}")
-                    #print(f"  recognition_metadata: {getattr(result, 'recognition_metadata', 'Not present')}")
-                    #print(f"  hasattr analysis_explanation: {hasattr(result, 'analysis_explanation')}")
-                    #if hasattr(result, 'analysis_explanation') and result.analysis_explanation:
-                    #    print(f"  recognizer: {result.analysis_explanation.recognizer}")                
+                #if len(raw_results) >0:
+                #    print (f"  File Content Is: {content}")
+                #print(f"[INTERFACE] For file: {context_info.get('file_path')}")
+          
                 #print(f"CRITICAL DEBUG: Presidio returned {len(raw_results)} results in real app")
                 # 2. Run the post-processing pipeline
                 processed_findings = []
@@ -193,6 +190,7 @@ class ClassificationEngine:
                         # Attach the rich context for later use
                         context_data=context_info 
                     )
+                    
                     processed_findings.append(finding)
 
                 return processed_findings

@@ -1,0 +1,131 @@
+import asyncio
+import logging
+from collections import defaultdict
+
+# Core component imports
+from core.config.configuration_manager import ConfigurationManager
+from core.db.database_interface import DatabaseInterface
+from core.errors import ErrorHandler
+from core.logging.system_logger import SystemLogger
+
+# --- USER CONFIGURATION ---
+
+# The script will look for these words (case-insensitive) in a classifier's name.
+CREDIT_CARD_KEYWORDS = ['credit', 'card', 'cc', 'visa', 'mastercard', 'mc', 'amex', 'discover']
+SSN_KEYWORDS = ['ssn', 'social security', 'social_security']
+
+# If a classifier's name contains any of these words, it will be skipped.
+EXCLUSION_KEYWORDS = ['test', 'sample', 'example', 'encrypted', 'masked','four','digit']
+
+# Path to your main configuration file
+CONFIG_FILE_PATH = "config/system_default.yaml"
+
+# Name of the generated SQL script file
+OUTPUT_SQL_FILE_NAME = "new_validation_rules.sql"
+
+# --- END OF CONFIGURATION ---
+
+# Map keywords to the validation functions available in the code
+RULES_TO_APPLY = {
+    'credit_card': 'validate_luhn_algorithm',
+    'ssn': 'validate_ssn_nist'
+}
+
+async def main():
+    """
+    Connects to the DB, finds classifiers matching keywords, and generates
+    SQL INSERT statements for missing validation rules.
+    """
+    db_interface = None
+    sql_statements = []
+    print("=" * 80)
+    print("🔎 Classifier Validation Rule Generation Script")
+    print("=" * 80)
+
+    try:
+        # 1. Initialize core components to connect to the database
+        print("\n[1] Initializing and connecting to the database...")
+        logging.basicConfig(level=logging.WARNING)
+        error_handler = ErrorHandler()
+        temp_logger = SystemLogger(logging.getLogger("script_startup"), "TEXT", {})
+        config_manager = ConfigurationManager(CONFIG_FILE_PATH)
+        config_manager.set_core_services(temp_logger, error_handler)
+        db_interface = DatabaseInterface(config_manager.get_db_connection_string(), temp_logger, error_handler)
+        
+        if not await db_interface.test_connection():
+            print("\n❌ DATABASE CONNECTION FAILED. Please check your configuration.")
+            return
+        print("    ✓ Database connection successful.")
+
+        # 2. Fetch all classifiers and their existing validation rules
+        print("\n[2] Fetching all existing classifiers and rules...")
+        query = """
+            SELECT c.id, c.classifier_id, c.name, cvr.validation_fn_name
+            FROM classifiers c
+            LEFT JOIN classifier_validation_rules cvr ON c.id = cvr.classifier_id
+            ORDER BY c.name;
+        """
+        results = await db_interface.execute_raw_sql(query)
+        
+        if not results:
+            print("    ❌ No classifiers found in the database.")
+            return
+
+        # Group existing rules by classifier ID for easy lookup
+        classifiers = defaultdict(lambda: {'name': '', 'classifier_id': '', 'rules': set()})
+        for row in results:
+            classifiers[row['id']]['name'] = row['name']
+            classifiers[row['id']]['classifier_id'] = row['classifier_id']
+            if row['validation_fn_name']:
+                classifiers[row['id']]['rules'].add(row['validation_fn_name'])
+        
+        print(f"    ✓ Found {len(classifiers)} total classifiers.")
+
+        # 3. Process each classifier
+        print("\n[3] Analyzing classifiers and generating new rules...")
+        for db_id, data in classifiers.items():
+            name_lower = data['name'].lower()
+
+            # --- Exclusion Check ---
+            if any(keyword in name_lower for keyword in EXCLUSION_KEYWORDS):
+                print(f"    - Skipping '{data['name']}' (matches exclusion keyword).")
+                continue
+
+            # --- Credit Card Check ---
+            if any(keyword in name_lower for keyword in CREDIT_CARD_KEYWORDS):
+                rule_name = RULES_TO_APPLY['credit_card']
+                if rule_name not in data['rules']:
+                    print(f"    + Adding '{rule_name}' to '{data['name']}'.")
+                    sql = f"INSERT INTO classifier_validation_rules (classifier_id, validation_fn_name) VALUES ({db_id}, '{rule_name}');"
+                    sql_statements.append(sql)
+
+            # --- SSN Check ---
+            if any(keyword in name_lower for keyword in SSN_KEYWORDS):
+                rule_name = RULES_TO_APPLY['ssn']
+                if rule_name not in data['rules']:
+                    print(f"    + Adding '{rule_name}' to '{data['name']}'.")
+                    sql = f"INSERT INTO classifier_validation_rules (classifier_id, validation_fn_name) VALUES ({db_id}, '{rule_name}');"
+                    sql_statements.append(sql)
+        
+        # 4. Write the generated SQL to a file
+        print("\n[4] Writing SQL file...")
+        if sql_statements:
+            with open(OUTPUT_SQL_FILE_NAME, 'w') as f:
+                f.write("-- Generated by the validation rule script\n")
+                f.write("-- Review before executing against your database\n\n")
+                for stmt in sql_statements:
+                    f.write(f"{stmt}\n")
+            print(f"    ✓ Success! {len(sql_statements)} new rules written to '{OUTPUT_SQL_FILE_NAME}'.")
+        else:
+            print("    ✓ No new validation rules needed.")
+
+    except Exception as e:
+        print(f"\nFATAL ERROR: An unexpected error occurred: {e}")
+    finally:
+        if db_interface:
+            await db_interface.close_async()
+            print("\n[INFO] Database connection closed.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

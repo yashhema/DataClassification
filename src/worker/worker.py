@@ -26,7 +26,7 @@ from core.errors import ErrorHandler
 
 from core.interfaces.worker_interfaces import (
     IDatabaseDataSourceConnector, 
-    IFileDataSourceConnector
+    IFileDataSourceConnector,IComplianceConnector
 )
 from classification.engineinterface import EngineInterface
 from core.db.database_interface import DatabaseInterface
@@ -909,12 +909,17 @@ class Worker:
                         task_id=work_packet.header.task_id,
                         total_findings=len(all_findings),
                         total_components=total_components)
-        
+
+        for finding in all_findings:
+            
+            print(f"Worker:For file: {finding.context_data.get('file_path')},  Finding : {finding.classifier_id}, text='{finding.text}'")
         db_records =  engine_interface.convert_findings_to_db_format(
             all_findings=all_findings,
             total_rows_scanned=total_components  # For files, this represents component count
         )
-        
+        print(f"[WORKER] convert_findings_to_db_format created {len(db_records)} records")
+        for rec in db_records:
+            print(f"Worker:  Record: classifier={rec['classifier_id']}, finding_count={rec['finding_count']},, file_path={rec['file_path']}")        
         # Store results in database (ASYNC)
         await self._store_classification_results_async(db_records, work_packet)
 
@@ -925,96 +930,70 @@ class Worker:
                         total_findings=len(all_findings),
                         db_records_created=len(db_records))
 
+
     async def _process_database_classification_async(self, connector: IDatabaseDataSourceConnector,
                                                  engine_interface: EngineInterface, work_packet: WorkPacket):
-        """Correctly handles database connectors by processing row-by-row."""
+        """Correctly handles database connectors using strategy-based table processing."""
         all_findings = []
-        objects_processed = 0
         total_rows_scanned = 0
-        total_objects = 0
-        self.logger.info("Starting database classification (row-by-row)", task_id=work_packet.header.task_id)
-
-        # The connector will yield batches of rows for each table/column it processes
-        async for content_batch in connector.get_object_content(work_packet):
-            objects_processed += 1
-            
-            # Extract metadata and row data from the batch
-            metadata = content_batch.get("metadata", {})
-            rows = content_batch.get("content", []) # Expects a list of row dicts
-           
-            if not isinstance(rows, list):
-                self.logger.warning("Database content for classification was not a list of rows.", object_id=metadata.get("object_id"))
-                continue
-            
-            total_rows_scanned += len(rows)
-            # --- THIS IS THE NEW LOGGING ---
-            self.logger.info(
-                f"Processing batch of {len(rows)} rows for object {metadata.get('object_path')}",
-                row_count=len(rows),
-                object_path=metadata.get('object_path')
-            )
-            # --- END OF NEW LOGGING ---
-            # Process each row within the batch
-            for row_index, row_data in enumerate(rows):
-                try:
-                    row_pk = {"row_index": row_index, "object_path": metadata.get("object_path")}
-                    
-                    row_findings = await engine_interface.classify_database_row(
-                        row_data=row_data,
-                        row_pk=row_pk,
-                        table_metadata=metadata  # Pass the rich metadata from the connector
-                    )
-                    all_findings.extend(row_findings)
-                except Exception as e:
-                    self.error_handler.handle_error(e, "classify_database_row", row_index=row_index, object_path=metadata.get("object_path"))
-                    continue # Skip problematic rows
-
-        self.logger.info("Converting findings to database format", task_id=work_packet.header.task_id, total_findings=len(all_findings))
         
-        # Log all findings in detail
-        if all_findings:
+        self.logger.info("Starting database classification (strategy-based)", 
+                        task_id=work_packet.header.task_id)
+
+        # The connector yields batches of rows for each table/column it processes
+        async for content_batch in connector.get_object_content(work_packet):
             try:
-                # Convert all PIIFinding objects to dictionaries for safe JSON serialization
-                findings_as_dicts = []
-                for finding in all_findings:
-                    finding_dict = {
-                        "finding_id": finding.finding_id,
-                        "entity_type": finding.entity_type,
-                        "text": finding.text,  # This contains the actual PII text found
-                        "start_position": finding.start_position,
-                        "end_position": finding.end_position,
-                        "confidence_score": finding.confidence_score,
-                        "classifier_id": finding.classifier_id,
-                        "context_data": finding.context_data  # This is already a dict
-                    }
-                    findings_as_dicts.append(finding_dict)
+                # Extract metadata and row data from the batch
+                metadata = content_batch.get("metadata", {})
+                rows = content_batch.get("content", [])
+            
+                if not isinstance(rows, list):
+                    self.logger.warning(
+                        "Database content for classification was not a list of rows.", 
+                        object_id=metadata.get("object_id")
+                    )
+                    continue
                 
-                # Log all findings as JSON
-                self.logger.info("All PIIFindings from database classification:")
-                self.logger.info(json.dumps(findings_as_dicts, indent=2, default=str))
+                total_rows_scanned += len(rows)
+                
+                self.logger.info(
+                    f"Processing table with {len(rows)} rows using strategy-based processing",
+                    row_count=len(rows),
+                    object_path=metadata.get('object_path')
+                )
+                
+                # NEW: Single call to strategy-based table processing
+                table_findings = await engine_interface.classify_database_table(
+                    table_data=rows,
+                    table_metadata=metadata
+                )
+                
+                all_findings.extend(table_findings)
                 
             except Exception as e:
-                # Fallback to string representation if JSON fails
-                self.logger.warning(f"Failed to serialize findings as JSON: {str(e)}")
-                for i, finding in enumerate(all_findings):
-                    self.logger.info(f"Finding {i+1}: {str(finding)}")
-        else:
-            self.logger.info("No PII findings detected in database classification", task_id=work_packet.header.task_id)
+                self.error_handler.handle_error(
+                    e, 
+                    "classify_database_batch", 
+                    object_path=metadata.get("object_path")
+                )
+                continue  # Skip problematic batches
 
+        self.logger.info(
+            "Database classification completed",
+            task_id=work_packet.header.task_id,
+            total_findings=len(all_findings),
+            total_rows_scanned=total_rows_scanned
+        )
 
-        # Convert all accumulated findings using the correct total row count
+        # Convert findings to database format
         db_records = engine_interface.convert_findings_to_db_format(
             all_findings=all_findings,
             total_rows_scanned=total_rows_scanned
         )
         
         await self._store_classification_results_async(db_records, work_packet)
-        self.logger.info("Database classification completed",
-                        task_id=work_packet.header.task_id,
-                        objects_processed=objects_processed,
-                        total_objects=total_objects,
-                        total_findings=len(all_findings),
-                        db_records_created=len(db_records))
+
+
 
     async def _classify_content_component_async(self, component: ContentComponent, 
                                               engine_interface: EngineInterface, work_packet: WorkPacket) -> List[PIIFinding]:
@@ -1061,110 +1040,38 @@ class Worker:
                              error=str(e))
             return []
 
+
     async def _classify_table_component_async(self, component: ContentComponent, 
-                                            engine_interface: EngineInterface, work_packet: WorkPacket) -> List[PIIFinding]:
-        """Handle table component: row-by-row classification with accumulation (async)."""
+                                            engine_interface: EngineInterface, 
+                                            work_packet: WorkPacket) -> List[PIIFinding]:
+        """
+        Handle table component with quality assessment and strategy-based processing.
         
-        all_row_findings = []  # Accumulate findings from all rows in this table
-        
+        Routes to either:
+        - Strategy-based table processing (if quality passes)
+        - Text-based processing (if quality fails)
+        """
         try:
-            # Validate component has required table data
-            if not hasattr(component, 'schema') or not component.schema:
-                self.logger.warning("Table component missing schema",
-                                   component_id=component.component_id)
-                return []
+            # Single call to new method that handles quality assessment and routing
+            findings = await engine_interface.classify_table_component(component)
             
-            table_schema = component.schema
+            self.logger.debug(
+                "Table component classification completed",
+                component_id=component.component_id,
+                findings_count=len(findings)
+            )
             
-            # Handle both possible table data formats
-            table_rows = []
-            if "rows" in table_schema and isinstance(table_schema["rows"], list):
-                # Structured format: data in schema
-                table_rows = table_schema["rows"]
-            elif component.content:
-                # Serialized format: parse from content
-                table_rows = self._parse_serialized_table_content(component.content, table_schema)
-            
-            if not table_rows:
-                self.logger.warning("Table component has no rows to process",
-                                   component_id=component.component_id)
-                return []
-            
-            headers = table_schema.get("headers", [])
-            
-            # Build table metadata for classification
-            table_metadata = {
-                "table_name": component.component_id,
-                "columns": {header: {} for header in headers},
-                "source_file": component.parent_path,
-                "component_type": component.component_type,
-                "schema_name": None  # Files don't have schema names
-            }
-            
-            # Classify each row individually and accumulate findings
-            for row_index, row_data in enumerate(table_rows):
-                try:
-                    # Ensure row_data is dict format
-                    if not isinstance(row_data, dict):
-                        self.logger.warning("Invalid row data format",
-                                           component_id=component.component_id,
-                                           row_index=row_index,
-                                           row_type=type(row_data))
-                        continue
-                    
-                    row_pk = {
-                        "row_index": row_index, 
-                        "component_id": component.component_id
-                    }
-                    
-                    # Single row classification call (ASYNC)
-                    row_findings = await engine_interface.classify_database_row(
-                        row_data=row_data,
-                        row_pk=row_pk,
-                        table_metadata=table_metadata
-                    )
-                    
-                    # Add component context to each finding
-                    for finding in row_findings:
-                        if not hasattr(finding, 'context_data') or finding.context_data is None:
-                            finding.context_data = {}
-                        finding.context_data.update({
-                            "component_id": component.component_id,
-                            "component_type": component.component_type,
-                            "extraction_method": component.extraction_method,
-                            "row_index": row_index,
-                            "file_path": component.parent_path,
-                            "file_name": component.parent_path.split('/')[-1] if component.parent_path else component.component_id,
-                            "field_name": component.component_id  # Use component_id as field_name
-                        })
-                    
-                    # Accumulate row findings
-                    all_row_findings.extend(row_findings)
-                    
-                except Exception as row_error:
-                    self.logger.warning(
-                        "Failed to classify a single row within a table component.",
-                        exc_info=True,  # This adds the full traceback
-                        component_id=component.component_id,
-                        parent_path=component.parent_path,
-                        row_index=row_index,
-                        job_id=work_packet.header.job_id,
-                        task_id=work_packet.header.task_id
-                    )
-                    # Continue processing other rows
-                    continue
-            
-            self.logger.info("Table component classification completed",
-                            component_id=component.component_id,
-                            rows_processed=len(table_rows),
-                            findings_found=len(all_row_findings))
-            
-            return all_row_findings  # Return accumulated findings from all rows
+            return findings
             
         except Exception as e:
-            self.logger.error("Table component classification failed",
-                             component_id=component.component_id, 
-                             error=str(e))
+            self.logger.error(
+                "Table component classification failed",
+                exc_info=True,
+                component_id=component.component_id,
+                parent_path=component.parent_path,
+                job_id=work_packet.header.job_id,
+                task_id=work_packet.header.task_id
+            )
             return []
 
     def _parse_serialized_table_content(self, content: str, schema: Dict[str, Any]) -> List[Dict[str, Any]]:
