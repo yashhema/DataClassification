@@ -116,70 +116,61 @@ class Pipeliner:
         
         return len(tasks_to_create)
 
-        async def _process_output_record_not_to_use(self, record) -> List[Dict[str, Any]]:
-            """
-            Main dispatcher that routes records to a handler and returns the
-            list of new tasks to be created.
-            """
-            parent_task = await self.db.get_task_by_id(record.task_id)
-            
-            if not parent_task or parent_task.status != TaskStatus.COMPLETED:
-                self.logger.warning(f"Orphaning output record {record.id} from a non-completed or missing parent task.")
-                await self.db.update_output_record_status(record.id, "ORPHANED")
-                return []
 
-            output_type = record.output_type
-            if output_type == "SELECTION_PLAN_CREATED":
-                return await self._fan_out_selection_tasks(parent_task, record)
-            elif output_type == "ACTION_PLAN_CREATED":
-                return await self._fan_out_action_tasks(parent_task, record)
-            elif output_type == "METADATA_RECONCILE_UPDATES":
-                return await self._create_reconciliation_task(parent_task, record)
-            elif output_type in ["DISCOVERED_OBJECTS", "OBJECT_DETAILS_FETCHED"]:
-                return await self._create_next_stage_scan_task(parent_task, record)
-            
-            return []
+    async def _process_output_record(self, record: TaskOutputRecord) -> List[Dict[str, Any]]:
+        """
+        Main dispatcher that routes a record to the correct handler.
+        Creates DISCOVERY_GET_DETAILS if needed.
+        Handles policy workflow outputs.
+        Does NOT create CLASSIFICATION tasks.
+        """
+        tasks_to_create = []
+        parent_task = None
 
+        async with self.db.get_async_session() as session:
+            try:
+                # Fetch the parent task using the active session
+                parent_task = await self.db.get_task_by_id(record.task_id, session=session) # Pass session
 
-    async def _process_output_record(self, record) -> List[Dict[str, Any]]:
-            """
-            Main dispatcher that routes records to a handler and returns the
-            list of new tasks to be created. The initial check is performed in a
-            single transaction to prevent detached instance errors.
-            """
-            # Start a single session that will be used for this entire operation
-            async with self.db.get_async_session() as session:
-                try:
-                    # 1. Fetch the parent task using the active session
-                    parent_task = await self.db.get_task_by_id(record.task_id, session=session)
-                    
-                    # 2. Perform validation while the parent_task is still "attached"
-                    if not parent_task or parent_task.status != TaskStatus.COMPLETED:
-                        self.logger.warning(f"Orphaning output record {record.id} from a non-completed or missing parent task.")
-                        # Use the same session to update the status
-                        await self.db.update_output_record_status(record.id, "ORPHANED", session=session)
-                        await session.commit() # Commit this specific action
-                        return []
+                # Validate parent task state
+                if not parent_task or parent_task.status != TaskStatus.COMPLETED:
+                    self.logger.warning(f"Orphaning output record {record.id} from a non-completed or missing parent task {record.task_id.hex() if record.task_id else 'None'}.")
+                    await self.db.update_output_record_status(record.id, "ORPHANED", session=session) # Pass session
+                    await session.commit() # Commit this specific action
+                    return [] # Exit early
 
-                    # 3. Dispatch to the correct handler to get the parameters for the next tasks.
-                    #    These handlers receive the "attached" parent_task object.
-                    output_type = record.output_type
-                    if output_type == "SELECTION_PLAN_CREATED":
-                        return await self._fan_out_selection_tasks(parent_task, record)
-                    elif output_type == "ACTION_PLAN_CREATED":
-                        return await self._fan_out_action_tasks(parent_task, record)
-                    elif output_type == "METADATA_RECONCILE_UPDATES":
-                        return await self._create_reconciliation_task(parent_task, record)
-                    elif output_type in ["DISCOVERED_OBJECTS", "OBJECT_DETAILS_FETCHED"]:
-                        return await self._create_next_stage_scan_task(parent_task, record)
-                    
-                    return []
-                    
-                except Exception as e:
-                    # If any error occurs during this process, roll back the transaction
-                    await session.rollback()
-                    # Re-raise the exception to be caught by the main run_async loop's error handler
-                    raise
+                output_type = record.output_type
+                context = {"job_id": parent_task.job_id, "parent_task_id": parent_task.id.hex(), "record_id": record.id}
+
+                # --- ROUTING LOGIC ---
+                if output_type == "NEW_ENUMERATION_BOUNDARIES":
+                    # Handles fanning out DISCOVERY_ENUMERATE tasks for sub-boundaries
+                    tasks_to_create = await self._create_new_enumeration_tasks(parent_task, record, context)
+                elif output_type == "DISCOVERED_OBJECTS":
+                    # *** CORRECTED LOGIC ***
+                    # This output now triggers DISCOVERY_GET_DETAILS *if* required by the workflow.
+                    # It NO LONGER triggers CLASSIFICATION tasks.
+                    tasks_to_create = await self._create_next_stage_scan_tasks(parent_task, record, context) # Reinstated call
+                elif output_type == "SELECTION_PLAN_CREATED":
+                     # Handles fanning out POLICY_SELECTOR_EXECUTE or POLICY_COMMIT_PLAN tasks
+                     tasks_to_create = await self._fan_out_selection_tasks(parent_task, record, context)
+                elif output_type == "ACTION_PLAN_CREATED":
+                     # Handles fanning out POLICY_ACTION_EXECUTE tasks
+                     tasks_to_create = await self._fan_out_action_tasks(parent_task, record, context)
+                elif output_type == "METADATA_RECONCILE_UPDATES":
+                     # Creates the final POLICY_RECONCILE task
+                     tasks_to_create = await self._create_reconciliation_task(parent_task, record, context)
+                # Add other policy-related output types if needed
+                else:
+                    self.logger.warning(f"Unknown TaskOutputRecord type '{output_type}' for record {record.id}.", **context)
+                    tasks_to_create = []
+
+            except Exception as e:
+                parent_task_id_str = parent_task.id.hex() if parent_task and parent_task.id else 'None'
+                self.orchestrator.error_handler.handle_error(e, "_process_output_record_dispatch", record_id=record.id, parent_task_id=parent_task_id_str)
+                raise # Re-raise to trigger rollback in process_batch
+
+        return tasks_to_create
 
 
     async def run_async(self):
@@ -316,70 +307,100 @@ class Pipeliner:
         self.logger.info(f"Fanning out {len(discovered_boundaries)} new boundaries into {len(tasks_to_create)} new enumeration tasks.", job_id=parent_task.job_id)
         return tasks_to_create
 
-    async def _create_next_stage_scan_tasks(self, parent_task: Task, record: TaskOutputRecord) -> List[Dict[str, Any]]:
+
+    async def _create_next_stage_scan_tasks(self, parent_task: Task, record: TaskOutputRecord, context: Dict) -> List[Dict[str, Any]]:
         """
-        Creates the next stage of tasks for a batch of discovered files. This can
-        include CLASSIFICATION and an optional DISCOVERY_GET_DETAILS task, based on
-        the job's configuration.
+        *** MODIFIED PURPOSE ***
+        Creates DISCOVERY_GET_DETAILS tasks for a batch of discovered objects *if*
+        the job configuration specifies a 'two-phase' discovery workflow.
+        It DOES NOT create CLASSIFICATION tasks anymore.
         """
-        context = {"parent_task_id": parent_task.id.hex(), "record_id": record.id}
         job = (await self.db.get_jobs_by_ids([parent_task.job_id], context=context))[0]
         if not job:
             self.logger.error(f"Cannot pipeline task for missing job {parent_task.job_id}", **context)
             return []
 
+        # Check the job's configuration for the discovery workflow type
+        workflow = job.configuration.get("discovery_workflow", "single-phase") # Default to single-phase if missing
+
+        # --- Only proceed if it's a two-phase workflow ---
+        if workflow != "two-phase":
+            self.logger.debug(f"Skipping DISCOVERY_GET_DETAILS task creation for job {job.id} (workflow: {workflow})", **context)
+            return [] # Return empty list, no tasks to create
+
+        # --- Proceed with creating DISCOVERY_GET_DETAILS ---
         discovered_object_dicts = record.output_payload.get("discovered_objects", [])
         if not discovered_object_dicts:
             return []
 
-        # Re-instantiate the Pydantic models from the dictionaries in the payload
+        # Re-instantiate the Pydantic models from the dictionaries
+        discovered_objects: List[DiscoveredObject] = []
         for data_dict in discovered_object_dicts:
+            # Handle potential base64 encoded hash from JSON transport
             if 'object_key_hash' in data_dict and isinstance(data_dict['object_key_hash'], str):
-                data_dict['object_key_hash'] = base64.b64decode(data_dict['object_key_hash'])
-        
-        discovered_objects = [DiscoveredObject(**data) for data in discovered_object_dicts if 'object_key_hash' in data]
+                 try:
+                     data_dict['object_key_hash'] = base64.b64decode(data_dict['object_key_hash'])
+                 except Exception:
+                     self.logger.warning(f"Could not decode object_key_hash for object path {data_dict.get('object_path')}", **context)
+                     continue # Skip object with invalid hash
+            # Only add valid objects
+            try:
+                # Ensure mandatory fields for DiscoveredObject are present
+                if all(k in data_dict for k in ['object_key_hash', 'datasource_id', 'object_type', 'object_path']):
+                     # Ensure object_type is a valid enum member if needed before validation
+                     if isinstance(data_dict.get('object_type'), str):
+                         try:
+                             data_dict['object_type'] = ObjectType(data_dict['object_type'])
+                         except ValueError:
+                              self.logger.warning(f"Invalid object_type '{data_dict['object_type']}' for object path {data_dict.get('object_path')}", **context)
+                              continue # Skip object with invalid type
+                     
+                     # Add default discovery_timestamp if missing, Pydantic should handle this
+                     data_dict.setdefault('discovery_timestamp', datetime.now(timezone.utc))
+
+                     discovered_objects.append(DiscoveredObject.model_validate(data)) # Use model_validate
+                else:
+                     self.logger.warning(f"Skipping object due to missing key fields: {data_dict.get('object_path')}", **context)
+            except Exception as pydantic_error:
+                 self.logger.warning(f"Failed to validate DiscoveredObject data: {pydantic_error}", data=data_dict, **context)
+                 continue # Skip invalid object data
+
         if not discovered_objects:
-            self.logger.warning("No valid discovered objects found in output record after decoding.", **context)
+            self.logger.warning("No valid discovered objects found in output record after validation for GET_DETAILS.", **context)
             return []
 
-        # Determine workflow from the job's self-contained configuration
-        workflow = job.configuration.get("discovery_workflow", "single-phase")
         datasource_id = job.configuration.get('datasource_targets', [{}])[0].get('datasource_id')
         if not datasource_id:
             self.logger.error(f"No datasource_id in job configuration for job {job.id}", **context)
             return []
-            
-        tasks_to_create = []
 
-        # 1. Always create the CLASSIFICATION task.
-        class_task_id = generate_task_id()
-        class_header = WorkPacketHeader(task_id=class_task_id.hex(), job_id=job.id, parent_task_id=parent_task.id.hex())
-        class_payload = ClassificationPayload(
-            datasource_id=datasource_id,
-            classifier_template_id=job.configuration.get("classifier_template_id"),
-            discovered_objects=discovered_objects
+        # --- Create ONLY the DISCOVERY_GET_DETAILS task ---
+        tasks_to_create = []
+        details_task_id = generate_task_id()
+        details_header = WorkPacketHeader(
+            task_id=details_task_id.hex(),
+            job_id=job.id,
+            parent_task_id=parent_task.id.hex()
         )
-        class_packet = WorkPacket(header=class_header, config=TaskConfig(), payload=class_payload)
+        # Pass the validated list of DiscoveredObject models
+        details_payload = DiscoveryGetDetailsPayload(
+            datasource_id=datasource_id,
+            discovered_objects=discovered_objects # Pass the Pydantic model list
+        )
+        details_packet = WorkPacket(header=details_header, config=TaskConfig(), payload=details_payload)
+
         tasks_to_create.append({
-            "job_id": job.id, "task_id": class_task_id, "task_type": TaskType.CLASSIFICATION,
-            "work_packet": class_packet.model_dump(mode='json'), "parent_task_id": parent_task.id
+            "job_id": job.id,
+            "task_id": details_task_id, # Use bytes
+            "task_type": TaskType.DISCOVERY_GET_DETAILS.value, # Use enum value
+            "work_packet": details_packet.model_dump(mode='json'), # Serialize Pydantic models correctly
+            "parent_task_id": parent_task.id, # Use bytes
+            "datasource_id": datasource_id, # Add datasource_id
+            "eligible_worker_type": "DATACENTER", # Explicitly set worker type
+            "node_group": job.node_group or "default" # Use job's node group
         })
 
-        # 2. Conditionally create the DISCOVERY_GET_DETAILS task.
-        if workflow == "two-phase":
-            details_task_id = generate_task_id()
-            details_header = WorkPacketHeader(task_id=details_task_id.hex(), job_id=job.id, parent_task_id=parent_task.id.hex())
-            details_payload = DiscoveryGetDetailsPayload(
-                datasource_id=datasource_id,
-                discovered_objects=discovered_objects
-            )
-            details_packet = WorkPacket(header=details_header, config=TaskConfig(), payload=details_payload)
-            tasks_to_create.append({
-                "job_id": job.id, "task_id": details_task_id, "task_type": TaskType.DISCOVERY_GET_DETAILS,
-                "work_packet": details_packet.model_dump(mode='json'), "parent_task_id": parent_task.id
-            })
-
-        self.logger.info(f"Pipeliner creating {len(tasks_to_create)} next-stage tasks for {len(discovered_objects)} objects.", **context)
+        self.logger.info(f"Pipeliner creating {len(tasks_to_create)} DISCOVERY_GET_DETAILS tasks for {len(discovered_objects)} objects.", **context)
         return tasks_to_create
 
 

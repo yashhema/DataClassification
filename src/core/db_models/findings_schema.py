@@ -37,7 +37,7 @@ class ScanFindingSummary(Base):
 
     # === Primary Key ===
     finding_key_hash: Mapped[bytes] = mapped_column(LargeBinary(32), primary_key=True)
-
+    object_path: Mapped[str] = mapped_column(String(5000), nullable=False)
     # === Core Context Fields ===
     scan_job_id: Mapped[str] = mapped_column(String(255), nullable=False)
     data_source_id: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -85,6 +85,7 @@ class ScanFindingSummary(Base):
     exact_match_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     negative_match_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     negative_match_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    scan_timestamp: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), comment="The timestamp when the current lease expires.")
 
 class ScanFindingOccurrence(Base):
     __tablename__ = 'scan_finding_occurrences'

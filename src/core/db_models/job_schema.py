@@ -37,12 +37,29 @@ class JobStatus(str, enum.Enum):
     COMPLETED_WITH_FAILURES = "COMPLETED_WITH_FAILURES" 
     FAILED = "FAILED"
 
+class JobStatus(str, enum.Enum):
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    PAUSING = "PAUSING"
+    PAUSED = "PAUSED"
+    CANCELLING = "CANCELLING"
+    CANCELLED = "CANCELLED"
+    COMPLETED = "COMPLETED"
+    # NEW: Added for more descriptive final state
+    COMPLETED_WITH_FAILURES = "COMPLETED_WITH_FAILURES" 
+    FAILED = "FAILED"
+
+
 class TaskStatus(str, enum.Enum):
     PENDING = "PENDING"
     ASSIGNED = "ASSIGNED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+class ReportingScopeForLatest(str, enum.Enum):
+    ALL = "ALL"
+    CURRENT = "CURRENT"
+
 
 # =================================================================
 # NEW: MasterJob and MasterJobStateSummary Models
@@ -81,6 +98,18 @@ class MasterJobStateSummary(Base):
 # =================================================================
 # Template Models (Unchanged)
 # =================================================================
+# --- Define PolicyType Enum ---
+class PolicyType(str, enum.Enum):
+    REPORTING = "reporting"
+    REMEDIATION_LIFECYCLE = "remediationlifecycle"
+    POLICY_AND_ACTION = "policyandaction"
+    ACTION = "action"
+    POLICY_AND_TAG = "policyandtag"
+    TAG = "tag"
+
+
+
+# --- PolicyTemplate Update ---
 class PolicyTemplate(Base):
     __tablename__ = 'policy_templates'
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -88,18 +117,43 @@ class PolicyTemplate(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(String(1024))
     is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    configuration: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
+    configuration: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False) # of type :PolicyTemplateConfiguration
+
+    # --- NEW FIELDS ---
+    policy_type: Mapped[PolicyType] = mapped_column(
+        SQLAlchemyEnum(PolicyType),
+        nullable=False,
+        comment="Defines the overall purpose of the policy."
+    )
+    
+      
+    # Storing the *master* job ID makes sense for grouping results of a full run.
+    report_on_master_job_id: Mapped[Optional[str]] = mapped_column(
+        String(255), # Master Job IDs are strings
+        nullable=True,
+        comment="If policy_type is 'reporting', specifies the master job ID whose data to query instead of 'latest'."
+    )
+    # --- END NEW FIELDS ---
+
+    reporting_policy_template_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey('policy_templates.id'),
+        nullable=True,
+        comment="Optional ID of a reporting policy to run after this policy completes."
+    )
+    reporting_policy: Mapped[Optional["PolicyTemplate"]] = relationship(remote_side=[id])
+
     jobs: Mapped[List["Job"]] = relationship(
         "Job",
         primaryjoin=lambda: and_(
             PolicyTemplate.id == foreign(Job.template_table_id),
-            Job.template_type == 'POLICY'
+            Job.template_type == JobType.POLICY # Use Enum here
         ),
         back_populates="policy_template",
         viewonly=True
     )
 
 
+# --- ScanTemplate Update ---
 class ScanTemplate(Base):
     __tablename__ = 'scan_templates'
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -111,11 +165,33 @@ class ScanTemplate(Base):
     classifier_template_id: Mapped[str] = mapped_column(String(255), nullable=False)
     is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     configuration: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+    # --- NEW FIELDS ---
+    # Optional FK to a PolicyTemplate (which MUST have policytype="reporting")
+    reporting_policy_template_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey('policy_templates.id'),
+        nullable=True,
+        comment="Optional ID of a reporting policy to run after this scan completes."
+    )
+    # Flag to control writing to the 'latest' S3 branch
+    write_to_latest: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        comment="If True, results promote to 'latest' S3 path on job completion. Delta scans implicitly True."
+    )
+    _reporting_scope: Mapped[ReportingScopeForLatest] = mapped_column(SQLAlchemyEnum(ReportingScopeForLatest), nullable=False, default=ReportingScopeForLatest.ALL)
+    # --- END NEW FIELDS ---
+
+    # Optional relationship for easier access (optional)
+    reporting_policy: Mapped[Optional["PolicyTemplate"]] = relationship()
+
     jobs: Mapped[List["Job"]] = relationship(
         "Job",
         primaryjoin=lambda: and_(
             ScanTemplate.id == foreign(Job.template_table_id),
-            Job.template_type == 'SCANNING'
+            # Allow linking from various scanning job types
+            Job.template_type.in_([JobType.SCANNING, JobType.DB_PROFILE, JobType.BENCHMARK, JobType.ENTITLEMENT, JobType.VULNERABILITY])
         ),
         back_populates="scan_template",
         viewonly=True
@@ -209,8 +285,9 @@ class Task(Base):
     worker_id: Mapped[Optional[str]] = mapped_column(String(255))
     lease_expiry: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
-
-
+    boundary_id: Mapped[Optional[bytes]] = mapped_column(LargeBinary(32), index=True, comment="A hash of the boundary (e.g., directory path) this output pertains to.")
+    eligible_worker_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    node_group: Mapped[str] = mapped_column(String(100), nullable=False)    
 
 
 class TaskOutputRecord(Base):

@@ -91,116 +91,153 @@ class TaskAssigner:
 
     async def _claim_and_initialize_new_job(self) -> bool:
         """
-        Finds a single QUEUED job, claims it, and creates the correct first task
-        with an application-generated hash ID.
+        Finds a single QUEUED job, checks orchestrator load balance, claims the job if appropriate,
+        and creates the correct first task with an application-generated hash ID.
+        Returns True if a job was successfully claimed and initialized, False otherwise.
         """
         nodegroup = self.settings.system.node_group
-        queued_jobs = await self.db.get_queued_jobs_for_nodegroup(nodegroup, limit=1)
+        context = {"nodegroup": nodegroup, "orchestrator_id": self.orchestrator.instance_id}
+        proceed_with_claim = True # Flag to control claim attempt
+
+        # --- LOAD BALANCING CHECK ---
+        try:
+            # Query DB for load counts of *currently active* orchestrators
+            # Use a threshold slightly longer than the LeaseManager interval
+            active_loads = await self.db.get_active_orchestrator_loads(
+                heartbeat_threshold_seconds=self.load_check_heartbeat_threshold,
+                context=context
+            )
+            own_load = 0
+            other_loads = []
+            for load_info in active_loads:
+                if load_info['orchestrator_id'] == self.orchestrator.instance_id:
+                    own_load = load_info['active_job_count']
+                else:
+                    other_loads.append(load_info['active_job_count'])
+
+            # Balancing logic: Skip if own load is > min other load + threshold
+            min_other_load = min(other_loads) if other_loads else 0
+            load_threshold = 2 # Configurable: how many more jobs is "too many"
+
+            # Only apply balancing if more than one orchestrator is active
+            if len(active_loads) > 1 and own_load > min_other_load + load_threshold:
+                self.logger.info(f"Skipping job claim attempt due to load imbalance.",
+                                 own_load=own_load, min_other_load=min_other_load, threshold=load_threshold, **context)
+                proceed_with_claim = False # Set flag to skip claim
+
+        except Exception as load_check_error:
+            # If checking load fails, log warning but proceed cautiously (attempt claim anyway)
+            self.orchestrator.error_handler.handle_error(load_check_error, "check_orchestrator_load_balance", **context)
+            self.logger.warning("Failed to check orchestrator load balance. Proceeding cautiously with claim attempt.", **context)
+            # proceed_with_claim remains True (fallback behavior)
+        # --- END LOAD BALANCING CHECK ---
+
+        # --- Proceed only if load balancing allows ---
+        if not proceed_with_claim:
+            return False # Skipped due to load
+
+        # --- Find and attempt to claim a job ---
+        queued_jobs = await self.db.get_queued_jobs_for_nodegroup(nodegroup, limit=1, context=context)
         if not queued_jobs:
-            return False
+            return False # No new jobs available
 
         job_to_claim = queued_jobs[0]
         job_id = job_to_claim.id
-        
-        lease_duration = 300
+        context["job_id"] = job_id # Add job_id to context after selection
+        context["template_type"] = job_to_claim.template_type.value # Add type for logging
+
+        lease_duration = 300 # Should be configurable via self.settings
         was_claimed = await self.db.claim_queued_job(
-            job_id, self.orchestrator.instance_id, lease_duration
+            job_id, self.orchestrator.instance_id, lease_duration, context=context
         )
 
+        # --- If claim successful, initialize the first task ---
         if was_claimed:
             self.logger.info(
                 f"Successfully claimed new '{job_to_claim.template_type.value}' job {job_id}.",
-                job_id=job_id
+                **context
             )
+            # Update in-memory state after successful claim
             await self.orchestrator._update_job_in_memory_state(
                 job_id=job_id,
                 new_status=JobState.RUNNING,
-                version=job_to_claim.version + 1,
+                version=job_to_claim.version + 1, # DB version implicitly increments on claim
                 lease_expiry=datetime.now(timezone.utc) + timedelta(seconds=lease_duration),
                 is_new=True
             )
-            
-            # --- FIXED: Application-Side Task ID Generation ---
-            
-            # 1. Generate the unique task ID first.
-            new_task_id_bytes = generate_task_id()
-            new_task_id_hex = new_task_id_bytes.hex() # For the WorkPacket
 
-            # 2. Create the WorkPacket with the new ID in the header.
-            header = WorkPacketHeader(
-                task_id=new_task_id_hex, # Use the hex string for the packet
-                job_id=job_id
-            )
-            config = TaskConfig()
-            
-            # 3. Build the appropriate payload based on job type.
-            if job_to_claim.template_type == JobType.SCANNING:
-                datasource_id = job_to_claim.configuration.get('datasource_targets', [{}])[0].get('datasource_id')
-                if not datasource_id:
-                    await self.db.fail_job(job_id, "Job is missing a datasource_id.")
+            # --- Create the FIRST task based on Job Type ---
+            new_task_id_bytes = generate_task_id()
+            new_task_id_hex = new_task_id_bytes.hex()
+            task_type = None
+            payload = None
+            eligible_worker_type = "DATACENTER" # Default
+            target_node_group = job_to_claim.node_group or "default"
+
+            try:
+                # Route to appropriate payload preparation helper
+                if job_to_claim.template_type in [JobType.SCANNING, JobType.DB_PROFILE, JobType.BENCHMARK, JobType.ENTITLEMENT, JobType.VULNERABILITY]:
+                    task_type, payload, eligible_worker_type, target_node_group = await self._prepare_first_scan_task_payload(job_to_claim, new_task_id_hex, context)
+                elif job_to_claim.template_type == JobType.POLICY:
+                    task_type, payload, eligible_worker_type, target_node_group = await self._prepare_first_policy_task_payload(job_to_claim, new_task_id_hex, context)
+                else:
+                    raise ValueError(f"Unknown job type '{job_to_claim.template_type.value}' during initial task creation.")
+
+                if task_type and payload:
+                    # Build the WorkPacket
+                    header = WorkPacketHeader(task_id=new_task_id_hex, job_id=job_id)
+                    config = TaskConfig() # Default config
+                    # Ensure payload is correctly instantiated if helpers return models
+                    if isinstance(payload, BaseModel):
+                         payload_model = payload
+                    else:
+                         # Attempt to create model if helpers returned dict (adjust based on helper return type)
+                         payload_model = self._get_payload_model(task_type)(**payload)
+
+                    full_work_packet = WorkPacket(header=header, config=config, payload=payload_model)
+
+                    # Create the Task in DB
+                    await self.db.create_task(
+                        job_id=job_id,
+                        task_id=new_task_id_bytes,
+                        task_type=task_type.value,
+                        work_packet=full_work_packet.model_dump(mode='json'),
+                        datasource_id=getattr(payload_model, 'datasource_id', None),
+                        eligible_worker_type=eligible_worker_type,
+                        node_group=target_node_group,
+                        context=context
+                    )
+                    self.logger.info(f"Created initial task '{task_type.value}' ({new_task_id_hex}) for job {job_id}", **context)
+
+                    # Refill cache immediately after creating the first task
+                    await self._refill_task_cache_for_job(job_id)
+
+                    # *** IMPORTANT: Immediately update own load count after successful claim ***
+                    try:
+                         async with self.orchestrator._state_lock:
+                             current_owned_count = len(self.orchestrator.job_states)
+                         await self.db.update_orchestrator_load(
+                             orchestrator_id=self.orchestrator.instance_id,
+                             job_count=current_owned_count,
+                             context=context
+                         )
+                    except Exception as update_err:
+                         self.orchestrator.error_handler.handle_error(update_err, "post_claim_load_update", **context)
+
+                    return True # Job claimed and first task created
+                else:
+                    # If payload creation failed, fail the job
+                    await self.db.fail_job(job_id, "Failed to create initial task payload.", context=context)
                     return False
 
-                # FIXED: Staging table logic now respects discovery_mode
-                discovery_mode = job_to_claim.configuration.get("discovery_mode", "FULL").upper()
-                staging_table = "discovered_objects"
-                if discovery_mode == "DELTA":
-                    staging_table = f"staging_discovered_objects_job_{job_id}"
-                    await self.db.create_staging_table_for_job(job_to_claim.id, "DiscoveredObjects")
-                    
-                payload = DiscoveryEnumeratePayload(
-                    datasource_id=datasource_id,
-                    paths=[],
-                    staging_table_name=staging_table
-                )
-                task_type = TaskType.DISCOVERY_ENUMERATE
-            elif job_to_claim.template_type == JobType.DB_PROFILE:
-                task_type = TaskType.DATASOURCE_PROFILE
-                payload = DatasourceProfilePayload(datasource_id=datasource_id)
+            except Exception as e:
+                # Catch errors during task creation, fail the job, and log
+                self.orchestrator.error_handler.handle_error(e, "claim_initialize_create_task", **context)
+                await self.db.fail_job(job_id, f"Error creating initial task: {str(e)}", context=context)
+                return False # Indicate job claim failed overall
 
-            elif job_to_claim.template_type == JobType.BENCHMARK:
-                task_type = TaskType.BENCHMARK_EXECUTE
-                profile_record = await self.db.get_datasource_metadata(datasource_id)
-                
+        return False # Job wasn't claimed (either due to load or race condition)
 
-
-                payload = BenchmarkExecutePayload(
-                    datasource_id=datasource_id,
-                    cycle_id=job_to_claim.get("cycle_id"),
-                    benchmark_name=job_to_claim.get("benchmark_name"),
-                    
-                )
-
-            elif job_to_claim.template_type == JobType.ENTITLEMENT:
-                task_type = TaskType.ENTITLEMENT_EXTRACT
-                payload = EntitlementExtractPayload(
-                    datasource_id=datasource_id,
-                    cycle_id=job_to_claim.configuration.get("cycle_id")
-                )                
-            elif job_to_claim.template_type == JobType.POLICY:
-                plan_id = f"plan_{job_to_claim.execution_id}"
-                policy_config = PolicyConfiguration(**job_to_claim.configuration.get("policy_definition", {}))
-                payload = PolicySelectorPlanPayload(plan_id=plan_id, policy_config=policy_config)
-                task_type = TaskType.POLICY_SELECTOR_PLAN
-            
-            else:
-                await self.db.fail_job(job_id, f"Unknown job type '{job_to_claim.template_type.value}'")
-                return False
-
-            full_work_packet = WorkPacket(header=header, config=config, payload=payload)
-
-            # 4. Call the updated create_task method with the bytes hash.
-            await self.db.create_task(
-                job_id=job_id,
-                task_id=new_task_id_bytes, # Pass the raw bytes to the DB method
-                task_type=task_type,
-                work_packet=full_work_packet.model_dump(mode='json'),
-                datasource_id=getattr(payload, 'datasource_id', None)
-            )
-            
-            await self._refill_task_cache_for_job(job_id)
-            return True
-            
-        return False
 
 
     async def _find_and_approve_task(self):
@@ -374,3 +411,139 @@ class TaskAssigner:
             return self.rc.get_next_job_for_assignment(jobs_with_tasks_in_cache)
 
         return None    
+        
+    # --- ***  HELPER METHODS *** ---
+
+    async def _prepare_first_scan_task_payload(self, job: Job, task_id_hex: str, context: Dict) -> Tuple[Optional[TaskType], Optional[BaseModel], str, str]:
+        """Helper to build the payload for the first task of various Scan jobs."""
+        datasource_id = job.configuration.get('datasource_targets', [{}])[0].get('datasource_id')
+        if not datasource_id:
+            raise ConfigurationError(f"Job {job.id} is missing a datasource_id.", config_key="datasource_targets")
+
+        task_type = None
+        payload = None
+        eligible_worker_type = "DATACENTER" # Scan tasks run on datacenter workers
+        target_node_group = job.node_group or "default" # Target worker in job's node group
+
+        if job.template_type == JobType.SCANNING:
+            task_type = TaskType.DISCOVERY_ENUMERATE
+            discovery_mode = job.configuration.get("discovery_mode", "FULL").upper()
+            staging_table = None
+            if discovery_mode == "DELTA":
+                 staging_table = f"staging_discovered_objects_job_{job.id}"
+                 # Ensure staging table exists (idempotent creation)
+                 await self.db.create_staging_table_for_job(job.id, "DiscoveredObjects", context=context)
+
+            payload = DiscoveryEnumeratePayload(
+                datasource_id=datasource_id,
+                paths=[], # Initial task starts enumeration from root(s) defined in connector/config
+                staging_table_name=staging_table # Will be None for FULL scan mode
+            )
+        elif job.template_type == JobType.DB_PROFILE:
+            task_type = TaskType.DATASOURCE_PROFILE
+            payload = DatasourceProfilePayload(datasource_id=datasource_id)
+        elif job.template_type == JobType.BENCHMARK:
+            task_type = TaskType.BENCHMARK_EXECUTE
+            benchmark_name = job.configuration.get("benchmark_name")
+            if not benchmark_name:
+                 raise ConfigurationError(f"Benchmark job {job.id} is missing 'benchmark_name'.")
+            payload = BenchmarkExecutePayload(
+                 datasource_id=datasource_id,
+                 cycle_id=job.configuration.get("cycle_id", f"cycle_{job.execution_id}"), # Generate cycle ID if needed
+                 benchmark_name=benchmark_name
+            )
+        elif job.template_type == JobType.ENTITLEMENT:
+             task_type = TaskType.ENTITLEMENT_EXTRACT
+             payload = EntitlementExtractPayload(
+                 datasource_id=datasource_id,
+                 cycle_id=job.configuration.get("cycle_id", f"cycle_{job.execution_id}") # Generate cycle ID if needed
+             )
+        # elif job.template_type == JobType.VULNERABILITY:
+             # Add logic for VULNERABILITY if implemented
+             # task_type = TaskType.VULNERABILITY_SCAN
+             # payload = VulnerabilityScanPayload(...)
+        else:
+             # Should not happen if claim logic is correct, but handles unexpected types
+             raise ValueError(f"Unsupported Scan JobType '{job.template_type.value}' in _prepare_first_scan_task_payload for job {job.id}")
+
+        return task_type, payload, eligible_worker_type, target_node_group
+
+
+    async def _prepare_first_policy_task_payload(self, job: Job, task_id_hex: str, context: Dict) -> Tuple[Optional[TaskType], Optional[BaseModel], str, str]:
+        """Helper to build the payload for the first POLICY_QUERY_EXECUTE task."""
+        eligible_worker_type = "POLICY" # Policy queries run centrally by PolicyWorker
+        target_node_group = "central"   # Always target the central node group
+
+        # Fetch the Policy Template using the job's template_table_id
+        # Use caching version for potentially frequent lookups
+        policy_template = await self.db.get_policy_template_by_id(job.template_table_id, context=context)
+        if not policy_template:
+            raise ConfigurationError(f"Policy template ID '{job.template_table_id}' not found for job {job.id}.", config_key="template_table_id")
+
+        # --- Logic moved from Pipeliner ---
+        config = policy_template.configuration # This is already a dict from JSON field
+
+        # Determine query source (Athena or Yugabyte replica)
+        if config.get("target_query_engine"):
+            query_source = config["target_query_engine"]
+        else:
+            # Infer based on where the data primarily resides
+            query_source = "athena" if config.get("policy_storage_scope") in ("S3", "BOTH") else "yugabyte"
+
+        # Get selection criteria and action definition (assuming they are dicts)
+        selection_criteria_dict = config.get("selection_criteria")
+        action_definition_dict = config.get("action_definition")
+        data_source_enum = config.get("data_source") # e.g., "SCANFINDINGS"
+        storage_scope_enum = config.get("policy_storage_scope") # e.g., "S3"
+
+        if not selection_criteria_dict or not action_definition_dict or not data_source_enum or not storage_scope_enum:
+             raise ConfigurationError(f"Policy template '{policy_template.template_id}' (DB ID: {policy_template.id}) is missing required configuration fields (selection_criteria, action_definition, data_source, or policy_storage_scope).")
+
+        # Validate/Parse into Pydantic models
+        try:
+            # Ensure enums are handled correctly if stored as strings
+            selection_criteria_model = SelectionCriteria.model_validate(selection_criteria_dict)
+            action_definition_model = ActionDefinition.model_validate(action_definition_dict)
+            # Add validation for data_source and storage_scope if needed, Pydantic handles Literal validation
+        except Exception as validation_error:
+             raise ConfigurationError(f"Invalid selection_criteria or action_definition in template '{policy_template.template_id}': {validation_error}")
+
+        payload = PolicyQueryExecutePayload(
+            policy_template_id=policy_template.id, # Use DB primary key for internal reference
+            policy_name=policy_template.name,
+            query_source=query_source,
+            data_source=data_source_enum, # Pass validated enum/string
+            policy_storage_scope=storage_scope_enum, # Pass validated enum/string
+            selection_criteria=selection_criteria_model, # Use validated Pydantic model
+            action_definition=action_definition_model, # Use validated Pydantic model
+            incremental_mode=config.get("policy_execution_type") == "INCREMENTAL",
+            incremental_checkpoints=None # PolicyWorker will load these from CheckpointRepository
+        )
+        # --- End of moved logic ---
+
+        return TaskType.POLICY_QUERY_EXECUTE, payload, eligible_worker_type, target_node_group
+
+    # --- Helper to get Pydantic model class from TaskType ---
+    def _get_payload_model(self, task_type: TaskType) -> Optional[type[BaseModel]]:
+         """Maps TaskType enum to the corresponding Pydantic payload model class."""
+         # This map needs to be kept in sync with core/models/models.py payload definitions
+         payload_class_map = {
+             TaskType.DISCOVERY_ENUMERATE: DiscoveryEnumeratePayload,
+             TaskType.DISCOVERY_GET_DETAILS: DiscoveryGetDetailsPayload,
+             TaskType.CLASSIFICATION: ClassificationPayload,
+             TaskType.DELTA_CALCULATE: DeltaCalculatePayload,
+             TaskType.POLICY_SELECTOR_PLAN: PolicySelectorPlanPayload,
+             TaskType.POLICY_SELECTOR_EXECUTE: PolicySelectorExecutePayload,
+             TaskType.POLICY_COMMIT_PLAN: PolicyCommitPlanPayload,
+             TaskType.POLICY_ENRICHMENT: PolicyEnrichmentPayload,
+             TaskType.POLICY_ACTION_EXECUTE: PolicyActionExecutePayload,
+             TaskType.POLICY_RECONCILE: PolicyReconcilePayload,
+             TaskType.DATASOURCE_PROFILE: DatasourceProfilePayload,
+             TaskType.BENCHMARK_EXECUTE: BenchmarkExecutePayload,
+             TaskType.ENTITLEMENT_EXTRACT: EntitlementExtractPayload,
+             # TaskType.VULNERABILITY_SCAN: VulnerabilityScanPayload, # Add when implemented
+             TaskType.POLICY_QUERY_EXECUTE: PolicyQueryExecutePayload, # From core/models/payloads.py
+             # TaskType.PREPARE_CLASSIFICATION_TASKS: PrepareClassificationTasksPayload, # From core/models/payloads.py
+             # TaskType.JOB_CLOSURE: JobClosurePayload # From core/models/payloads.py
+         }
+         return payload_class_map.get(task_type)

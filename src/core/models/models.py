@@ -399,6 +399,266 @@ class EntitlementExtractPayload(BaseModel):
 
 #
 
+class ObjectSelectAction(BaseModel):
+    """
+    Represents the outcome of a policy select action .
+    Intended to be stored individually (e.g., as a JSON object in S3).
+    """
+    
+    
+    object_key_hash: bytes = Field(..., description="SHA256 hash of the object (32 bytes)")
+    object_path: str = Field(..., description="Original path/identifier of the object.")
+    datasource_id: Optional[str] = Field(..., description="Datasource id , store if required for query , other wise avoid to prevent storage .")
+
+class ObjectActionResult(BaseModel):
+    """
+    Represents the outcome of a policy action applied to a single object.
+    Intended to be stored individually (e.g., as a JSON object in S3).
+    """
+    # --- Context ---
+    
+    object_key_hash: bytes = Field(..., description="SHA256 hash of the object (32 bytes)")
+    object_path: str = Field(..., description="Original path/identifier of the object.")
+    policy_id: str = Field(..., description="ID of the policy being executed.")
+    policy_name: str = Field(..., description="Name of the policy being executed.")
+    job_id: int = Field(..., description="Job ID responsible for this action.")
+    timestamp_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat(), description="Timestamp when the action was completed or failed.")
+    
+    policy_status: Literal["SUCCESS", "FAILURE"] = Field(..., description="Outcome of the action for this object.")
+    policy_action_type: str = Field(..., description="The type of action attempted (e.g., MOVE, DELETE, TAG).")    
+    policy_tags: Optional[List[str]] = Field(None, description="Attached Tags")
+    datasource_id: Optional[str] = Field(..., description="Datasource id , store if required for query , other wise avoid to prevent storage .")
+    
+    plan_id: Optional[str] = Field(..., description="ID of the overall remediation plan.")
+    bin_id: Optional[str] = Field(..., description="ID of the specific bin this object belonged to.")
+    task_id: str = Field(..., description="Task ID (hex string) responsible for this action.")
+    # --- Outcome ---
+    
+    
+    worker_id: str = Field(..., description="ID of the worker that performed the action.")
+
+    # --- Details ---
+    policy_new_object_path: Optional[str] = Field(None, description="New path if the action was MOVE and successful.")
+    policy_action_metadata: Optional[Dict[str, Any]] = Field(None, description="Specific metadata from the action (e.g., tags applied, tombstone details). Populated on SUCCESS.")
+    error_message: Optional[str] = Field(None, description="Reason for failure. Populated on FAILURE.")
+    
+    class Config:
+        # Configuration for Pydantic, e.g., allowing bytes encoding
+        json_encoders = {
+            # Use urlsafe_b64encode for S3 key compatibility if needed, otherwise standard
+            bytes: lambda b: base64.b64encode(b).decode('ascii') if b else None
+        }
+        use_enum_values = True
+        validate_assignment = True
+
+class TaskSummaryMetrics(BaseModel):
+    """
+    Structured summary of metrics collected during task execution.
+    Fields are optional, populate based on task type.
+    """
+    # General counts
+    items_processed: Optional[int] = Field(None, description="Generic count of items processed (e.g., files, rows, objects).")
+    bytes_processed: Optional[int] = Field(None, description="Total bytes processed by the task.")
+
+    # Classification specific
+    findings_count: Optional[int] = Field(None, description="Total number of PII findings generated.")
+    components_processed: Optional[int] = Field(None, description="Number of content components classified.")
+
+    # Discovery specific
+    objects_discovered: Optional[int] = Field(None, description="Number of objects found during enumeration.")
+    metadata_records_saved: Optional[int] = Field(None, description="Number of metadata records successfully saved.")
+    boundaries_processed: Optional[int] = Field(None, description="Number of boundaries (e.g., directories, schemas) processed in an enumeration task.")
+
+    # Policy Action specific
+    action_success_count: Optional[int] = Field(None, description="Number of objects successfully remediated.")
+    action_failure_count: Optional[int] = Field(None, description="Number of objects where remediation failed.")
+    action_total_objects: Optional[int] = Field(None, description="Total number of objects targeted by the action task/bin.")
+
+    class Config:
+        validate_assignment = True
+
+# --- Updated TaskStatusUpdatePayload ---
+
+class TaskStatusUpdatePayload(BaseModel):
+    """
+    Payload for the TASK_COMPLETION_STATUS event sent to Kafka.
+    Contains the task's status, summary (now typed), progress, and error details.
+    """
+    status: Literal["STARTED", "PROGRESS", "COMPLETED", "FAILED"] = Field(..., description="The current or final status being reported for the task.")
+    percent_done: Optional[float] = Field(None, ge=0.0, le=100.0, description="Optional field indicating task progress percentage.")
+    # --- UPDATED TYPE HINT ---
+    task_summary: Optional[TaskSummaryMetrics] = Field(None, description="Structured aggregated metrics collected during task execution. Populated on COMPLETED/FAILED.")
+    # --- END UPDATE ---
+    processing_errors: List[Dict[str, Any]] = Field(default_factory=list, description="List of errors encountered during core task processing.")
+    upload_errors: List[Dict[str, Any]] = Field(default_factory=list, description="List of errors encountered during the Kafka upload phase.")
+    timestamp_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat(), description="Timestamp when this status update was generated.")
+
+    class Config:
+        validate_assignment = True
+
+
+
+# --- 3.10 REMEDIATION_GROUP_STATUS Payload ---
+class RemediationGroupStatusUpdate(BaseModel):
+    """
+    Payload for REMEDIATION_GROUP_STATUS event.
+    Maps to updates in RemediationLifeCycleGroupTable.
+    """
+    group_name: str
+    current_version: int
+    policy_name: str # Include for context
+    new_status: Literal["Open", "Closed", "AcceptablyClosed"] # Status being set
+    progress_indicators: Dict[str, int] = Field(..., description="Counts: CountOpen, CountAcknowledged, etc.")
+    status_history_entry: Dict[str, Any] = Field(..., description="New entry to append: {status, timestamp, user}")
+    updated_by: str # System or user triggering the update
+    timestamp: datetime # Timestamp of the status change
+
+# --- 3.11 REMEDIATION_DATASOURCE_STATUS Payload ---
+class RemediationDataSourceStatusUpdate(BaseModel):
+    """
+    Payload for REMEDIATION_DATASOURCE_STATUS event.
+    Maps to updates in RemediationLifeCycleDataSourceTable.
+    """
+    group_name: str
+    current_version: int
+    datasource_name: str
+    new_status: Literal["Open", "Acknowledged", "RequestForScan", "Closed", "AcceptablyClosed"] # Status being set
+    # Optional fields based on evaluation that led to this status
+    closure_reason: Optional[str] = None
+    closure_condition_met: Optional[bool] = None
+    acceptable_closure_condition_met: Optional[bool] = None
+    metric_value: Optional[Any] = None
+    updated_by: str # System or user triggering the update
+    timestamp: datetime # Timestamp of the status change
+
+# --- 3.12 REMEDIATION_TABLE_STATUS Payload ---
+class RemediationTableStatusUpdate(BaseModel):
+    """
+    Payload for REMEDIATION_TABLE_STATUS event.
+    Maps to updates/inserts in RemediationLifeCycleTableStatus.
+    """
+    group_name: str
+    current_version: int
+    datasource_name: str
+    schema_name: str
+    table_name: str
+    status: Literal["Pending", "Acknowledged"] # Status being set or initial status
+    acknowledged_by: Optional[str] = None # User if status is Acknowledged
+    acknowledged_at: Optional[datetime] = None # Timestamp if status is Acknowledged
+    notes: Optional[str] = None # User notes
+    timestamp: datetime # Timestamp of the event
+
+# --- 3.13 REMEDIATION_FINDING_STATUS Payload ---
+class RemediationFindingStatusUpdate(BaseModel):
+    """
+    Payload for REMEDIATION_FINDING_STATUS event.
+    Maps to updates/inserts in RemediationLifeCycleObjectTable.
+    """
+    group_name: str
+    current_version: int
+    # Location info implicitly via finding_key_hash resolution, but good for context
+    datasource_name: str
+    schema_name: str
+    table_name: str
+    field_name: str
+    # Primary identifier
+    finding_key_hash: bytes = Field(..., description="SHA256 hash from ScanFindingSummary (32 bytes)")
+    # Classifier context
+    classifier_id: str
+    entity_type: str
+    new_status: Literal["Accepted", "FalsePositive"] # Status being set
+    # Review metadata
+    reviewed_by: Optional[str] = None # User setting the status
+    reviewed_at: Optional[datetime] = None # Timestamp of review
+    notes: Optional[str] = None # User notes
+    timestamp: datetime # Timestamp of the event
+
+    class Config:
+        # Configuration for Pydantic, e.g., allowing bytes encoding
+        json_encoders = {
+            bytes: lambda b: base64.b64encode(b).decode('ascii') if b else None
+        }
+
+class ScanFindingSummary(BaseModel):
+    """
+    Aggregated finding summary for classification results, used in Kafka messages
+    and potentially mapping to the scan_finding_summaries SQL table schema.
+
+    Aggregation happens at worker level:
+    - Structured data: Aggregated by (classifier_id, field_name)
+    - Unstructured data: Aggregated by (classifier_id, file_path)
+    """
+    finding_key_hash: bytes = Field(
+        ...,
+        description="SHA256 hash of finding context (32 bytes)"
+    )
+    scan_job_id: str = Field(..., max_length=255, description="Originating Job ID.")
+    data_source_id: str = Field(..., max_length=255)
+    classifier_id: str = Field(..., max_length=255)
+    entity_type: str = Field(..., max_length=100)
+    object_path: str = Field(..., description="Full path or identifier of the object at the source.")
+    # Location fields (structured data)
+    schema_name: Optional[str] = Field(None, max_length=255)
+    table_name: Optional[str] = Field(None, max_length=255)
+    field_name: Optional[str] = Field(None, max_length=255)
+
+    # Location fields (unstructured data)
+    file_path: Optional[str] = Field(None, description="Full path to the file.")
+    # file_name field was removed from Kafka spec example, using file_path. Can be added if needed.
+    file_extension: Optional[str] = Field(None, max_length=50) # Added based on DB schema
+
+    # Aggregated statistics
+    finding_count: int = Field(..., ge=1, description="Number of individual findings this summary represents.")
+    average_confidence: float = Field(..., ge=0.0, le=1.0)
+    max_confidence: float = Field(..., ge=0.0, le=1.0) # Added based on DB schema
+    confidence_tier: str = Field(..., max_length=10, description="Aggregated confidence tier (HIGH, MEDIUM, LOW).")
+
+    # Sample findings (e.g., text snippets, row identifiers)
+    sample_findings: Optional[str] = Field(None, description="JSON string containing sample occurrences.") # Changed to string based on DB schema
+
+    # Source statistics
+    total_rows_in_source: Optional[int] = Field(None, description="Total rows/items in the scanned source object (table/file).")
+    # non_null_rows_scanned field removed from Kafka spec example, can be added if needed.
+
+    # --- Fields mirroring DB schema ---
+    # Column statistics (NULL for files)
+    null_percentage: Optional[float] = Field(None)
+    min_length: Optional[int] = Field(None)
+    max_length: Optional[int] = Field(None)
+    mean_length: Optional[float] = Field(None)
+    distinct_value_count: Optional[int] = Field(None)
+    distinct_value_percentage: Optional[float] = Field(None)
+
+    # Match statistics
+    total_regex_matches: int = Field(default=0)
+    regex_match_rate: float = Field(default=0.0)
+    distinct_regex_matches: int = Field(default=0)
+    distinct_match_percentage: float = Field(default=0.0)
+    column_name_matched: bool = Field(default=False)
+    words_match_count: int = Field(default=0)
+    words_match_rate: float = Field(default=0.0)
+    exact_match_count: int = Field(default=0)
+    exact_match_rate: float = Field(default=0.0)
+    negative_match_count: int = Field(default=0)
+    negative_match_rate: float = Field(default=0.0)
+    # --- End Fields mirroring DB schema ---
+
+    # Metadata
+    scan_timestamp: Optional[datetime] = Field(None, description="Timestamp relevant to the scan (can be derived from Kafka msg)")
+
+    class Config:
+        # Configuration for Pydantic, e.g., allowing bytes encoding
+        json_encoders = {
+            bytes: lambda b: base64.b64encode(b).decode('ascii') if b else None
+        }
+        validate_assignment = True
+        # If this model corresponds directly to a DB table, configure ORM mode
+        # orm_mode = True # Use model_config nowadays
+        model_config = {
+            "from_attributes": True # For SQLAlchemy ORM integration if needed later
+        }
+
+
 
 # FIXED: Discriminated Union for WorkPacket payload
 class WorkPacket(BaseModel):
@@ -423,8 +683,11 @@ class WorkPacket(BaseModel):
         Annotated[DatasourceProfilePayload, Field(discriminator='task_type')],
         Annotated[BenchmarkExecutePayload, Field(discriminator='task_type')],
         Annotated[EntitlementExtractPayload, Field(discriminator='task_type')],
-        Annotated[VulnerabilityScanPayload, Field(discriminator='task_type')]
+        Annotated[VulnerabilityScanPayload, Field(discriminator='task_type')],
 
+        Annotated[PolicyQueryExecutePayload, Field(discriminator='task_type')],
+        Annotated[PrepareClassificationTasksPayload, Field(discriminator='task_type')],
+        Annotated[JobClosurePayload, Field(discriminator='task_type')]
     ]
 
     class Config:

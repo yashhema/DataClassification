@@ -52,7 +52,54 @@ from ..errors import ErrorHandler
 from ..db_models.job_schema import MasterJob
 from ..models.models import SystemProfile
 
+'''
+To Do Methods:
+async def bulk_insert_task_output_records(
+    self,
+    records: List[Dict[str, Any]],
+    job_id: int,
+    context: Optional[Dict[str, Any]] = None
+) -> None:
+    """
+    Bulk inserts TaskOutputRecord records to database.
+    Used by standalone mode for Pipeliner consumption.
+    """
+    # Implementation similar to bulk_insert_discovered_objects
+    pass
 
+async def bulk_insert_database_profiles(
+    self,
+    records: List[Dict[str, Any]],
+    job_id: int,
+    context: Optional[Dict[str, Any]] = None
+) -> None:
+    """
+    Bulk inserts SystemProfile records to database.
+    """
+    pass
+
+async def bulk_insert_entitlement_snapshots(
+    self,
+    records: List[Dict[str, Any]],
+    job_id: int,
+    context: Optional[Dict[str, Any]] = None
+) -> None:
+    """
+    Bulk inserts EntitlementSnapshot records to database.
+    """
+    pass
+
+async def bulk_insert_benchmark_findings(
+    self,
+    records: List[Dict[str, Any]],
+    job_id: int,
+    context: Optional[Dict[str, Any]] = None
+) -> None:
+    """
+    Bulk inserts BenchmarkFinding records to database.
+    """
+    pass
+'''
 
 
 class LeaseRenewalResult(NamedTuple):
@@ -158,8 +205,270 @@ class DatabaseInterface:
 
 
 
+    async def update_orchestrator_load(self, orchestrator_id: str, job_count: int, context: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Updates the active job count and heartbeat timestamp for this orchestrator instance
+        in the orchestrator_load table using an atomic MERGE statement (SQL Server).
+
+        If the orchestrator_id exists, it updates the job count and timestamp.
+        If the orchestrator_id does not exist, it inserts a new row.
+
+        Args:
+            orchestrator_id: The unique identifier of the orchestrator instance.
+            job_count: The current number of active jobs owned by this instance.
+            context: Optional dictionary for logging and trace propagation.
+        """
+        context = context or {}
+        # Add orchestrator_id to context if not already present, useful for logging
+        log_context = {"orchestrator_id": orchestrator_id, **context}
+
+        self.logger.log_database_operation(
+            "UPSERT",
+            "orchestrator_load",
+            "STARTED",
+            job_count=job_count,
+            **log_context # Use combined context
+        )
+        try:
+            # Use the session context manager to handle the transaction
+            async with self._get_session_context() as session: # Assuming _get_session_context handles commit/rollback
+                now_utc = datetime.now(timezone.utc)
+
+                # SQL Server MERGE statement for atomic UPSERT
+                merge_sql = text("""
+                    MERGE INTO orchestrator_load AS target
+                    USING (SELECT :oid AS orchestrator_id) AS source
+                    ON (target.orchestrator_id = source.orchestrator_id)
+                    WHEN MATCHED THEN
+                        UPDATE SET
+                            active_job_count = :count,
+                            last_heartbeat = :ts -- Update timestamp on every update
+                    WHEN NOT MATCHED BY TARGET THEN
+                        INSERT (orchestrator_id, active_job_count, last_heartbeat)
+                        VALUES (:oid, :count, :ts);
+                """)
+
+                # Execute the MERGE statement with parameters
+                await session.execute(
+                    merge_sql,
+                    {
+                        "oid": orchestrator_id,
+                        "count": job_count,
+                        "ts": now_utc
+                    }
+                )
+                # Commit is handled by _get_session_context upon successful exit
+
+            self.logger.log_database_operation(
+                "UPSERT",
+                "orchestrator_load",
+                "SUCCESS",
+                job_count=job_count,
+                **log_context # Use combined context
+            )
+        except Exception as e:
+            # Use the error handler to log and potentially classify the error
+            self.error_handler.handle_error(
+                e,
+                "update_orchestrator_load", # Context identifier for the error handler
+                job_count=job_count,
+                **log_context # Pass full context to error handler
+            )
+
+    async def bulk_insert_task_output_records(
+        self,
+        records: List[Dict[str, Any]],
+        job_id: int,
+        context: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Bulk inserts TaskOutputRecord records to database.
+        Used by standalone mode for Pipeliner consumption.
+        """
+        # Implementation similar to bulk_insert_discovered_objects
+        pass
+
+    async def bulk_insert_database_profiles(
+        self,
+        records: List[Dict[str, Any]],
+        job_id: int,
+        context: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Bulk inserts SystemProfile records to database.
+        """
+        pass
+
+    async def bulk_insert_entitlement_snapshots(
+        self,
+        records: List[Dict[str, Any]],
+        job_id: int,
+        context: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Bulk inserts EntitlementSnapshot records to database.
+        """
+        pass
+
+    async def bulk_insert_benchmark_findings(
+        self,
+        records: List[Dict[str, Any]],
+        job_id: int,
+        context: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Bulk inserts BenchmarkFinding records to database.
+        """
+        pass
+
+
 
 # In src/core/db/database_interface.py
+
+    async def upsert_component_registration(
+        self,
+        component_id: str,
+        component_type: str,
+        node_group: str,
+        version: Optional[str],
+        capabilities: Optional[Dict[str, Any]],
+        context: Dict[str, Any]
+    ) -> None:
+        """
+        Registers or updates component in registry.
+        
+        Logic:
+        1. INSERT ... ON CONFLICT DO UPDATE
+        2. Update last_heartbeat to current time
+        3. If new registration, set registered_at
+        
+        Error Handling:
+        - Database errors logged and raised
+        """
+        try:
+            async with self.get_async_session() as session:
+                stmt = ComponentRegistry.__table__.insert().values(
+                    component_id=component_id,
+                    component_type=component_type,
+                    node_group=node_group,
+                    version=version,
+                    capabilities=capabilities,
+                    last_heartbeat=datetime.now(timezone.utc),
+                    registered_at=datetime.now(timezone.utc),
+                    status="active"
+                ).on_conflict_do_update(
+                    index_elements=["component_id"],
+                    set_={
+                        "last_heartbeat": datetime.now(timezone.utc),
+                        "version": version,
+                        "capabilities": capabilities,
+                        "status": "active"
+                    }
+                )
+                await session.execute(stmt)
+                await session.commit()
+                
+                self.logger.info(
+                    f"Component {component_id} registered/updated",
+                    component_type=component_type,
+                    node_group=node_group,
+                    **context
+                )
+        except Exception as e:
+            error = self.error_handler.handle_error(
+                e,
+                "upsert_component_registration",
+                **context
+            )
+            raise
+
+    async def delete_component_registration(
+        self,
+        component_id: str,
+        context: Dict[str, Any]
+    ) -> None:
+        """
+        Removes component from registry on graceful shutdown.
+        
+        Logic:
+        1. DELETE FROM component_registry WHERE component_id = ?
+        
+        Error Handling:
+        - Database errors logged but not raised (shutdown continues)
+        """
+        try:
+            async with self.get_async_session() as session:
+                stmt = delete(ComponentRegistry).where(
+                    ComponentRegistry.component_id == component_id
+                )
+                await session.execute(stmt)
+                await session.commit()
+                
+                self.logger.info(
+                    f"Component {component_id} deregistered",
+                    **context
+                )
+        except Exception as e:
+            self.error_handler.handle_error(
+                e,
+                "delete_component_registration",
+                **context
+            )
+            # Don't raise - allow shutdown to continue
+
+    async def get_active_components(
+        self,
+        component_type: Optional[str] = None,
+        node_group: Optional[str] = None,
+        context: Dict[str, Any] = {}
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieves list of active components for ops dashboard.
+        
+        Logic:
+        1. SELECT * FROM component_registry
+        2. WHERE status = 'active'
+        3. AND last_heartbeat > (now - 5 minutes)  # Stale check
+        4. Optional filters by type and node_group
+        
+        Returns:
+            List of component dicts with all fields
+        """
+        try:
+            async with self.get_async_session() as session:
+                query = select(ComponentRegistry).where(
+                    ComponentRegistry.status == "active",
+                    ComponentRegistry.last_heartbeat > datetime.now(timezone.utc) - timedelta(minutes=5)
+                )
+                
+                if component_type:
+                    query = query.where(ComponentRegistry.component_type == component_type)
+                if node_group:
+                    query = query.where(ComponentRegistry.node_group == node_group)
+                
+                result = await session.execute(query)
+                components = result.scalars().all()
+                
+                return [
+                    {
+                        "component_id": c.component_id,
+                        "component_type": c.component_type,
+                        "node_group": c.node_group,
+                        "version": c.version,
+                        "capabilities": c.capabilities,
+                        "last_heartbeat": c.last_heartbeat.isoformat(),
+                        "registered_at": c.registered_at.isoformat()
+                    }
+                    for c in components
+                ]
+        except Exception as e:
+            error = self.error_handler.handle_error(
+                e,
+                "get_active_components",
+                **context
+            )
+            raise
+
 
 
     async def write_discovery_to_staging_async(

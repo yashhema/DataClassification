@@ -7,12 +7,13 @@ handling frameworks and contains the complete schema for all system components.
 """
 
 import socket
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional,Literal
 from dataclasses import dataclass, field
 import yaml
 from pydantic import BaseModel, Field, ValidationError as PydanticValidationError
 
 from ..db_models.system_parameters_schema import SystemParameter
+
 
 # Forward reference for core components to avoid circular imports at runtime
 from typing import TYPE_CHECKING
@@ -24,6 +25,217 @@ if TYPE_CHECKING:
 # =================================================================
 # Pydantic Models for Type-Safe System Configuration
 # =================================================================
+
+class KafkaTopicsConfig(BaseModel):
+    """
+    Kafka topic names for different data streams.
+    Follows naming convention: {environment}_{purpose}
+    """
+    findings: str = Field(
+        "prod_classification_findings",
+        description="Topic for classification findings data"
+    )
+    discovery: str = Field(
+        "prod_discovery_metadata",
+        description="Topic for discovered object metadata"
+    )
+    task_outputs: str = Field(
+        "prod_task_output_records",
+        description="Topic for TaskOutputRecords (consumed by Flink, written to DB)"
+    )
+    task_metadata: str = Field(
+        "prod_task_metadata",
+        description="Optional topic for task completion metadata summaries"
+    )
+    object_metadata: str = Field(
+        "prod_object_metadata",
+        description="Topic for object-level metadata"
+    )
+    worker_control: str = Field(
+        "prod_worker_control_topic",
+        description="Topic for receiving config update notifications (consumer)"
+    )
+
+class KafkaMTLSConfig(BaseModel):
+    """
+    mTLS certificate configuration for Kafka connectivity.
+    These are SEPARATE from worker-backend mTLS certificates.
+    """
+    ssl_certfile: str = Field(
+        "/etc/worker/certs/kafka/client.pem",
+        description="Path to Kafka client certificate"
+    )
+    ssl_keyfile: str = Field(
+        "/etc/worker/certs/kafka/client.key",
+        description="Path to Kafka client private key"
+    )
+    ssl_cafile: str = Field(
+        "/etc/worker/certs/kafka/ca.pem",
+        description="Path to Kafka CA certificate for server verification"
+    )
+    ssl_check_hostname: bool = Field(
+        True,
+        description="Verify hostname in server certificate"
+    )
+
+class KafkaResilienceConfig(BaseModel):
+    """
+    Resilience and fallback configuration for Kafka operations.
+    Implements the "always write locally first" pattern.
+    """
+    fallback_directory: str = Field(
+        "/mnt/kafka-fallback",
+        description="Directory for local file writes (must be persistent volume)"
+    )
+    max_local_file_size_mb: int = Field(
+        500,
+        description="Maximum size for a single task's local file"
+    )
+    max_retries: int = Field(
+        3,
+        description="Maximum upload retry attempts before marking task failed"
+    )
+    retry_backoff_base: float = Field(
+        2.0,
+        description="Base for exponential backoff (seconds)"
+    )
+    batch_size_bytes: int = Field(
+        900000,  # ~900KB, leaves room for metadata
+        description="Maximum size of a single Kafka message batch"
+    )
+    flush_interval_records: int = Field(
+        100,
+        description="Flush local file after this many records"
+    )
+
+class KafkaProducerConfig(BaseModel):
+    """
+    Kafka producer-specific configuration.
+    """
+    acks: Literal["all", "0", "1"] = Field(
+        "all",
+        description="Acknowledgment level: 'all' for durability"
+    )
+    compression_type: Literal["none", "gzip", "snappy", "lz4", "zstd"] = Field(
+        "snappy",
+        description="Compression algorithm for messages"
+    )
+    request_timeout_ms: int = Field(
+        30000,
+        description="Timeout for producer requests"
+    )
+    enable_idempotence: bool = Field(
+        True,
+        description="Enable idempotent producer for exactly-once semantics"
+    )
+    linger_ms: int = Field(
+        10,
+        description="Milliseconds to wait before sending batch"
+    )
+    max_in_flight_requests_per_connection: int = Field(
+        5,
+        description="Maximum unacknowledged requests per connection"
+    )
+
+class KafkaConsumerConfig(BaseModel):
+    """
+    Kafka consumer-specific configuration for control topic.
+    """
+    group_id: str = Field(
+        "worker-control-consumers",
+        description="Consumer group ID for control topic"
+    )
+    auto_offset_reset: Literal["earliest", "latest"] = Field(
+        "latest",
+        description="Where to start if no committed offset exists"
+    )
+    enable_auto_commit: bool = Field(
+        True,
+        description="Automatically commit offsets"
+    )
+    auto_commit_interval_ms: int = Field(
+        5000,
+        description="Auto-commit interval"
+    )
+    session_timeout_ms: int = Field(
+        30000,
+        description="Consumer session timeout"
+    )
+
+class KafkaConfig(BaseModel):
+    """
+    Complete Kafka configuration for worker operations.
+    Supports producer (findings, discovery, task outputs) and consumer (control topic).
+    """
+    enabled: bool = Field(
+        True,
+        description="Master switch for Kafka integration"
+    )
+    bootstrap_servers: str = Field(
+        "kafka.internal.yourcorp.com:9093",
+        description="Comma-separated list of Kafka brokers"
+    )
+    security_protocol: Literal["SSL", "PLAINTEXT", "SASL_SSL", "SASL_PLAINTEXT"] = Field(
+        "SSL",
+        description="Security protocol for Kafka connections"
+    )
+    topics: KafkaTopicsConfig = Field(
+        default_factory=KafkaTopicsConfig,
+        description="Kafka topic names"
+    )
+    mtls: KafkaMTLSConfig = Field(
+        default_factory=KafkaMTLSConfig,
+        description="mTLS certificate configuration"
+    )
+    resilience: KafkaResilienceConfig = Field(
+        default_factory=KafkaResilienceConfig,
+        description="Resilience and fallback configuration"
+    )
+    producer: KafkaProducerConfig = Field(
+        default_factory=KafkaProducerConfig,
+        description="Producer-specific settings"
+    )
+    consumer: KafkaConsumerConfig = Field(
+        default_factory=KafkaConsumerConfig,
+        description="Consumer-specific settings for control topic"
+    )
+    credential_id: Optional[str] = Field(
+        None,
+        description="Credential ID for Kafka auth secrets (if using SASL)"
+    )
+
+
+class WorkerMTLSConfig(BaseModel):
+    """
+    mTLS + API key configuration for worker-backend communication.
+    Used when deployment_model = "EKS"
+    """
+    client_cert_path: str = Field(
+        ...,
+        description="Path to worker client certificate for mTLS"
+    )
+    client_key_path: str = Field(
+        ...,
+        description="Path to worker private key for mTLS"
+    )
+    ca_cert_path: str = Field(
+        ...,
+        description="Path to CA certificate for server verification"
+    )
+    api_key: str = Field(
+        ...,
+        description="API key for authentication (in addition to mTLS)"
+    )
+
+class SecurityConfig(BaseModel):
+    """
+    Security-related configuration for worker-backend communication.
+    """
+    worker_mtls: WorkerMTLSConfig = Field(
+        ...,
+        description="mTLS and API key configuration for EKS deployment"
+    )
+
 
 class DatabaseConfig(BaseModel):
     connection_string: str
@@ -65,6 +277,14 @@ class WorkerConfig(BaseModel):
     max_retries: int = Field(3)
     process_memory_limit_mb: int = Field(4096)
     global_cpu_threshold_percent: int = Field(90)
+    api_timeout_seconds: int = Field(
+        30,
+        description="Timeout for backend API calls in EKS mode"
+    )    
+    results_destination: Literal["kafka", "database"] = Field(
+        "kafka",
+        description="Destination for classification findings and discovery metadata"
+    )
 
 class OrchestratorConfig(BaseModel):
     deployment_model: str = Field("EKS")
@@ -252,6 +472,14 @@ class SystemConfig(BaseModel):
     task_cost_estimation: TaskCostEstimationConfig = Field(default_factory=TaskCostEstimationConfig)
     content_extraction: ContentExtractionSystemConfig = Field(default_factory=ContentExtractionSystemConfig)
     task_manager: TaskManagerConfig = Field(default_factory=TaskManagerConfig)
+    security: SecurityConfig = Field(
+        ...,
+        description="Security configuration for distributed deployments"
+    )
+    kafka: KafkaConfig = Field(
+        default_factory=KafkaConfig,
+        description="Kafka configuration for distributed event streaming"
+    )    
 # =================================================================
 # The Configuration Manager
 # =================================================================

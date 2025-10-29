@@ -28,32 +28,66 @@ class LeaseManager:
         self.interval_sec = self.lease_duration_sec / 3
         self.name = "LeaseManagerCoroutine"
 
+
+
+
+
     async def run_async(self):
         """The main async loop for the Lease Manager."""
         self.logger.log_component_lifecycle("LeaseManager", "STARTED")
 
         while not self.orchestrator._shutdown_event.is_set():
+            current_owned_count = 0 # Initialize count for this cycle
             try:
-                await self._renew_all_active_leases()
-                
+                # --- RENEW LEASES ---
+                owned_job_ids = []
+                async with self.orchestrator._state_lock:
+                    # Get IDs of jobs currently owned by this instance from in-memory state
+                    owned_job_ids = list(self.orchestrator.job_states.keys())
+                    current_owned_count = len(owned_job_ids) # Capture the count *under the lock*
+
+                if owned_job_ids:
+                    self.logger.info(f"LeaseManager checking {len(owned_job_ids)} active jobs for lease renewal.", count=len(owned_job_ids))
+                    # Pass the list of IDs to the renewal method
+                    await self._renew_all_active_leases(owned_job_ids)
+                else:
+                     self.logger.debug("LeaseManager found no active jobs to renew lease for.")
+
+
+                # --- UPDATE ORCHESTRATOR LOAD COUNT ---
+                # Update this instance's load count in the DB using the count determined earlier
+                await self.db.update_orchestrator_load(
+                    orchestrator_id=self.orchestrator.instance_id,
+                    job_count=current_owned_count # Use the count captured under the lock
+                )
+                # --- END LOAD UPDATE ---
+
                 self.orchestrator.update_thread_liveness("lease_manager")
                 await asyncio.sleep(self.interval_sec)
 
+            # Error handling remains the same...
             except Exception as e:
-                
                 error = self.orchestrator.error_handler.handle_error(e, "lease_manager_main_loop")
-                
-                # Fatal error detection and propagation
                 if error.error_category == ErrorCategory.FATAL_BUG:
                     self.logger.critical(f"Fatal error detected in {self.__class__.__name__}: {error}")
-                    raise  # Propagate to TaskManager
-                
-                # Existing retry logic for operational errors
+                    raise
                 self.logger.warning(f"Transient error in {self.__class__.__name__}, retrying: {error}")
-                await asyncio.sleep(self.interval * 5)
-                
+                # Ensure load count is updated even if lease renewals had issues mid-way
+                try:
+                     async with self.orchestrator._state_lock:
+                          current_owned_count = len(self.orchestrator.job_states) # Recalculate count on error
+                     await self.db.update_orchestrator_load(
+                          orchestrator_id=self.orchestrator.instance_id,
+                          job_count=current_owned_count
+                     )
+                except Exception as update_err:
+                     self.orchestrator.error_handler.handle_error(update_err, "lease_manager_load_update_on_error")
+
+                await asyncio.sleep(self.interval_sec * 5) # Longer backoff
 
         self.logger.log_component_lifecycle("LeaseManager", "STOPPED")
+
+
 
     async def _renew_all_active_leases(self):
         """

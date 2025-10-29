@@ -95,6 +95,14 @@ class JobCompletionMonitor:
         is_task_work_done = total_tasks > 0 and pending_tasks == 0 and assigned_tasks == 0
         has_pending_outputs = await self.db.has_pending_output_records(job.id)
         is_job_fully_complete = is_task_work_done and not has_pending_outputs
+        if all_tasks_complete:
+            self.logger.info(
+                "All tasks complete for job, creating closure task",
+                job_id=job.id
+            )
+            # NEW: Create JOB_CLOSURE task
+            await self._create_closure_task(job)
+        
 
         if is_job_fully_complete:
             final_status = JobStatus.COMPLETED if failed_tasks == 0 else JobStatus.COMPLETED_WITH_FAILURES
@@ -123,6 +131,119 @@ class JobCompletionMonitor:
                 await self.db.update_job_status(job.id, JobStatus.FAILED)
                 await self._update_master_summary_with_retry(job.master_job_id, job.status, JobStatus.FAILED)
                 return
+
+
+    async def _create_closure_task(self, job: Job):
+        """
+        Create JOB_CLOSURE task for completed job.
+        Determines closure actions based on job template configuration.
+        """
+        import uuid
+        from datetime import datetime, timezone
+        
+        # Get job template (ScanTemplate or PolicyTemplate)
+        template = await self._get_job_template(job)
+        
+        if not template:
+            self.logger.warning(
+                "No template found for job, skipping closure",
+                job_id=job.id
+            )
+            return
+        
+        # Determine closure actions based on template config
+        closure_actions = []
+        
+        if job.job_type == "SCANNING":
+            closure_actions.append("update_timestamps")
+            
+            # Check if write_to_latest enabled
+            if template.write_to_latest:
+                closure_actions.append("promote_to_latest")
+                closure_actions.append("trigger_merge")
+            
+            # Check if reporting policy configured
+            if template.reporting_policy_template_id:
+                closure_actions.append("execute_reporting")
+        
+        elif job.job_type == "POLICY":
+            closure_actions.append("update_policy_checkpoint")
+            
+            if template.policy_type == "remediationlifecycle":
+                closure_actions.append("update_remediation")
+        
+        # Get datasource IDs from job tasks
+        datasource_ids = await self._get_job_datasource_ids(job.id)
+        
+        # Create JOB_CLOSURE task
+        task_id = uuid.uuid4().bytes
+        
+        work_packet = {
+            "header": {
+                "task_id": task_id.hex(),
+                "job_id": job.id,
+                "trace_id": f"trace_{uuid.uuid4().hex}",
+                "created_timestamp": datetime.now(timezone.utc).isoformat()
+            },
+            "config": {
+                "batch_write_size": 1000,
+                "retry_count": 0
+            },
+            "payload": {
+                "task_type": "JOB_CLOSURE",
+                "completed_job_id": job.id,
+                "job_type": job.job_type,
+                "datasource_ids": datasource_ids,
+                "template_id": job.template_id,
+                "closure_actions": closure_actions,
+                "write_to_latest": template.write_to_latest if hasattr(template, 'write_to_latest') else False,
+                "scan_mode": template.scan_mode if hasattr(template, 'scan_mode') else None,
+                "reporting_policy_template_id": template.reporting_policy_template_id if hasattr(template, 'reporting_policy_template_id') else None
+            }
+        }
+        
+        # Insert task directly (not via Pipeliner)
+        await self.db.insert_task(
+            task_id=task_id,
+            job_id=job.id,
+            task_type="JOB_CLOSURE",
+            status="PENDING",
+            eligible_worker_type="POLICY",  # Route to PolicyWorker
+            node_group="central",
+            work_packet=work_packet
+        )
+        
+        self.logger.info(
+            "JOB_CLOSURE task created",
+            job_id=job.id,
+            task_id=task_id.hex(),
+            closure_actions=closure_actions
+        )
+
+    async def _get_job_template(self, job: Job):
+        """Get ScanTemplate or PolicyTemplate for job"""
+        
+        if job.job_type == "SCANNING":
+            return await self.db.get_scan_template(job.template_id)
+        elif job.job_type == "POLICY":
+            return await self.db.get_policy_template(job.template_id)
+        
+        return None
+
+    async def _get_job_datasource_ids(self, job_id: int) -> List[str]:
+        """Get unique datasource IDs from job tasks"""
+        
+        result = await self.db.execute_raw_sql(f"""
+            SELECT DISTINCT datasource_id
+            FROM tasks
+            WHERE job_id = {job_id}
+              AND datasource_id IS NOT NULL
+            ORDER BY datasource_id
+        """)
+        
+        return [row["datasource_id"] for row in result]
+
+
     
     async def _update_master_summary_with_retry(self, master_job_id: str, from_status: JobStatus, to_status: JobStatus, max_retries: int = 5):
         """

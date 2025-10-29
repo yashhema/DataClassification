@@ -21,6 +21,10 @@ if TYPE_CHECKING:
     from .compliance_schemas import OverrideGroup  # ADDED
     # Import the Pydantic model for documentation purposes
 
+class StoragePrefernce(str, enum.Enum):
+    DB = "DB"
+    S3 = "S3"
+
 class NodeGroup(Base):
     __tablename__ = 'node_groups'
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -45,7 +49,7 @@ class DataSource(Base):
     datasource_id: Mapped[str] = mapped_column(NVARCHAR(255), primary_key=True)
     name: Mapped[str] = mapped_column(NVARCHAR(255), nullable=False)
     datasource_type: Mapped[str] = mapped_column(NVARCHAR(50), nullable=False)
-    
+    storage_prefernce: Mapped[str] = mapped_column(SQLAlchemyEnum(StoragePrefernce), nullable=False, default=StoragePrefernce.S3)
 
     
     node_group: Mapped[Optional["NodeGroup"]] = relationship()
@@ -61,6 +65,12 @@ class DataSource(Base):
         secondary=DatasourceToOverrideGroupLink,
         back_populates="datasources"
     )
+    created_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    last_metascantimestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())    
+    last_classificationscantimestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())    
+    last_deltaclassificationscantimestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    latestbranch_scanhistoryjson: Mapped[Optional[Dict[str, Any]]] = mapped_column("metadata", JSON)    
+
 
 class DataSourceMetadata(Base):
     __tablename__ = 'datasource_metadata'

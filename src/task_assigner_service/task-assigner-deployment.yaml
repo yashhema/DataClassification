@@ -1,0 +1,30 @@
+# task-assigner-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: task-assigner
+spec:
+  replicas: 2  # HA deployment
+  selector:
+    matchLabels:
+      app: task-assigner
+  template:
+    spec:
+      containers:
+      - name: task-assigner
+        image: task-assigner:1.0.0
+        ports:
+        - containerPort: 8080
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: db-secret
+              key: url
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"

@@ -14,7 +14,9 @@ from pydantic import BaseModel, Field
 
 # --- 1.1: Database Connection Models ---
 # --- Define a model for each specific authentication method ---
-
+class PolicyExecutionType(str, enum.Enum):
+    INCREMENTAL = "INCREMENTAL"
+    ONESHOT = "ONESHOT"
 class WindowsAuthConfig(BaseModel):
     auth_method: Literal["windows"]
 
@@ -65,6 +67,7 @@ class DatabaseConnectionConfig(BaseModel):
     connection_timeout_seconds: int = 30
     command_timeout_seconds: int = 300
     auth: DbAuthConfig
+    extra_params: Optional[Dict[str, str]] = Field(None, description="Additional key-value pairs to append to the connection string.")
 
 # --- 1.2: File & Object Store Connection Models (NEW) ---
 
@@ -243,4 +246,54 @@ class ConnectorConfiguration(BaseModel):
         Union[DatabaseConnectorConfig, FileConnectorConfig],
         Field(discriminator="connector_family")
     ]
+# In core/config/config_models.py
 
+class PolicyTemplateConfiguration(BaseModel):
+    policy_storage_scope: Literal["S3", "DB", "BOTH"]
+    data_source: Literal["DISCOVEREDOBJECT", "OBJECTMETADATA", "SCANFINDINGS"]
+    policy_execution_type: Literal["INCREMENTAL", "ONESHOT"]
+    incremental_logic_level: Literal["DATASOURCE", "FIELDLIST"]
+    action_source: Optional[str] = None
+    query: Optional[str] = None
+    
+    selection_criteria: SelectionCriteria
+    action_definition: ActionDefinition
+    
+    # FIXED: Proper Python syntax for optional list
+    incremental_checkpoint_fields: Optional[List[str]] = None
+    
+    # NEW: Added fields for query engine and output format
+    target_query_engine: Optional[Literal["athena", "yugabyte"]] = None
+    output_format: Literal["csv", "parquet", "json"] = "parquet"
+    
+    # Reporting specific
+    reporting_aggregation: Optional[ReportingAggregation] = None
+    
+    # Remediation Lifecycle specific
+    relevant_classifiers: Optional[List[str]] = None
+    view_filter: Optional[Any] = None
+    closure_condition: Optional[Any] = None
+    acceptable_closure_condition: Optional[Any] = None
+
+
+
+
+class ReportingField(BaseModel):
+    fieldname: str = Field(..., description="The field from the source data (e.g., ScanFindingSummary) to aggregate.")
+    operation: Literal["count", "sum", "max", "min"] = Field(..., description="The aggregation operation to perform.")
+    output_name: Optional[str] = Field(None, description="Optional alias for the resulting aggregated field name.") # Added for clarity
+
+class ReportingAggregation(BaseModel):
+    # Field to group by *in addition* to the mandatory datasource_id
+    additional_groupby: Optional[str] = Field(
+        None,
+        description="Optional field to group by (e.g., 'classifier_id', 'entity_type'). Only findings source supported for now."
+    )
+    # List of aggregations to calculate
+    reporting_fields: List[ReportingField] = Field(
+        ...,
+        description="A list defining the fields and operations for aggregation."
+    )
+
+    class Config:
+        extra = "forbid" # Prevent unexpected fields

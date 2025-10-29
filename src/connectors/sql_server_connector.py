@@ -141,7 +141,7 @@ class AsyncSQLServerConnection:
         auth_config = self.connection_config.get('auth', {})
         tls_config = self.connection_config.get('tls', {})
         auth_method = auth_config.get('auth_method')
-        
+        extra_params = self.connection_config.get('extra_params', {})
         base_string = ""
 
         if auth_method == 'windows' or self.connection_config.get('trusted_connection'):
@@ -158,7 +158,13 @@ class AsyncSQLServerConnection:
 
         if tls_config.get('trust_server_certificate', False):
             base_string += "&TrustServerCertificate=yes"
-
+# --- NEW: Add extra parameters ---
+        if extra_params:
+            for key, value in extra_params.items():
+                # URL-encode both key and value for safety
+                encoded_key = urllib.parse.quote_plus(str(key))
+                encoded_value = urllib.parse.quote_plus(str(value))
+                params_list.append(f"{encoded_key}={encoded_value}")
         log_string = base_string
         if 'password' in self.connection_config:
             encoded_password_for_redaction = quote_plus(self.connection_config['password'])
